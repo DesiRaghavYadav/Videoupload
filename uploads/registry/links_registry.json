@@ -1,0 +1,16 @@
+[
+  {
+    "id": "link_example_com_erfqrp",
+    "sourceUrl": "https://example.com/video-demo-123",
+    "title": "Test Cloudflare Tracked Video",
+    "rawTitle": "Test Cloudflare Tracked Video",
+    "videoUrl": "https://pub-test.r2.dev/sample.mp4",
+    "cloudflareVideoUrl": "https://pub-378f4e9e34f944fb949d1337c43c8de0.r2.dev/videos/sample.mp4",
+    "destination": "categories",
+    "destinationDetail": "Action Hits",
+    "status": "uploaded",
+    "firstExtractedAt": "2026-11-09T12:17:12.271Z",
+    "lastUpdatedAt": "2026-11-09T12:17:12.271Z",
+    "metadata": {}
+  }
+]

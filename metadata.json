@@ -1,0 +1,6 @@
+{
+  "name": "Cloudflare OTT Creator Studio & Admin Hub",
+  "description": "Admin and Creator Studio to create, edit, upload, and sync Batch Videos, Short Reels, Comics, Audio Stories, and Live TV to Cloudflare D1 via Worker REST API.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
