@@ -43,6 +43,7 @@ export interface ExtractedPageLink {
   text: string;
   type: 'video_media' | 'page_article' | 'image' | 'external';
   isRegisteredInCloudflare: boolean;
+  isNewInCloudflare?: boolean;
   cloudflareRecord?: {
     id: string;
     title: string;
@@ -60,6 +61,7 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
   const [sameDomainOnly, setSameDomainOnly] = useState(false);
   const [webpagesOnly, setWebpagesOnly] = useState(true);
   const [urlFormat, setUrlFormat] = useState('');
+  const [autoRegisterNew, setAutoRegisterNew] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
@@ -187,6 +189,7 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
           sameDomainOnly,
           webpagesOnly,
           urlFormat: urlFormat.trim(),
+          autoRegisterNew,
         }),
       });
 
@@ -535,6 +538,20 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
                   className="rounded border-slate-700 text-orange-500 focus:ring-0 bg-slate-950"
                 />
                 <span>Only same domain</span>
+              </label>
+
+              {/* Cloudflare Auto-Registration Toggle (No Duplicates · Auto-Add New) */}
+              <label className="flex items-center gap-2 cursor-pointer font-bold select-none bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 px-3 py-1.5 rounded-xl transition-colors hover:bg-emerald-500/20">
+                <input
+                  type="checkbox"
+                  checked={autoRegisterNew}
+                  onChange={(e) => setAutoRegisterNew(e.target.checked)}
+                  className="rounded border-slate-700 text-emerald-500 focus:ring-0 bg-slate-950"
+                />
+                <span className="flex items-center gap-1.5">
+                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Cloudflare Auto-Sync (No Copy on Match · Auto-Add New)</span>
+                </span>
               </label>
 
               <button
@@ -966,10 +983,17 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
                       <td className="p-3 align-top space-y-1">
                         {isRegistered && record ? (
                           <div className="space-y-0.5">
-                            <span className="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 font-bold text-[10px] flex items-center gap-1 w-fit">
-                              <ShieldCheck className="w-2.5 h-2.5" />
-                              <span>In Cloudflare</span>
-                            </span>
+                            {item.isNewInCloudflare ? (
+                              <span className="px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-bold text-[10px] flex items-center gap-1 w-fit">
+                                <Plus className="w-2.5 h-2.5" />
+                                <span>New Link Added</span>
+                              </span>
+                            ) : (
+                              <span className="px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-bold text-[10px] flex items-center gap-1 w-fit">
+                                <ShieldCheck className="w-2.5 h-2.5" />
+                                <span>In Cloudflare (0 Copy)</span>
+                              </span>
+                            )}
                             {record.destination && record.destination !== 'none' && (
                               <p className="text-[10px] text-yellow-400 font-medium">
                                 Saved to: <strong>{record.destination}</strong>

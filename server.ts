@@ -1225,35 +1225,84 @@ async function syncRegistryToStorage(req?: Request): Promise<void> {
   }
 }
 
-// API: Check single or multiple URLs against Cloudflare registry
-app.post('/api/registry/check', (req: Request, res: Response) => {
-  const { urls } = req.body;
+// API: Check single or multiple URLs against Cloudflare registry (No copy on match; auto-add if new)
+app.post('/api/registry/check', async (req: Request, res: Response) => {
+  const { urls, autoRegisterIfMissing = true } = req.body;
   if (!urls) {
     return res.status(400).json({ success: false, error: 'urls array or single url is required' });
   }
 
   const urlList: string[] = Array.isArray(urls) ? urls : [urls];
+  let hasNew = false;
+  const now = new Date().toISOString();
+
   const results = urlList.map((rawUrl) => {
     const norm = normalizeUrlForDedup(rawUrl);
-    const existing = extractedLinksRegistry.find(
-      (item) => normalizeUrlForDedup(item.sourceUrl) === norm || item.id === rawUrl
+    const existingIndex = extractedLinksRegistry.findIndex(
+      (item) => normalizeUrlForDedup(item.sourceUrl) === norm || item.id === rawUrl || item.id === getLinkUniqueId(rawUrl)
     );
-    return {
-      url: rawUrl,
-      normalizedUrl: norm,
-      uniqueId: existing ? existing.id : getLinkUniqueId(rawUrl),
-      isRegistered: Boolean(existing),
-      isUploaded: Boolean(existing?.cloudflareVideoUrl || existing?.cloudflareThumbnailUrl || existing?.status === 'uploaded'),
-      destination: existing?.destination || 'none',
-      destinationDetail: existing?.destinationDetail || null,
-      record: existing || null,
-    };
+
+    if (existingIndex >= 0) {
+      // Existing record in Cloudflare: ZERO DUPLICATE COPIES CREATED!
+      const existing = extractedLinksRegistry[existingIndex];
+      return {
+        url: rawUrl,
+        normalizedUrl: norm,
+        uniqueId: existing.id,
+        isRegistered: true,
+        isNew: false,
+        noCopy: true,
+        isUploaded: Boolean(existing.cloudflareVideoUrl || existing.cloudflareThumbnailUrl || existing.status === 'uploaded'),
+        destination: existing.destination || 'none',
+        destinationDetail: existing.destinationDetail || null,
+        record: existing,
+      };
+    } else {
+      // Not yet in Cloudflare: auto-register new link so future checks immediately find it
+      const uniqueId = getLinkUniqueId(rawUrl);
+      let newRecord: CloudflareExtractedLink | null = null;
+      if (autoRegisterIfMissing) {
+        newRecord = {
+          id: uniqueId,
+          sourceUrl: rawUrl,
+          title: rawUrl.split('/').pop()?.split('?')[0] || 'Tracked Link',
+          rawTitle: rawUrl,
+          status: 'extracted',
+          destination: 'none',
+          firstExtractedAt: now,
+          lastUpdatedAt: now,
+          metadata: {
+            addedVia: 'cloudflare_auto_check',
+          },
+        };
+        extractedLinksRegistry.unshift(newRecord);
+        hasNew = true;
+      }
+
+      return {
+        url: rawUrl,
+        normalizedUrl: norm,
+        uniqueId,
+        isRegistered: Boolean(newRecord),
+        isNew: true,
+        isUploaded: false,
+        destination: 'none',
+        destinationDetail: null,
+        record: newRecord,
+      };
+    }
   });
+
+  if (hasNew) {
+    await syncRegistryToStorage(req);
+  }
 
   res.json({
     success: true,
     count: results.length,
     registeredCount: results.filter((r) => r.isRegistered).length,
+    newlyAddedCount: results.filter((r) => r.isNew).length,
+    reusedExistingCount: results.filter((r) => !r.isNew && r.isRegistered).length,
     results,
   });
 });
@@ -1437,6 +1486,7 @@ export interface ExtractedPageLink {
   text: string;
   type: 'video_media' | 'page_article' | 'image' | 'external';
   isRegisteredInCloudflare: boolean;
+  isNewInCloudflare?: boolean;
   cloudflareRecord?: CloudflareExtractedLink | null;
 }
 
@@ -1449,6 +1499,7 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
       enableDomainFilters = true,
       webpagesOnly = true,
       urlFormat = '',
+      autoRegisterNew = true,
     } = req.body;
 
     if (!url || typeof url !== 'string') {
@@ -1662,22 +1713,54 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
       }
     }
 
-    // Convert map to list and cross-reference with Cloudflare Extracted Registry
+    // Convert map to list and cross-reference with Cloudflare Extracted Registry (No copies for existing; auto-add new)
+    let hasNewRegistrations = false;
+    const now = new Date().toISOString();
+
     let list: ExtractedPageLink[] = Array.from(linksMap.entries()).map(([linkUrl, meta]) => {
       const norm = normalizeUrlForDedup(linkUrl);
       const reg = extractedLinksRegistry.find(
         (r) => normalizeUrlForDedup(r.sourceUrl) === norm || r.id === getLinkUniqueId(linkUrl)
       );
 
+      let isNew = false;
+      let finalReg = reg;
+
+      if (!reg && autoRegisterNew) {
+        // Automatically add new link to Cloudflare so future requests find it immediately
+        finalReg = {
+          id: getLinkUniqueId(linkUrl),
+          sourceUrl: linkUrl,
+          title: meta.text || linkUrl.split('/').pop()?.split('?')[0] || 'Discovered Webpage',
+          rawTitle: meta.text,
+          status: 'extracted',
+          destination: 'none',
+          firstExtractedAt: now,
+          lastUpdatedAt: now,
+          metadata: {
+            extractedFromPage: url,
+            originDomain: targetDomain,
+          },
+        };
+        extractedLinksRegistry.unshift(finalReg);
+        hasNewRegistrations = true;
+        isNew = true;
+      }
+
       return {
         url: linkUrl,
         normalizedUrl: norm,
         text: meta.text,
         type: meta.type,
-        isRegisteredInCloudflare: Boolean(reg),
-        cloudflareRecord: reg || null,
+        isRegisteredInCloudflare: Boolean(finalReg),
+        isNewInCloudflare: isNew,
+        cloudflareRecord: finalReg || null,
       };
     });
+
+    if (hasNewRegistrations) {
+      await syncRegistryToStorage(req);
+    }
 
     // Apply optional keyword filter
     if (filterKeywords && typeof filterKeywords === 'string' && filterKeywords.trim()) {
@@ -1706,6 +1789,8 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
       videoMediaCount: list.filter((l) => l.type === 'video_media').length,
       pageArticleCount: list.filter((l) => l.type === 'page_article').length,
       registeredCount: list.filter((l) => l.isRegisteredInCloudflare).length,
+      newlyRegisteredCount: list.filter((l) => l.isNewInCloudflare).length,
+      reusedExistingCount: list.filter((l) => l.isRegisteredInCloudflare && !l.isNewInCloudflare).length,
       links: list,
     });
   } catch (err: any) {

@@ -479,12 +479,12 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
         const checkRes = await fetch('/api/registry/check', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ urls: [target] }),
+          body: JSON.stringify({ urls: [target], autoRegisterIfMissing: true }),
         });
         const checkData = await checkRes.json();
         const checkItem = checkData.results?.[0];
         if (checkItem?.isRegistered && checkItem.record) {
-          setSingleRegistryRecord(checkItem.record);
+          setSingleRegistryRecord({ ...checkItem.record, isNew: checkItem.isNew });
         }
       } catch (e) {
         console.warn('Pre-check registry error:', e);
@@ -623,64 +623,69 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
           const checkRes = await fetch('/api/registry/check', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ urls: [item.url] }),
+            body: JSON.stringify({ urls: [item.url], autoRegisterIfMissing: true }),
           });
           const checkData = await checkRes.json();
           const checkItem = checkData.results?.[0];
 
           if (checkItem?.isRegistered && checkItem.record) {
             const rec = checkItem.record;
+            const isReusedNoCopy = !checkItem.isNew;
 
             if (batchSkipMode === 'strict_skip') {
               // Option B: Skip from both (Strict bypass)
-              setBatchQueue((prev) =>
-                prev.map((q, idx) =>
-                  idx === i
-                    ? {
-                        ...q,
-                        status: 'skipped_in_cloudflare',
-                        statusMessage: `Strict Skip: Already in Cloudflare (${rec.status}) · Bypassed`,
-                        title: rec.title,
-                        rawTitle: rec.rawTitle || rec.title,
-                        isRegisteredInCloudflare: true,
-                        destination: rec.destination,
-                        registryUniqueId: rec.id,
-                      }
-                    : q
-                )
-              );
-              // Advance to next link without queuing for category forward
-              continue;
+              if (isReusedNoCopy) {
+                setBatchQueue((prev) =>
+                  prev.map((q, idx) =>
+                    idx === i
+                      ? {
+                          ...q,
+                          status: 'skipped_in_cloudflare',
+                          statusMessage: `Strict Skip: Already in Cloudflare (0 copy created) · Bypassed`,
+                          title: rec.title,
+                          rawTitle: rec.rawTitle || rec.title,
+                          isRegisteredInCloudflare: true,
+                          destination: rec.destination,
+                          registryUniqueId: rec.id,
+                        }
+                      : q
+                  )
+                );
+                // Advance to next link without queuing for category forward
+                continue;
+              }
             } else if (batchSkipMode === 'smart_cache') {
               // Option A: Skip re-scraping but retrieve full details from Cloudflare R2
-              setBatchQueue((prev) =>
-                prev.map((q, idx) =>
-                  idx === i
-                    ? {
-                        ...q,
-                        status: 'completed',
-                        statusMessage: `Retrieved from Cloudflare R2 Vault (0 Download Overhead)`,
-                        title: rec.title,
-                        rawTitle: rec.rawTitle || rec.title,
-                        videoStreamUrl: rec.cloudflareVideoUrl || rec.videoUrl,
-                        originalVideoUrl: rec.videoUrl,
-                        cloudflareVideoUrl: rec.cloudflareVideoUrl,
-                        originalThumbnailUrl: rec.thumbnailUrl,
-                        cloudflareThumbnailUrl: rec.cloudflareThumbnailUrl || rec.thumbnailUrl,
-                        thumbnailStorageSource: rec.cloudflareThumbnailUrl ? 'cloudflare_r2' : undefined,
-                        durationFormatted: rec.durationFormatted,
-                        durationSec: rec.durationSec,
-                        sizeFormatted: rec.sizeFormatted,
-                        isRegisteredInCloudflare: true,
-                        destination: rec.destination,
-                        destinationDetail: rec.destinationDetail,
-                        registryUniqueId: rec.id,
-                      }
-                    : q
-                )
-              );
-              // Completed with cached R2 assets, continue to next link
-              continue;
+              if (isReusedNoCopy && (rec.cloudflareVideoUrl || rec.videoUrl)) {
+                setBatchQueue((prev) =>
+                  prev.map((q, idx) =>
+                    idx === i
+                      ? {
+                          ...q,
+                          status: 'completed',
+                          statusMessage: `Reused from Cloudflare R2 (0 Copy Overhead · Cached)`,
+                          title: rec.title,
+                          rawTitle: rec.rawTitle || rec.title,
+                          videoStreamUrl: rec.cloudflareVideoUrl || rec.videoUrl,
+                          originalVideoUrl: rec.videoUrl,
+                          cloudflareVideoUrl: rec.cloudflareVideoUrl,
+                          originalThumbnailUrl: rec.thumbnailUrl,
+                          cloudflareThumbnailUrl: rec.cloudflareThumbnailUrl || rec.thumbnailUrl,
+                          thumbnailStorageSource: rec.cloudflareThumbnailUrl ? 'cloudflare_r2' : undefined,
+                          durationFormatted: rec.durationFormatted,
+                          durationSec: rec.durationSec,
+                          sizeFormatted: rec.sizeFormatted,
+                          isRegisteredInCloudflare: true,
+                          destination: rec.destination,
+                          destinationDetail: rec.destinationDetail,
+                          registryUniqueId: rec.id,
+                        }
+                      : q
+                  )
+                );
+                // Completed with cached R2 assets, continue to next link
+                continue;
+              }
             }
           }
         } catch (checkErr) {
@@ -1402,7 +1407,9 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
             <div className="space-y-1">
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="font-bold text-amber-300 text-sm">
-                  Found in Cloudflare Registry (Status: {singleRegistryRecord.status})
+                  {singleRegistryRecord.isNew
+                    ? 'Added as New Link to Cloudflare Registry'
+                    : 'Found in Cloudflare Registry (Cached · 0 Duplicate Copies)'}
                 </span>
                 <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 font-mono text-[10px] text-slate-300">
                   ID: {singleRegistryRecord.id}
@@ -1414,7 +1421,9 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
                 )}
               </div>
               <p className="text-slate-300">
-                This URL was previously extracted on {new Date(singleRegistryRecord.firstExtractedAt).toLocaleDateString()}. You can retrieve its stored Cloudflare metadata directly to prevent duplicate uploads.
+                {singleRegistryRecord.isNew
+                  ? `This link was automatically registered into your Cloudflare vault. Future requests will instantly reuse it without duplicate copies.`
+                  : `This URL was already tracked in Cloudflare on ${new Date(singleRegistryRecord.firstExtractedAt).toLocaleDateString()}. Reused directly with zero duplicate copies.`}
               </p>
               {singleRegistryRecord.cloudflareVideoUrl && (
                 <p className="text-slate-400 font-mono text-[11px] truncate max-w-xl">
