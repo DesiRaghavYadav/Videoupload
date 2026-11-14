@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
   Globe,
   Search,
@@ -39,11 +39,25 @@ import {
   Download,
   Trash2,
   ShieldCheck,
+  Zap,
 } from 'lucide-react';
 import { AppTabType } from './Header';
+import { getR2Headers } from '../utils/r2Service';
 
-interface WebProcessorProps {
+export interface WebProcessorBatchProgress {
+  isRunning: boolean;
+  isPaused: boolean;
+  concurrency: number;
+  completedCount: number;
+  totalCount: number;
+  activeWorkers: number;
+}
+
+export interface WebProcessorProps {
   onNavigateTab: (tab: AppTabType, initialData?: any) => void;
+  onBatchProgressUpdate?: (progress: WebProcessorBatchProgress) => void;
+  externalConcurrency?: number;
+  onConcurrencyChange?: (concurrency: number) => void;
 }
 
 export interface CandidateTitle {
@@ -62,6 +76,11 @@ export interface CandidateThumbnail {
 
 export interface ProcessedWebResult {
   success: boolean;
+  fromCache?: boolean;
+  cachedByWebUrl?: boolean;
+  registryUniqueId?: string;
+  isRegisteredInCloudflare?: boolean;
+  isUploadedToCloudflare?: boolean;
   status: number;
   statusText: string;
   targetUrl: string;
@@ -146,6 +165,7 @@ export interface BatchQueueItem {
   id: string;
   url: string;
   index: number;
+  workerId?: number;
   status: 'pending' | 'checking_registry' | 'skipped_in_cloudflare' | 'scraping' | 'uploading_cloudflare' | 'completed' | 'error';
   statusMessage?: string;
   error?: string;
@@ -238,7 +258,12 @@ export function extractUrlsFromText(text: string): string[] {
 
 export type BatchSkipMode = 'smart_cache' | 'strict_skip' | 'dont_skip';
 
-export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => {
+export const WebProcessor: React.FC<WebProcessorProps> = ({
+  onNavigateTab,
+  onBatchProgressUpdate,
+  externalConcurrency,
+  onConcurrencyChange,
+}) => {
   // Mode: 'single' | 'batch'
   const [inputMode, setInputMode] = useState<'single' | 'batch'>('single');
 
@@ -275,9 +300,57 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
   const [activeVideoSize, setActiveVideoSize] = useState('');
   const [showRawComparison, setShowRawComparison] = useState(false);
 
-  // Multi-Link Batch Queue state
+  // Multi-Link Batch Queue state & VPS Multi-Worker Concurrency (1 - 20)
   const [batchRawText, setBatchRawText] = useState('');
   const [batchQueue, setBatchQueue] = useState<BatchQueueItem[]>([]);
+  const [concurrency, setConcurrency] = useState<number>(externalConcurrency ?? 3); // 1 - 20 workers
+
+  // Dynamic concurrency refs for live scaling during active runs
+  const concurrencyRef = useRef<number>(externalConcurrency ?? 3);
+  concurrencyRef.current = concurrency;
+  const isBatchRunningRef = useRef(false);
+  const currentQueueRef = useRef<BatchQueueItem[]>([]);
+  const nextIndexRef = useRef<number>(0);
+  const runningWorkerCountRef = useRef<number>(0);
+  const workerIdCounterRef = useRef<number>(0);
+  const runWorkerFnRef = useRef<((id: number) => Promise<void>) | null>(null);
+
+  const handleSetConcurrency = (num: number) => {
+    const clamped = Math.max(1, Math.min(20, num));
+    setConcurrency(clamped);
+    concurrencyRef.current = clamped;
+    if (onConcurrencyChange) {
+      onConcurrencyChange(clamped);
+    }
+
+    // Dynamic adjustment while batch is actively running:
+    // If increased: immediately spawn additional workers to grab next queue items right now!
+    // If decreased: active workers finish their current video, and exit when completing that item.
+    if (isBatchRunningRef.current && !cancelRef.current && !pauseRef.current && runWorkerFnRef.current) {
+      const targetCount = Math.min(clamped, currentQueueRef.current.length);
+      const deficit = targetCount - runningWorkerCountRef.current;
+      if (deficit > 0 && nextIndexRef.current < currentQueueRef.current.length) {
+        for (let i = 0; i < deficit; i++) {
+          const newWorkerId = ++workerIdCounterRef.current;
+          runWorkerFnRef.current(newWorkerId);
+        }
+      }
+    }
+  };
+
+  // Sync external concurrency changes from the top VPS telemetry bar (up to 20 workers)
+  useEffect(() => {
+    if (
+      externalConcurrency !== undefined &&
+      externalConcurrency >= 1 &&
+      externalConcurrency <= 20 &&
+      externalConcurrency !== concurrency
+    ) {
+      handleSetConcurrency(externalConcurrency);
+    }
+  }, [externalConcurrency]);
+
+  const [activeWorkers, setActiveWorkers] = useState<number>(0);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
   const [isBatchPaused, setIsBatchPaused] = useState(false);
   const [activeBatchIndex, setActiveBatchIndex] = useState<number>(-1);
@@ -285,6 +358,30 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
   const [singleRegistryRecord, setSingleRegistryRecord] = useState<any | null>(null);
   const pauseRef = useRef(false);
   const cancelRef = useRef(false);
+  const onBatchProgressUpdateRef = useRef(onBatchProgressUpdate);
+  onBatchProgressUpdateRef.current = onBatchProgressUpdate;
+  const lastBroadcastRef = useRef<string>('');
+
+  // Broadcast background batch status so other tabs in App.tsx show live progress
+  useEffect(() => {
+    if (!onBatchProgressUpdateRef.current) return;
+    const completedCount = batchQueue.filter(
+      (q) => q.status === 'completed' || q.status === 'skipped_in_cloudflare'
+    ).length;
+    const payload = {
+      isRunning: isBatchRunning,
+      isPaused: isBatchPaused,
+      concurrency,
+      completedCount,
+      totalCount: batchQueue.length,
+      activeWorkers,
+    };
+    const serialized = JSON.stringify(payload);
+    if (serialized !== lastBroadcastRef.current) {
+      lastBroadcastRef.current = serialized;
+      onBatchProgressUpdateRef.current(payload);
+    }
+  }, [isBatchRunning, isBatchPaused, batchQueue, concurrency, activeWorkers]);
 
   // HTML Inspector search & filter
   const [htmlSearchTerm, setHtmlSearchTerm] = useState('');
@@ -391,6 +488,7 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          ...getR2Headers(),
         },
         body: JSON.stringify({
           imageUrl: activeThumbnail,
@@ -408,6 +506,22 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
       setActiveCloudflareThumbnail(backLink);
       setActiveThumbnail(backLink); // Replace active thumbnail with permanent Cloudflare link!
       setThumbUploadSuccess(backLink);
+
+      // Persist updated Cloudflare thumbnail back link into saved registry
+      const regSourceUrl = result?.targetUrl || urlInput.trim();
+      if (regSourceUrl) {
+        fetch('/api/registry/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sourceUrl: regSourceUrl,
+            title: activeTitle || undefined,
+            thumbnailUrl: backLink,
+            cloudflareThumbnailUrl: backLink,
+            thumbnailStorageSource: data.storageSource || 'cloudflare_r2',
+          }),
+        }).catch(() => {});
+      }
     } catch (err: any) {
       setErrorMessage(err.message || 'Error uploading thumbnail to Cloudflare R2');
     } finally {
@@ -427,15 +541,18 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
     setErrorMessage(null);
 
     try {
+      const originalStreamBeforeUpload = activeStreamUrl;
       const res = await fetch('/api/upload-video-to-r2', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          ...getR2Headers(),
         },
         body: JSON.stringify({
-          videoUrl: activeStreamUrl,
+          videoUrl: originalStreamBeforeUpload,
           customFilename: activeTitle || 'video',
           folderPrefix: 'videos',
+          refererUrl: result?.finalUrl || result?.targetUrl || urlInput.trim() || undefined,
         }),
       });
 
@@ -450,7 +567,35 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
       if (data.sizeFormatted) {
         setActiveVideoSize(data.sizeFormatted);
       }
+      if (data.durationSec) {
+        setActiveDurationSec(data.durationSec);
+        setActiveDurationFormatted(data.durationFormatted || formatSecondsToDuration(data.durationSec));
+      }
       setVideoUploadSuccess(backLink);
+
+      // Persist updated Cloudflare video URL + verified size & duration into saved registry
+      const regSourceUrl = result?.targetUrl || urlInput.trim();
+      if (regSourceUrl) {
+        fetch('/api/registry/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sourceUrl: regSourceUrl,
+            title: activeTitle || undefined,
+            rawTitle: rawBaseTitle || undefined,
+            description: activeDescription || undefined,
+            videoUrl: originalStreamBeforeUpload,
+            cloudflareVideoUrl: backLink,
+            videoStorageSource: data.storageSource || 'cloudflare_r2',
+            cloudflareThumbnailUrl: activeCloudflareThumbnail || undefined,
+            sizeBytes: data.sizeBytes ?? undefined,
+            sizeMb: data.sizeMb || undefined,
+            sizeFormatted: data.sizeFormatted || activeVideoSize || undefined,
+            durationSec: data.durationSec ?? activeDurationSec ?? undefined,
+            durationFormatted: data.durationFormatted || activeDurationFormatted || undefined,
+          }),
+        }).catch(() => {});
+      }
     } catch (err: any) {
       setErrorMessage(err.message || 'Error uploading video to Cloudflare R2');
     } finally {
@@ -458,8 +603,8 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
     }
   };
 
-  // Process single URL
-  const handleProcessUrl = async (overrideUrl?: string) => {
+  // Process single URL (Strictly matched by Web URL with 0 duplicate copies)
+  const handleProcessUrl = async (overrideUrl?: string, forceRefresh: boolean = false) => {
     const target = (overrideUrl || urlInput).trim();
     if (!target) {
       setErrorMessage('Please enter a website or media stream URL to process.');
@@ -474,7 +619,8 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
     setSingleRegistryRecord(null);
 
     try {
-      // First, check Cloudflare Registry to see if this URL was already processed or uploaded
+      // Step 1: Query Cloudflare Registry strictly by Web URL
+      let cachedRecord: any = null;
       try {
         const checkRes = await fetch('/api/registry/check', {
           method: 'POST',
@@ -484,22 +630,149 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
         const checkData = await checkRes.json();
         const checkItem = checkData.results?.[0];
         if (checkItem?.isRegistered && checkItem.record) {
-          setSingleRegistryRecord({ ...checkItem.record, isNew: checkItem.isNew });
+          const rec = checkItem.record;
+          const hasCfVideo = Boolean(rec.cloudflareVideoUrl);
+          const hasCfThumb = Boolean(rec.cloudflareThumbnailUrl);
+          // Only reuse cached record if it actually holds complete Cloudflare assets matching current upload settings
+          const hasProcessedAssets =
+            (hasCfVideo || (rec.status === 'uploaded' && hasCfThumb && !rec.videoUrl)) &&
+            (!autoUploadVideoToR2 || hasCfVideo || (rec.status === 'uploaded' && !rec.videoUrl)) &&
+            (!autoUploadToR2 || hasCfThumb || !rec.thumbnailUrl);
+
+          if (hasProcessedAssets) {
+            setSingleRegistryRecord({ ...rec, isNew: false, noCopy: checkItem.noCopy, hasProcessedAssets: true });
+            cachedRecord = rec;
+          } else {
+            // Link was not uploaded to Cloudflare R2 yet (or missing video upload) — proceed to live processing & update!
+            setSingleRegistryRecord(null);
+          }
         }
       } catch (e) {
         console.warn('Pre-check registry error:', e);
       }
 
+      // Step 2: If Web URL already has full Cloudflare assets and user didn't force re-scrape, reuse directly!
+      if (cachedRecord && !forceRefresh) {
+        const bestTitle = cachedRecord.title || 'Archived Link';
+        const bestRawTitle = cachedRecord.rawTitle || bestTitle;
+        const bestThumb = cachedRecord.cloudflareThumbnailUrl || cachedRecord.thumbnailUrl || '';
+        const bestStream = cachedRecord.cloudflareVideoUrl || cachedRecord.videoUrl || '';
+        const bestDesc =
+          cachedRecord.description ||
+          (cachedRecord.destination && cachedRecord.destination !== 'none'
+            ? `Saved in Cloudflare. Destination: ${cachedRecord.destination}`
+            : 'Cached Cloudflare vault item');
+        const bestDurationFormatted = cachedRecord.durationFormatted || '';
+        const bestDurationSec = cachedRecord.durationSec ?? null;
+        const bestSize = cachedRecord.sizeFormatted || '';
+
+        setRawBaseTitle(bestRawTitle);
+        setActiveTitle(bestTitle);
+        setActiveThumbnail(bestThumb);
+        setActiveCloudflareThumbnail(cachedRecord.cloudflareThumbnailUrl || null);
+        setActiveStreamUrl(bestStream);
+        setActiveCloudflareVideo(cachedRecord.cloudflareVideoUrl || null);
+        setActiveDescription(bestDesc);
+        setActiveDurationFormatted(bestDurationFormatted);
+        setActiveDurationSec(bestDurationSec);
+        setActiveVideoSize(bestSize);
+
+        setResult({
+          success: true,
+          fromCache: true,
+          cachedByWebUrl: true,
+          status: 200,
+          statusText: 'OK (Reused from Cloudflare Vault by Web URL · 0 Copies)',
+          targetUrl: target,
+          finalUrl: cachedRecord.sourceUrl || target,
+          registryUniqueId: cachedRecord.id,
+          isRegisteredInCloudflare: true,
+          isUploadedToCloudflare: Boolean(cachedRecord.cloudflareVideoUrl || cachedRecord.status === 'uploaded'),
+          responseTimeMs: 0,
+          contentType: 'text/html; charset=utf-8',
+          headers: {
+            server: 'cloudflare-r2-vault',
+            'content-type': 'text/html; charset=utf-8',
+            'content-length': null,
+            'cache-control': 'public, max-age=86400',
+            date: new Date().toUTCString(),
+          },
+          page: {
+            title: bestTitle,
+            rawTitle: bestRawTitle,
+            description: bestDesc,
+            favicon: '',
+            ogImage: bestThumb,
+            ogVideo: bestStream,
+            siteName: 'Cloudflare Vault',
+            cloudflareVideoUrl: cachedRecord.cloudflareVideoUrl,
+            cloudflareThumbnailUrl: cachedRecord.cloudflareThumbnailUrl,
+            durationFormatted: bestDurationFormatted,
+            durationSec: bestDurationSec,
+            videoSize:
+              bestSize || cachedRecord.sizeBytes
+                ? {
+                    sizeBytes: cachedRecord.sizeBytes || 0,
+                    sizeMb: cachedRecord.sizeMb || '0',
+                    sizeFormatted: bestSize,
+                  }
+                : null,
+          },
+          media: {
+            videos: [
+              {
+                id: 1,
+                url: bestStream,
+                originalVideoUrl: cachedRecord.videoUrl || bestStream,
+                cloudflareVideoUrl: cachedRecord.cloudflareVideoUrl,
+                poster: bestThumb,
+                cloudflareThumbnailUrl: cachedRecord.cloudflareThumbnailUrl,
+                type: 'video/mp4',
+                filename: bestTitle,
+                title: bestTitle,
+                rawTitle: bestRawTitle,
+                durationSec: bestDurationSec,
+                durationFormatted: bestDurationFormatted,
+                sizeBytes: cachedRecord.sizeBytes ?? null,
+                sizeMb: cachedRecord.sizeMb ?? null,
+                sizeFormatted: bestSize || null,
+                description: bestDesc,
+              },
+            ],
+            images: bestThumb ? [{ src: bestThumb, alt: bestTitle }] : [],
+            iframes: [],
+          },
+          content: {
+            headings: [bestTitle],
+            textExcerpt: bestDesc || `Saved in Cloudflare registry. Registered on ${cachedRecord.firstExtractedAt || 'earlier session'}.`,
+            metaTags: {},
+            jsonLd: [],
+          },
+          fullHtml: `<!-- Cached Cloudflare Registry Entry for Web URL: ${target} -->`,
+          rawSnippet: `Cached record from Cloudflare: ${bestTitle}`,
+          htmlLength: 0,
+        });
+
+        if (bestStream) {
+          setActiveSubTab('media');
+        }
+        setIsProcessing(false);
+        return;
+      }
+
+      // Step 3: Fetch via /api/process-url (server will also check Web URL cache unless forceRefresh)
       const response = await fetch('/api/process-url', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          ...getR2Headers(),
         },
         body: JSON.stringify({
           url: target,
           wordsToRemove: wordsToRemove.trim(),
           uploadThumbnailToR2: autoUploadToR2,
           uploadVideoToR2: autoUploadVideoToR2,
+          forceRefresh,
         }),
       });
 
@@ -568,17 +841,353 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
     setBatchQueue(items);
   };
 
-  // Sequential Batch Queue Processor: "process link 1 get it cloudflare done then another link and so on"
+  // Process a single item within the concurrent worker pool
+  const processSingleBatchItem = async (
+    i: number,
+    workerId: number,
+    item: BatchQueueItem
+  ) => {
+    setActiveBatchIndex(i);
+
+    // STEP 0: Check Cloudflare Registry according to user's batchSkipMode
+    if (batchSkipMode !== 'dont_skip') {
+      setBatchQueue((prev) =>
+        prev.map((q, idx) =>
+          idx === i
+            ? {
+                ...q,
+                workerId,
+                status: 'checking_registry',
+                statusMessage: `[Worker ${workerId}] Checking Cloudflare Registry for Link ${i + 1}...`,
+              }
+            : q
+        )
+      );
+
+      try {
+        const checkRes = await fetch('/api/registry/check', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ urls: [item.url], autoRegisterIfMissing: true }),
+        });
+        const checkData = await checkRes.json();
+        const checkItem = checkData.results?.[0];
+
+        if (checkItem?.isRegistered && checkItem.record) {
+          const rec = checkItem.record;
+          const hasStoredAssets = Boolean(
+            rec.cloudflareVideoUrl ||
+            (rec.status === 'uploaded' && rec.cloudflareThumbnailUrl && !rec.videoUrl)
+          );
+
+          if (batchSkipMode === 'strict_skip') {
+            // Option B: Strict bypass ONLY if this exact Web URL already has its Cloudflare-uploaded assets
+            if (hasStoredAssets) {
+              setBatchQueue((prev) =>
+                prev.map((q, idx) =>
+                  idx === i
+                    ? {
+                        ...q,
+                        workerId,
+                        status: 'skipped_in_cloudflare',
+                        statusMessage: `[Worker ${workerId}] Strict Skip: Web URL already uploaded to Cloudflare (0 duplicate copies) · Bypassed`,
+                        title: rec.title,
+                        rawTitle: rec.rawTitle || rec.title,
+                        description: rec.description || '',
+                        videoStreamUrl: rec.cloudflareVideoUrl || rec.videoUrl,
+                        originalVideoUrl: rec.videoUrl,
+                        cloudflareVideoUrl: rec.cloudflareVideoUrl,
+                        videoStorageSource: rec.videoStorageSource || 'cloudflare_r2',
+                        originalThumbnailUrl: rec.thumbnailUrl,
+                        cloudflareThumbnailUrl: rec.cloudflareThumbnailUrl || rec.thumbnailUrl,
+                        thumbnailStorageSource: rec.thumbnailStorageSource || (rec.cloudflareThumbnailUrl ? 'cloudflare_r2' : undefined),
+                        durationFormatted: rec.durationFormatted,
+                        durationSec: rec.durationSec,
+                        sizeFormatted: rec.sizeFormatted,
+                        isRegisteredInCloudflare: true,
+                        destination: rec.destination,
+                        destinationDetail: rec.destinationDetail,
+                        registryUniqueId: rec.id,
+                      }
+                    : q
+                )
+              );
+              // Advance to next link without re-scraping
+              return;
+            }
+          } else if (batchSkipMode === 'smart_cache') {
+            // Option A: Reuse FULL saved details from Cloudflare Vault ONLY if video is actually on Cloudflare R2
+            if (hasStoredAssets) {
+              setBatchQueue((prev) =>
+                prev.map((q, idx) =>
+                  idx === i
+                    ? {
+                        ...q,
+                        workerId,
+                        status: 'completed',
+                        statusMessage: `[Worker ${workerId}] Reused from Cloudflare Vault (Web URL Match · 0 Duplicate Copies)`,
+                        title: rec.title,
+                        rawTitle: rec.rawTitle || rec.title,
+                        description: rec.description || '',
+                        videoStreamUrl: rec.cloudflareVideoUrl || rec.videoUrl,
+                        originalVideoUrl: rec.videoUrl,
+                        cloudflareVideoUrl: rec.cloudflareVideoUrl,
+                        videoStorageSource: rec.videoStorageSource || 'cloudflare_r2',
+                        originalThumbnailUrl: rec.thumbnailUrl,
+                        cloudflareThumbnailUrl: rec.cloudflareThumbnailUrl || rec.thumbnailUrl,
+                        thumbnailStorageSource: rec.thumbnailStorageSource || (rec.cloudflareThumbnailUrl ? 'cloudflare_r2' : undefined),
+                        durationFormatted: rec.durationFormatted,
+                        durationSec: rec.durationSec,
+                        sizeFormatted: rec.sizeFormatted,
+                        isRegisteredInCloudflare: true,
+                        destination: rec.destination,
+                        destinationDetail: rec.destinationDetail,
+                        registryUniqueId: rec.id,
+                      }
+                    : q
+                )
+              );
+              // Completed with full cached Cloudflare assets, return from worker task
+              return;
+            }
+          }
+        }
+      } catch (checkErr) {
+        console.warn('Registry check failed, continuing with live extraction:', checkErr);
+      }
+    }
+
+    // STEP 1: Update status to Scraping
+    setBatchQueue((prev) =>
+      prev.map((q, idx) =>
+        idx === i
+          ? {
+              ...q,
+              workerId,
+              status: 'scraping',
+              statusMessage: `[Worker ${workerId}] Scraping & extracting link ${i + 1}...`,
+            }
+          : q
+      )
+    );
+
+    try {
+      // Scrape and automatically upload both thumbnail and video stream to Cloudflare R2
+      const res = await fetch('/api/process-url', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getR2Headers() },
+        body: JSON.stringify({
+          url: item.url,
+          wordsToRemove: wordsToRemove.trim(),
+          uploadThumbnailToR2: true, // Automatically upload thumbnail to Cloudflare R2!
+          uploadVideoToR2: true, // Automatically upload video stream to Cloudflare R2!
+          forceRefresh: batchSkipMode === 'dont_skip',
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || `Failed with status ${res.status}`);
+      }
+
+      const primaryVideo = data.media?.videos?.[0];
+      const title = data.page?.title || primaryVideo?.title || item.url.split('/').pop()?.split('?')[0] || `Video ${i + 1}`;
+      const rawTitle = data.page?.rawTitle || title;
+      const originalVideoUrl = primaryVideo?.originalVideoUrl || primaryVideo?.url || (data.contentType?.includes('video') ? item.url : '');
+      let cloudflareVideoUrl = data.page?.cloudflareVideoUrl || primaryVideo?.cloudflareVideoUrl;
+      let videoStreamUrl = cloudflareVideoUrl || originalVideoUrl;
+
+      let cloudflareThumb = data.page?.cloudflareThumbnailUrl || primaryVideo?.cloudflareThumbnailUrl;
+      const originalThumb = data.page?.ogImage || primaryVideo?.poster || data.page?.candidateThumbnails?.[0]?.url || '';
+      let resolvedDurationFormatted = data.page?.durationFormatted || primaryVideo?.durationFormatted || '';
+      let resolvedDurationSec = data.page?.durationSec ?? primaryVideo?.durationSec ?? null;
+      let resolvedSizeFormatted = data.page?.videoSize?.sizeFormatted || primaryVideo?.sizeFormatted || '';
+      let resolvedSizeBytes = data.page?.videoSize?.sizeBytes ?? primaryVideo?.sizeBytes ?? null;
+      let resolvedSizeMb = data.page?.videoSize?.sizeMb || primaryVideo?.sizeMb || undefined;
+      let resolvedVideoStorageSource = data.page?.videoStorageSource || (cloudflareVideoUrl ? 'cloudflare_r2' : undefined);
+      let resolvedThumbStorageSource = data.page?.thumbnailStorageSource || (cloudflareThumb ? 'cloudflare_r2' : undefined);
+
+      // If server didn't auto-upload thumbnail, trigger fallback upload now and update registry
+      if (!cloudflareThumb && originalThumb && !data.fromCache) {
+        setBatchQueue((prev) =>
+          prev.map((q, idx) =>
+            idx === i
+              ? {
+                  ...q,
+                  workerId,
+                  status: 'uploading_cloudflare',
+                  statusMessage: `[Worker ${workerId}] Uploading thumbnail to Cloudflare R2 for link ${i + 1}...`,
+                }
+              : q
+          )
+        );
+
+        try {
+          const upRes = await fetch('/api/upload-thumbnail-to-r2', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...getR2Headers() },
+            body: JSON.stringify({
+              imageUrl: originalThumb,
+              customFilename: title,
+              folderPrefix: 'thumbnails',
+              refererUrl: data.finalUrl || item.url,
+            }),
+          });
+          const upData = await upRes.json();
+          if (upRes.ok && upData.success) {
+            cloudflareThumb = upData.cloudflareBackLink;
+            resolvedThumbStorageSource = upData.storageSource || 'cloudflare_r2';
+          }
+        } catch (cfErr) {
+          console.warn('Cloudflare thumbnail upload error on item', i, cfErr);
+        }
+      }
+
+      // If server didn't auto-upload video, trigger fallback upload now and capture verified size/duration
+      let fallbackUploaded = false;
+      if (!cloudflareVideoUrl && originalVideoUrl && !data.fromCache) {
+        setBatchQueue((prev) =>
+          prev.map((q, idx) =>
+            idx === i
+              ? {
+                  ...q,
+                  workerId,
+                  status: 'uploading_cloudflare',
+                  statusMessage: `[Worker ${workerId}] Uploading video to Cloudflare R2 for link ${i + 1}...`,
+                }
+              : q
+          )
+        );
+
+        try {
+          const upVidRes = await fetch('/api/upload-video-to-r2', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...getR2Headers() },
+            body: JSON.stringify({
+              videoUrl: originalVideoUrl,
+              customFilename: title,
+              folderPrefix: 'videos',
+              refererUrl: data.finalUrl || item.url,
+            }),
+          });
+          const upVidData = await upVidRes.json();
+          if (upVidRes.ok && upVidData.success) {
+            cloudflareVideoUrl = upVidData.cloudflareVideoBackLink;
+            videoStreamUrl = upVidData.cloudflareVideoBackLink;
+            resolvedVideoStorageSource = upVidData.storageSource || 'cloudflare_r2';
+            if (upVidData.sizeFormatted) resolvedSizeFormatted = upVidData.sizeFormatted;
+            if (upVidData.sizeBytes) resolvedSizeBytes = upVidData.sizeBytes;
+            if (upVidData.sizeMb) resolvedSizeMb = upVidData.sizeMb;
+            if (upVidData.durationSec) {
+              resolvedDurationSec = upVidData.durationSec;
+              resolvedDurationFormatted = upVidData.durationFormatted || formatSecondsToDuration(upVidData.durationSec);
+            }
+            fallbackUploaded = true;
+          }
+        } catch (cfVidErr) {
+          console.warn('Cloudflare video upload error on item', i, cfVidErr);
+        }
+      }
+
+      if (fallbackUploaded || (cloudflareThumb && !data.page?.cloudflareThumbnailUrl)) {
+        fetch('/api/registry/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sourceUrl: item.url,
+            title,
+            rawTitle,
+            description: data.page?.description || primaryVideo?.description || '',
+            videoUrl: originalVideoUrl,
+            thumbnailUrl: originalThumb,
+            cloudflareVideoUrl: cloudflareVideoUrl || undefined,
+            cloudflareThumbnailUrl: cloudflareThumb || undefined,
+            thumbnailStorageSource: resolvedThumbStorageSource || null,
+            videoStorageSource: resolvedVideoStorageSource || null,
+            durationSec: resolvedDurationSec,
+            durationFormatted: resolvedDurationFormatted,
+            sizeBytes: resolvedSizeBytes,
+            sizeMb: resolvedSizeMb,
+            sizeFormatted: resolvedSizeFormatted,
+          }),
+        }).catch(() => {});
+      }
+
+      // STEP 2: Mark Completed with verified Cloudflare status
+      const isFromWebUrlCache = Boolean(data.fromCache || data.cachedByWebUrl);
+      setBatchQueue((prev) =>
+        prev.map((q, idx) =>
+          idx === i
+            ? {
+                ...q,
+                workerId,
+                status: 'completed',
+                statusMessage: isFromWebUrlCache
+                  ? `[Worker ${workerId}] Reused from Cloudflare Vault (Web URL Match · 0 Duplicate Copies)`
+                  : cloudflareVideoUrl
+                  ? `[Worker ${workerId}] Completed: Video & Thumbnail on Cloudflare R2`
+                  : `[Worker ${workerId}] Scraped (Website Stream Only · Video Not Uploaded to R2)`,
+                title,
+                rawTitle,
+                videoStreamUrl,
+                originalVideoUrl,
+                cloudflareVideoUrl: cloudflareVideoUrl || undefined,
+                videoStorageSource: resolvedVideoStorageSource,
+                originalThumbnailUrl: originalThumb,
+                cloudflareThumbnailUrl: cloudflareThumb || originalThumb,
+                thumbnailStorageSource: resolvedThumbStorageSource,
+                durationFormatted: resolvedDurationFormatted,
+                durationSec: resolvedDurationSec,
+                sizeFormatted: resolvedSizeFormatted,
+                description: data.page?.description || primaryVideo?.description || '',
+                isRegisteredInCloudflare: true,
+                registryUniqueId: data.registryUniqueId || data.registryRecord?.id,
+              }
+            : q
+        )
+      );
+    } catch (itemErr: any) {
+      setBatchQueue((prev) =>
+        prev.map((q, idx) =>
+          idx === i
+            ? {
+                ...q,
+                workerId,
+                status: 'error',
+                statusMessage: `[Worker ${workerId}] Failed: ${itemErr.message || 'Scrape failed'}`,
+                error: itemErr.message || 'Scraping failed',
+              }
+            : q
+        )
+      );
+    }
+  };
+
+  // Concurrent Multi-Worker Batch Queue Processor: Supports 1 - 20 parallel workers for VPS capacity
   const handleStartSequentialBatch = async () => {
-    // If queue is empty, populate from detected links
+    // Sync queue with newly pasted links in batchRawText if queue is empty OR textarea URLs changed
     let currentQueue = [...batchQueue];
-    if (currentQueue.length === 0 && detectedLinksInBatch.length > 0) {
+    const queueUrlsJoined = currentQueue.map((q) => q.url).join('\n');
+    const detectedJoined = detectedLinksInBatch.join('\n');
+
+    if (
+      (currentQueue.length === 0 && detectedLinksInBatch.length > 0) ||
+      (detectedLinksInBatch.length > 0 && queueUrlsJoined !== detectedJoined)
+    ) {
       currentQueue = detectedLinksInBatch.map((url, index) => ({
         id: `queue_${Date.now()}_${index}`,
         url,
         index: index + 1,
         status: 'pending',
         statusMessage: 'Ready in queue',
+      }));
+      setBatchQueue(currentQueue);
+    } else if (batchSkipMode === 'dont_skip' && currentQueue.length > 0) {
+      // If user chose "Don't Skip (Force Done Again)", reset completed/skipped items to pending so they re-run
+      currentQueue = currentQueue.map((q) => ({
+        ...q,
+        status: 'pending',
+        statusMessage: 'Ready for forced re-scrape',
       }));
       setBatchQueue(currentQueue);
     }
@@ -593,256 +1202,85 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
     pauseRef.current = false;
     cancelRef.current = false;
 
-    for (let i = 0; i < currentQueue.length; i++) {
-      if (cancelRef.current) break;
+    // Concurrency control: 1 to 20 parallel workers with live dynamic scaling
+    isBatchRunningRef.current = true;
+    currentQueueRef.current = currentQueue;
+    nextIndexRef.current = 0;
+    runningWorkerCountRef.current = 0;
+    workerIdCounterRef.current = 0;
 
-      // Handle pause loop
-      while (pauseRef.current) {
-        await new Promise((r) => setTimeout(r, 500));
-        if (cancelRef.current) break;
-      }
-      if (cancelRef.current) break;
-
-      const item = currentQueue[i];
-      // Skip already completed unless user requested retry
-      if (item.status === 'completed' || item.status === 'skipped_in_cloudflare') continue;
-
-      setActiveBatchIndex(i);
-
-      // STEP 0: Check Cloudflare Registry according to user's batchSkipMode
-      if (batchSkipMode !== 'dont_skip') {
-        setBatchQueue((prev) =>
-          prev.map((q, idx) =>
-            idx === i
-              ? { ...q, status: 'checking_registry', statusMessage: `Checking Cloudflare Registry for Link ${i + 1}...` }
-              : q
-          )
-        );
-
-        try {
-          const checkRes = await fetch('/api/registry/check', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ urls: [item.url], autoRegisterIfMissing: true }),
-          });
-          const checkData = await checkRes.json();
-          const checkItem = checkData.results?.[0];
-
-          if (checkItem?.isRegistered && checkItem.record) {
-            const rec = checkItem.record;
-            const isReusedNoCopy = !checkItem.isNew;
-
-            if (batchSkipMode === 'strict_skip') {
-              // Option B: Skip from both (Strict bypass)
-              if (isReusedNoCopy) {
-                setBatchQueue((prev) =>
-                  prev.map((q, idx) =>
-                    idx === i
-                      ? {
-                          ...q,
-                          status: 'skipped_in_cloudflare',
-                          statusMessage: `Strict Skip: Already in Cloudflare (0 copy created) · Bypassed`,
-                          title: rec.title,
-                          rawTitle: rec.rawTitle || rec.title,
-                          isRegisteredInCloudflare: true,
-                          destination: rec.destination,
-                          registryUniqueId: rec.id,
-                        }
-                      : q
-                  )
-                );
-                // Advance to next link without queuing for category forward
-                continue;
-              }
-            } else if (batchSkipMode === 'smart_cache') {
-              // Option A: Skip re-scraping but retrieve full details from Cloudflare R2
-              if (isReusedNoCopy && (rec.cloudflareVideoUrl || rec.videoUrl)) {
-                setBatchQueue((prev) =>
-                  prev.map((q, idx) =>
-                    idx === i
-                      ? {
-                          ...q,
-                          status: 'completed',
-                          statusMessage: `Reused from Cloudflare R2 (0 Copy Overhead · Cached)`,
-                          title: rec.title,
-                          rawTitle: rec.rawTitle || rec.title,
-                          videoStreamUrl: rec.cloudflareVideoUrl || rec.videoUrl,
-                          originalVideoUrl: rec.videoUrl,
-                          cloudflareVideoUrl: rec.cloudflareVideoUrl,
-                          originalThumbnailUrl: rec.thumbnailUrl,
-                          cloudflareThumbnailUrl: rec.cloudflareThumbnailUrl || rec.thumbnailUrl,
-                          thumbnailStorageSource: rec.cloudflareThumbnailUrl ? 'cloudflare_r2' : undefined,
-                          durationFormatted: rec.durationFormatted,
-                          durationSec: rec.durationSec,
-                          sizeFormatted: rec.sizeFormatted,
-                          isRegisteredInCloudflare: true,
-                          destination: rec.destination,
-                          destinationDetail: rec.destinationDetail,
-                          registryUniqueId: rec.id,
-                        }
-                      : q
-                  )
-                );
-                // Completed with cached R2 assets, continue to next link
-                continue;
-              }
-            }
-          }
-        } catch (checkErr) {
-          console.warn('Registry check failed, continuing with live extraction:', checkErr);
-        }
-      }
-
-      // STEP 1: Update status to Scraping
-      setBatchQueue((prev) =>
-        prev.map((q, idx) =>
-          idx === i
-            ? { ...q, status: 'scraping', statusMessage: `Processing & extracting link ${i + 1}/${prev.length}...` }
-            : q
-        )
-      );
-
+    const runWorker = async (workerId: number) => {
+      runningWorkerCountRef.current++;
       try {
-        // Scrape and automatically upload both thumbnail and video stream to Cloudflare R2
-        const res = await fetch('/api/process-url', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            url: item.url,
-            wordsToRemove: wordsToRemove.trim(),
-            uploadThumbnailToR2: true, // Automatically upload thumbnail to Cloudflare R2!
-            uploadVideoToR2: true, // Automatically upload video stream to Cloudflare R2!
-          }),
-        });
+        while (true) {
+          if (cancelRef.current) break;
 
-        const data = await res.json();
-        if (!res.ok || !data.success) {
-          throw new Error(data.error || `Failed with status ${res.status}`);
-        }
+          // Handle pause loop
+          while (pauseRef.current) {
+            await new Promise((r) => setTimeout(r, 400));
+            if (cancelRef.current) break;
+          }
+          if (cancelRef.current) break;
 
-        const primaryVideo = data.media?.videos?.[0];
-        const title = data.page?.title || primaryVideo?.title || item.url.split('/').pop()?.split('?')[0] || `Video ${i + 1}`;
-        const rawTitle = data.page?.rawTitle || title;
-        let originalVideoUrl = primaryVideo?.originalVideoUrl || primaryVideo?.url || (data.contentType?.includes('video') ? item.url : '');
-        let cloudflareVideoUrl = data.page?.cloudflareVideoUrl || primaryVideo?.cloudflareVideoUrl;
-        let videoStreamUrl = cloudflareVideoUrl || originalVideoUrl;
+          // Dynamic scale-down check:
+          // If user reduced worker count while this worker was processing a video,
+          // gracefully stop this worker now that its previous video is complete!
+          if (runningWorkerCountRef.current > concurrencyRef.current) {
+            break;
+          }
 
-        let cloudflareThumb = data.page?.cloudflareThumbnailUrl || primaryVideo?.cloudflareThumbnailUrl;
-        const originalThumb = data.page?.ogImage || primaryVideo?.poster || data.page?.candidateThumbnails?.[0]?.url || '';
+          const targetIndex = nextIndexRef.current++;
+          if (targetIndex >= currentQueueRef.current.length) {
+            break;
+          }
 
-        // If server didn't auto-upload thumbnail, trigger upload now
-        if (!cloudflareThumb && originalThumb) {
-          setBatchQueue((prev) =>
-            prev.map((q, idx) =>
-              idx === i
-                ? {
-                    ...q,
-                    status: 'uploading_cloudflare',
-                    statusMessage: `Uploading thumbnail to Cloudflare R2 for link ${i + 1}...`,
-                  }
-                : q
-            )
-          );
+          const targetItem = currentQueueRef.current[targetIndex];
+          // Skip already completed unless reset
+          if (targetItem.status === 'completed' || targetItem.status === 'skipped_in_cloudflare') {
+            continue;
+          }
 
+          setActiveWorkers((prev) => prev + 1);
           try {
-            const upRes = await fetch('/api/upload-thumbnail-to-r2', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                imageUrl: originalThumb,
-                customFilename: title,
-                folderPrefix: 'thumbnails',
-              }),
-            });
-            const upData = await upRes.json();
-            if (upRes.ok && upData.success) {
-              cloudflareThumb = upData.cloudflareBackLink;
-            }
-          } catch (cfErr) {
-            console.warn('Cloudflare thumbnail upload error on item', i, cfErr);
+            await processSingleBatchItem(targetIndex, workerId, targetItem);
+          } finally {
+            setActiveWorkers((prev) => Math.max(0, prev - 1));
+          }
+
+          // Check again after item completion: if concurrency decreased during processing, exit gracefully
+          if (runningWorkerCountRef.current > concurrencyRef.current) {
+            break;
+          }
+
+          // Small breathing delay if running single worker
+          if (concurrencyRef.current === 1) {
+            await new Promise((r) => setTimeout(r, 400));
           }
         }
+      } finally {
+        runningWorkerCountRef.current = Math.max(0, runningWorkerCountRef.current - 1);
 
-        // If server didn't auto-upload video, trigger video upload now
-        if (!cloudflareVideoUrl && originalVideoUrl) {
-          setBatchQueue((prev) =>
-            prev.map((q, idx) =>
-              idx === i
-                ? {
-                    ...q,
-                    status: 'uploading_cloudflare',
-                    statusMessage: `Uploading video to Cloudflare R2 for link ${i + 1}...`,
-                  }
-                : q
-            )
-          );
-
-          try {
-            const upVidRes = await fetch('/api/upload-video-to-r2', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                videoUrl: originalVideoUrl,
-                customFilename: title,
-                folderPrefix: 'videos',
-              }),
-            });
-            const upVidData = await upVidRes.json();
-            if (upVidRes.ok && upVidData.success) {
-              cloudflareVideoUrl = upVidData.cloudflareVideoBackLink;
-              videoStreamUrl = upVidData.cloudflareVideoBackLink;
-            }
-          } catch (cfVidErr) {
-            console.warn('Cloudflare video upload error on item', i, cfVidErr);
-          }
+        // If all running workers have completed and no items left or cancelled, clean up batch
+        if (runningWorkerCountRef.current === 0) {
+          setIsBatchRunning(false);
+          setIsBatchPaused(false);
+          isBatchRunningRef.current = false;
+          setActiveWorkers(0);
+          setActiveBatchIndex(-1);
         }
-
-        // STEP 2: Mark Completed with both permanent Cloudflare back links verified
-        setBatchQueue((prev) =>
-          prev.map((q, idx) =>
-            idx === i
-              ? {
-                  ...q,
-                  status: 'completed',
-                  statusMessage: 'Completed: Video & Thumbnail on Cloudflare R2',
-                  title,
-                  rawTitle,
-                  videoStreamUrl,
-                  originalVideoUrl,
-                  cloudflareVideoUrl: cloudflareVideoUrl || undefined,
-                  videoStorageSource: data.page?.videoStorageSource || (cloudflareVideoUrl ? 'cloudflare_r2' : undefined),
-                  originalThumbnailUrl: originalThumb,
-                  cloudflareThumbnailUrl: cloudflareThumb || originalThumb,
-                  thumbnailStorageSource: data.page?.thumbnailStorageSource || 'cloudflare_r2',
-                  durationFormatted: data.page?.durationFormatted || primaryVideo?.durationFormatted || '',
-                  durationSec: data.page?.durationSec || primaryVideo?.durationSec || null,
-                  sizeFormatted: data.page?.videoSize?.sizeFormatted || primaryVideo?.sizeFormatted || '',
-                  description: data.page?.description || primaryVideo?.description || '',
-                }
-              : q
-          )
-        );
-      } catch (itemErr: any) {
-        setBatchQueue((prev) =>
-          prev.map((q, idx) =>
-            idx === i
-              ? {
-                  ...q,
-                  status: 'error',
-                  statusMessage: itemErr.message || 'Failed to process link',
-                  error: itemErr.message || 'Scraping failed',
-                }
-              : q
-          )
-        );
       }
+    };
 
-      // Small delay between links to be gentle on servers
-      await new Promise((r) => setTimeout(r, 600));
+    runWorkerFnRef.current = runWorker;
+
+    // Launch initial workers (1 - 20)
+    const safeConcurrency = Math.max(1, Math.min(20, concurrencyRef.current));
+    const initialWorkerCount = Math.min(safeConcurrency, currentQueue.length);
+
+    for (let i = 0; i < initialWorkerCount; i++) {
+      const workerId = ++workerIdCounterRef.current;
+      runWorker(workerId);
     }
-
-    setIsBatchRunning(false);
-    setActiveBatchIndex(-1);
   };
 
   const handlePauseBatch = () => {
@@ -853,12 +1291,26 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
   const handleResumeBatch = () => {
     pauseRef.current = false;
     setIsBatchPaused(false);
+    // If worker count dropped below current concurrency target, spawn workers
+    if (runWorkerFnRef.current && isBatchRunningRef.current) {
+      const targetCount = Math.min(concurrencyRef.current, currentQueueRef.current.length);
+      const deficit = targetCount - runningWorkerCountRef.current;
+      if (deficit > 0 && nextIndexRef.current < currentQueueRef.current.length) {
+        for (let i = 0; i < deficit; i++) {
+          const newWorkerId = ++workerIdCounterRef.current;
+          runWorkerFnRef.current(newWorkerId);
+        }
+      }
+    }
   };
 
   const handleCancelBatch = () => {
     cancelRef.current = true;
+    isBatchRunningRef.current = false;
     setIsBatchRunning(false);
     setIsBatchPaused(false);
+    setActiveWorkers(0);
+    setActiveBatchIndex(-1);
   };
 
   const copyToClipboard = (text: string, key: string) => {
@@ -1212,7 +1664,9 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
                     className="px-5 py-2 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-xs transition-all shadow-lg shadow-emerald-500/20 disabled:opacity-50 flex items-center gap-1.5"
                   >
                     <Play className="w-3.5 h-3.5 fill-current" />
-                    <span>Start Sequential Pipeline (Link 1 ➔ Link 2...)</span>
+                    <span>
+                      Start Pipeline ({concurrency === 1 ? '1x Sequential' : `${concurrency}x Parallel Workers`})
+                    </span>
                   </button>
                 ) : (
                   <div className="flex items-center gap-2">
@@ -1245,6 +1699,68 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
                   </div>
                 )}
               </div>
+            </div>
+
+            {/* VPS Multi-Worker Concurrency Bar (1 - 20 Parallel Workers) */}
+            <div className="p-3 bg-gradient-to-r from-cyan-950/40 via-slate-950 to-slate-950 border border-cyan-500/30 rounded-xl space-y-2.5 text-xs">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Zap className="w-4 h-4 text-cyan-400" />
+                  <span className="font-bold text-white text-xs">VPS Multi-Worker Concurrency (1 - 20 at a time)</span>
+                  <span className="px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 font-mono text-[10px] font-bold border border-cyan-500/30">
+                    {concurrency}x Parallel {concurrency === 1 ? 'Worker' : 'Workers'}
+                  </span>
+                  {activeWorkers > 0 && (
+                    <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 font-mono text-[10px] font-bold border border-emerald-500/30 animate-pulse">
+                      {activeWorkers} Active Now
+                    </span>
+                  )}
+                  {isBatchRunning && (
+                    <span className="px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 text-[10px] font-semibold border border-indigo-500/30">
+                      Live Dynamic Scaling Active
+                    </span>
+                  )}
+                </div>
+
+                {/* Quick Presets: 1x, 2x, 3x, 5x, 8x, 10x, 15x, 20x */}
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="text-[11px] text-slate-400 mr-0.5">Presets:</span>
+                  {[1, 2, 3, 5, 8, 10, 15, 20].map((num) => (
+                    <button
+                      key={num}
+                      type="button"
+                      onClick={() => handleSetConcurrency(num)}
+                      className={`px-2 py-0.5 rounded-lg border text-[11px] font-mono font-bold transition-all ${
+                        concurrency === num
+                          ? 'bg-cyan-500 text-slate-950 border-cyan-400 shadow-sm'
+                          : 'bg-slate-900 border-slate-700 text-slate-300 hover:border-slate-600'
+                      }`}
+                    >
+                      {num}x{num === 1 ? ' (Seq)' : num === 5 ? ' (Rec)' : num === 20 ? ' (Max)' : ''}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Slider for smooth 1 - 20 selection */}
+              <div className="flex items-center gap-3 pt-0.5">
+                <span className="text-[11px] text-slate-400 font-mono w-16">1 Worker</span>
+                <input
+                  type="range"
+                  min={1}
+                  max={20}
+                  step={1}
+                  value={concurrency}
+                  onChange={(e) => handleSetConcurrency(Number(e.target.value))}
+                  className="flex-1 accent-cyan-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                />
+                <span className="text-[11px] text-cyan-400 font-mono font-bold w-28 text-right">
+                  20 Workers (Max)
+                </span>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-tight">
+                Live adjustable: Increase workers anytime to immediately launch parallel scraping threads. Decrease workers anytime and active threads will gracefully finish their current video before scaling down.
+              </p>
             </div>
 
             {/* Cloudflare Deduplication & Multi-Option Skip Selector */}
@@ -1461,6 +1977,18 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
               <span>Get Details from Cloudflare</span>
             </button>
 
+            {!singleRegistryRecord.isNew && (
+              <button
+                type="button"
+                onClick={() => handleProcessUrl(undefined, true)}
+                className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-cyan-500/30 font-semibold rounded-lg text-xs transition-colors flex items-center gap-1"
+                title="Force re-fetch and re-extract webpage from live source (bypassing Web URL cache)"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Force Live Re-Scrape</span>
+              </button>
+            )}
+
             <button
               type="button"
               onClick={() => {
@@ -1630,13 +2158,16 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
               const isCurrent = activeBatchIndex === idx;
               const isDone = item.status === 'completed';
               const isErr = item.status === 'error';
-              const isWorking = item.status === 'scraping' || item.status === 'uploading_cloudflare';
+              const isWorking =
+                item.status === 'scraping' ||
+                item.status === 'uploading_cloudflare' ||
+                item.status === 'checking_registry';
 
               return (
                 <div
                   key={item.id}
                   className={`p-4 rounded-xl border text-xs transition-all ${
-                    isCurrent
+                    isWorking || isCurrent
                       ? 'bg-cyan-500/10 border-cyan-500/40 ring-1 ring-cyan-500/30'
                       : isDone
                       ? 'bg-slate-950/80 border-slate-800 hover:border-slate-700'
@@ -1673,6 +2204,13 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
                           <span className="font-bold text-white text-sm truncate">
                             {item.title || `Link ${item.index}`}
                           </span>
+
+                          {/* Parallel Worker ID Tag */}
+                          {item.workerId && isWorking && (
+                            <span className="px-1.5 py-0.5 rounded bg-cyan-400 text-slate-950 font-bold font-mono text-[9px] shadow-sm animate-pulse">
+                              Worker #{item.workerId}
+                            </span>
+                          )}
 
                           {/* Status Badge */}
                           {isWorking && (
@@ -1756,7 +2294,23 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
                     </div>
 
                     {/* Per-Item Actions */}
-                    <div className="flex items-center gap-2 shrink-0">
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                      {item.url && (
+                        <button
+                          type="button"
+                          onClick={() => copyToClipboard(item.url, `item_main_url_${idx}`)}
+                          className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-lg font-semibold text-xs flex items-center gap-1"
+                          title="Copy main website URL to verify video, title, and thumbnail"
+                        >
+                          {copiedKey === `item_main_url_${idx}` ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5 text-slate-400" />
+                          )}
+                          <span>{copiedKey === `item_main_url_${idx}` ? 'Copied' : 'Copy Main URL'}</span>
+                        </button>
+                      )}
+
                       {item.cloudflareVideoUrl && (
                         <button
                           type="button"
@@ -1846,18 +2400,39 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({ onNavigateTab }) => 
                 <span className="p-1.5 rounded-lg bg-cyan-500 text-slate-950 font-bold">
                   <Sparkles className="w-4 h-4" />
                 </span>
-                <div>
+                <div className="min-w-0">
                   <h3 className="text-sm font-bold text-white">
                     Extracted Video Metadata &amp; Cloudflare Thumbnail
                   </h3>
                   <p className="text-xs text-slate-400">
                     Direct stream link, verified Cloudflare R2 thumbnail back link, duration, and synopsis.
                   </p>
+                  {result.targetUrl && (
+                    <p className="text-[11px] font-mono text-slate-500 truncate max-w-xl mt-0.5">
+                      Main URL: {result.targetUrl}
+                    </p>
+                  )}
                 </div>
               </div>
 
-              {/* Action Buttons to forward to Categories, Series, Reels (Tracks destination in Cloudflare Registry) */}
+              {/* Action Buttons to copy main URL or forward to Categories, Series, Reels */}
               <div className="flex flex-wrap items-center gap-2">
+                {result.targetUrl && (
+                  <button
+                    type="button"
+                    onClick={() => copyToClipboard(result.targetUrl, 'single_main_url')}
+                    className="px-3.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-sm"
+                    title={`Copy main website URL: ${result.targetUrl}`}
+                  >
+                    {copiedKey === 'single_main_url' ? (
+                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                    ) : (
+                      <Copy className="w-3.5 h-3.5 text-slate-400" />
+                    )}
+                    <span>{copiedKey === 'single_main_url' ? 'Copied Main URL' : 'Copy Main URL'}</span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   onClick={async () => {

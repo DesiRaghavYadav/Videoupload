@@ -2,10 +2,18 @@ import express, { Request, Response } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
+import http from 'http';
+import https from 'https';
+import { pipeline } from 'stream/promises';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+
+const execFileAsync = promisify(execFile);
 import {
   S3Client,
   PutObjectCommand,
@@ -17,12 +25,206 @@ import {
 // Initialize dotenv
 dotenv.config();
 
+// Format network/Axios errors concisely without dumping raw TLSSocket / ClientRequest internals
+function formatCompactError(err: any): string {
+  if (!err) return 'Unknown error';
+  if (typeof err === 'string') return err;
+  const code = err.code || err.cause?.code;
+  const status = err.response?.status;
+  const msg = err.message || err.cause?.message || String(err);
+  const parts: string[] = [];
+  if (code) parts.push(`[${code}]`);
+  if (status) parts.push(`[HTTP ${status}]`);
+  parts.push(msg);
+  return parts.join(' ');
+}
+
+const RETRYABLE_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ECONNABORTED',
+  'EPIPE',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'ERR_STREAM_PREMATURE_CLOSE',
+  'ERR_SOCKET_CONNECTION_TIMEOUT',
+  'ERR_BAD_RESPONSE',
+  'UND_ERR_SOCKET',
+  'HPE_INVALID_EOF_STATE',
+]);
+
+const RETRYABLE_HTTP_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524]);
+
+function isRetryableNetworkError(err: any): boolean {
+  if (!err) return false;
+  const code = String(err.code || err.cause?.code || '').toUpperCase();
+  if (code && RETRYABLE_ERROR_CODES.has(code)) return true;
+
+  const status = Number(err.response?.status || 0);
+  if (status && RETRYABLE_HTTP_STATUSES.has(status)) return true;
+
+  const msg = `${err.message || ''} ${err.cause?.message || ''}`.toLowerCase();
+  return (
+    msg.includes('econnreset') ||
+    msg.includes('socket hang up') ||
+    msg.includes('stream has been aborted') ||
+    msg.includes('aborted') ||
+    msg.includes('premature close') ||
+    msg.includes('etimedout') ||
+    msg.includes('timeout') ||
+    msg.includes('epipe') ||
+    msg.includes('network socket disconnected')
+  );
+}
+
+function createNonKeepAliveAgents() {
+  return {
+    httpAgent: new http.Agent({ keepAlive: false }),
+    httpsAgent: new https.Agent({ keepAlive: false }),
+  };
+}
+
+function resolveOriginSafe(targetUrl?: string): string {
+  if (!targetUrl) return '';
+  try {
+    return new URL(targetUrl).origin;
+  } catch {
+    return '';
+  }
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function axiosGetWithRetry(url: string, config: Record<string, any> = {}, maxAttempts = 3) {
+  let lastErr: any;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const agents = createNonKeepAliveAgents();
+    const attemptConfig = {
+      ...config,
+      ...agents,
+      headers: {
+        Connection: 'close',
+        ...(config.headers || {}),
+      },
+    };
+
+    try {
+      const response = await axios.get(url, attemptConfig);
+      if (RETRYABLE_HTTP_STATUSES.has(response.status) && attempt < maxAttempts) {
+        if (config.responseType === 'stream' && response.data && typeof response.data.destroy === 'function') {
+          try {
+            response.data.destroy();
+          } catch {}
+        }
+        const backoff = 450 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 250);
+        await sleepMs(backoff);
+        continue;
+      }
+      return response;
+    } catch (err: any) {
+      lastErr = err;
+      if (attempt < maxAttempts && isRetryableNetworkError(err)) {
+        const backoff = 450 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 250);
+        await sleepMs(backoff);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
+}
+
+// System resources & CPU telemetry snapshot tracking
+interface CpuSnapshot {
+  idle: number;
+  total: number;
+  time: number;
+}
+
+let prevCpuSnapshot: CpuSnapshot | null = null;
+let lastCalculatedCpuPercent = 0;
+
+function getCpuSnapshot(): CpuSnapshot {
+  const cpus = os.cpus();
+  let idle = 0;
+  let total = 0;
+  for (const cpu of cpus) {
+    for (const t in cpu.times) {
+      total += (cpu.times as any)[t];
+    }
+    idle += cpu.times.idle;
+  }
+  return { idle, total, time: Date.now() };
+}
+
+// Baseline CPU snapshot on start
+try {
+  prevCpuSnapshot = getCpuSnapshot();
+} catch {}
+
+function getCpuClockSpeed(): { speedMhz: number; model: string } {
+  const cpus = os.cpus();
+  let speedMhz = cpus[0]?.speed || 0;
+  let model = cpus[0]?.model || '';
+
+  // If virtualization hides speed or model in os.cpus(), parse /proc/cpuinfo on Linux
+  if ((!speedMhz || speedMhz === 0 || !model || model === 'unknown') && fs.existsSync('/proc/cpuinfo')) {
+    try {
+      const cpuinfo = fs.readFileSync('/proc/cpuinfo', 'utf8');
+      const speedMatch = cpuinfo.match(/cpu MHz\s*:\s*([\d.]+)/i);
+      if (speedMatch && speedMatch[1]) {
+        speedMhz = parseFloat(speedMatch[1]);
+      }
+      const modelMatch = cpuinfo.match(/model name\s*:\s*(.+)/i);
+      if (modelMatch && modelMatch[1]) {
+        const parsedModel = modelMatch[1].trim();
+        if (parsedModel && parsedModel !== 'unknown') {
+          model = parsedModel;
+        }
+      }
+    } catch {}
+  }
+
+  if (!speedMhz || speedMhz === 0) {
+    speedMhz = 2500;
+  }
+  if (!model || model === 'unknown') {
+    model = `${cpus.length}x vCPU (${os.arch()})`;
+  }
+
+  return { speedMhz, model };
+}
+
+function formatBytes(bytes: number, decimals = 2): string {
+  if (bytes <= 0) return '0 B';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
+}
+
+function formatUptime(seconds: number): string {
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  if (days > 0) return `${days}d ${hours}h ${mins}m`;
+  if (hours > 0) return `${hours}h ${mins}m`;
+  return `${mins}m`;
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = 3000;
 const isProduction = process.env.NODE_ENV === 'production';
+const CF_WORKER_BASE_URL = (
+  getEnvValue(['CF_WORKER_BASE_URL', 'CLOUDFLARE_WORKER_BASE_URL', 'OTT_API_BASE_URL']) ||
+  'https://ott-api.fussionbhakti3.workers.dev'
+).replace(/\/+$/, '');
 
 // In-memory or temp storage uploads directory for local emulator mode
 const localUploadsDir = path.join(__dirname, 'uploads');
@@ -1058,17 +1260,22 @@ export interface CloudflareExtractedLink {
   sourceUrl: string; // original web url
   title: string;
   rawTitle?: string;
+  description?: string;
   videoUrl?: string; // original video stream
   thumbnailUrl?: string; // original poster
   cloudflareVideoUrl?: string; // permanent R2 back link
   cloudflareThumbnailUrl?: string; // permanent R2 thumb link
+  thumbnailStorageSource?: 'cloudflare_r2' | 'emulator' | null;
+  videoStorageSource?: 'cloudflare_r2' | 'emulator' | null;
   durationFormatted?: string;
   durationSec?: number | null;
+  sizeBytes?: number | null;
+  sizeMb?: string;
   sizeFormatted?: string;
   destination?: 'categories' | 'batchvideo' | 'reels' | 'database' | 'none';
   destinationDetail?: string; // e.g. "cat_action_01" or series name
   categories?: string[]; // Multiple categories array: e.g. ["Action Hits", "Trending 2026", "VIP Movies"]
-  status: 'extracted' | 'uploaded' | 'forwarded';
+  status: 'extracted' | 'processing' | 'uploaded' | 'forwarded';
   firstExtractedAt: string;
   lastUpdatedAt: string;
   metadata?: Record<string, any>;
@@ -1162,28 +1369,45 @@ async function syncDomainRulesToStorage(req?: Request): Promise<void> {
   }
 }
 
-// Normalize URL for reliable deduplication comparison
+// Normalize Web URL for reliable deduplication comparison (Strictly matching by Webpage URL)
 function normalizeUrlForDedup(rawUrl: string): string {
   if (!rawUrl) return '';
+  let str = rawUrl.trim();
+  // Ensure protocol for URL parsing
+  if (!/^https?:\/\//i.test(str)) {
+    str = `https://${str}`;
+  }
   try {
-    const u = new URL(rawUrl.trim());
-    // remove trailing slashes and hash
-    let path = u.pathname.replace(/\/+$/, '');
-    if (!path) path = '/';
-    // sorted search params without tracking tokens
+    const u = new URL(str);
+    // Hostnames are case-insensitive; strip leading www.
+    const host = u.hostname.toLowerCase().replace(/^www\./, '');
+    const port = u.port ? `:${u.port}` : '';
+    // Paths are case-sensitive on most video/CDN platforms (preserve case, collapse // and strip trailing /)
+    let pathname = u.pathname.replace(/\/+/g, '/').replace(/\/+$/, '');
+    if (!pathname) pathname = '/';
+
+    // Remove ONLY genuine ad-tracking query params; preserve content IDs like ?v=, ?id=, ?source=, ?ref=
     const params = new URLSearchParams(u.search);
-    params.delete('utm_source');
-    params.delete('utm_medium');
-    params.delete('utm_campaign');
-    params.delete('ref');
+    const adTrackingParams = [
+      'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
+      'fbclid', 'gclid', '_ga', 'mc_cid', 'mc_eid', 'yclid'
+    ];
+    for (const p of adTrackingParams) {
+      params.delete(p);
+    }
+    params.sort();
     const cleanSearch = params.toString();
-    return `${u.protocol}//${u.host}${path}${cleanSearch ? '?' + cleanSearch : ''}`.toLowerCase();
+
+    // Standardize to https://
+    return `https://${host}${port}${pathname}${cleanSearch ? '?' + cleanSearch : ''}`;
   } catch {
-    return rawUrl.trim().toLowerCase().replace(/\/+$/, '');
+    return str
+      .replace(/^https?:\/\/(www\.)?/i, '')
+      .replace(/\/+$/, '');
   }
 }
 
-// Generate deterministic unique ID from normalized URL
+// Generate deterministic unique ID from normalized Web URL
 function getLinkUniqueId(rawUrl: string): string {
   const norm = normalizeUrlForDedup(rawUrl);
   let hash = 0;
@@ -1195,64 +1419,278 @@ function getLinkUniqueId(rawUrl: string): string {
   return `link_${cleanDomain}_${Math.abs(hash).toString(36)}`;
 }
 
-// Helper: Sync links registry to Cloudflare R2 bucket (`registry/links_registry.json`) or local emulator
-async function syncRegistryToStorage(req?: Request): Promise<void> {
+// Helper: Find registry record strictly by Web URL
+function findRegistryRecordByWebUrl(webUrl: string): CloudflareExtractedLink | undefined {
+  if (!webUrl) return undefined;
+  const norm = normalizeUrlForDedup(webUrl);
+  const rawTrimmed = webUrl.trim();
+  const rawWithoutProtocol = rawTrimmed.replace(/^https?:\/\/(www\.)?/i, '').replace(/\/+$/, '');
+
+  return extractedLinksRegistry.find((item) => {
+    if (item.sourceUrl) {
+      if (normalizeUrlForDedup(item.sourceUrl) === norm) return true;
+      if (item.sourceUrl.trim() === rawTrimmed) return true;
+      const itemWithoutProtocol = item.sourceUrl.trim().replace(/^https?:\/\/(www\.)?/i, '').replace(/\/+$/, '');
+      if (itemWithoutProtocol === rawWithoutProtocol) return true;
+      return false;
+    }
+    return item.id === webUrl;
+  });
+}
+
+// Helper: Determine whether a registry entry actually has its media uploaded to Cloudflare R2 (not just un-uploaded source links)
+function hasCompleteCloudflareAssets(rec?: CloudflareExtractedLink | null): boolean {
+  if (!rec) return false;
+  if (rec.cloudflareVideoUrl) return true;
+  // Only treat as complete without cloudflareVideoUrl if no un-uploaded videoUrl is pending and a CF thumbnail was uploaded
+  if (rec.status === 'uploaded' && rec.cloudflareThumbnailUrl && !rec.videoUrl) return true;
+  return false;
+}
+
+let hasHydratedRegistryFromD1 = false;
+let hydratingRegistryPromise: Promise<void> | null = null;
+
+function mergeRegistryEntry(
+  localExisting: CloudflareExtractedLink,
+  remoteItem: CloudflareExtractedLink
+): CloudflareExtractedLink {
+  const localTime = Date.parse(localExisting.lastUpdatedAt || '') || 0;
+  const remoteTime = Date.parse(remoteItem.lastUpdatedAt || '') || 0;
+  const preferRemote = remoteTime > localTime;
+  const primary = preferRemote ? remoteItem : localExisting;
+  const secondary = preferRemote ? localExisting : remoteItem;
+
+  return {
+    ...secondary,
+    ...primary,
+    title: primary.title || secondary.title,
+    rawTitle: primary.rawTitle || secondary.rawTitle,
+    description: primary.description || secondary.description,
+    videoUrl: primary.videoUrl || secondary.videoUrl,
+    thumbnailUrl: primary.thumbnailUrl || secondary.thumbnailUrl,
+    cloudflareVideoUrl: localExisting.cloudflareVideoUrl || remoteItem.cloudflareVideoUrl,
+    cloudflareThumbnailUrl: localExisting.cloudflareThumbnailUrl || remoteItem.cloudflareThumbnailUrl,
+    thumbnailStorageSource: primary.thumbnailStorageSource || secondary.thumbnailStorageSource,
+    videoStorageSource: primary.videoStorageSource || secondary.videoStorageSource,
+    durationSec: primary.durationSec ?? secondary.durationSec,
+    durationFormatted: primary.durationFormatted || secondary.durationFormatted,
+    sizeBytes: primary.sizeBytes ?? secondary.sizeBytes,
+    sizeMb: primary.sizeMb || secondary.sizeMb,
+    sizeFormatted: primary.sizeFormatted || secondary.sizeFormatted,
+    destination:
+      primary.destination && primary.destination !== 'none'
+        ? primary.destination
+        : secondary.destination || 'none',
+    destinationDetail: primary.destinationDetail || secondary.destinationDetail,
+    status:
+      primary.status === 'forwarded' || secondary.status === 'forwarded'
+        ? 'forwarded'
+        : hasCompleteCloudflareAssets(localExisting) || hasCompleteCloudflareAssets(remoteItem)
+        ? 'uploaded'
+        : primary.status,
+  };
+}
+
+async function hydrateRegistryFromD1IfNeeded(): Promise<void> {
+  if (hasHydratedRegistryFromD1) return;
+
+  if (hydratingRegistryPromise) {
+    return hydratingRegistryPromise;
+  }
+
+  hydratingRegistryPromise = (async () => {
+    try {
+      const response = await axios.get(`${CF_WORKER_BASE_URL}/api/links_registry`, {
+        timeout: 15000,
+        validateStatus: () => true,
+      });
+      if (response.status >= 200 && response.status < 300 && Array.isArray(response.data)) {
+        const remoteList: CloudflareExtractedLink[] = response.data;
+        for (const remoteItem of remoteList) {
+          if (!remoteItem?.sourceUrl && !remoteItem?.id) continue;
+          const localExisting = remoteItem.sourceUrl
+            ? findRegistryRecordByWebUrl(remoteItem.sourceUrl)
+            : extractedLinksRegistry.find((r) => r.id === remoteItem.id);
+          if (!localExisting) {
+            extractedLinksRegistry.push(remoteItem);
+          } else {
+            const idx = extractedLinksRegistry.findIndex((r) => r.id === localExisting.id);
+            if (idx >= 0) {
+              extractedLinksRegistry[idx] = mergeRegistryEntry(localExisting, remoteItem);
+            }
+          }
+        }
+        try {
+          fs.writeFileSync(registryFilePath, JSON.stringify(extractedLinksRegistry, null, 2), 'utf-8');
+        } catch {}
+        hasHydratedRegistryFromD1 = true;
+      } else {
+        console.warn(`D1 links_registry hydration returned HTTP ${response.status}`);
+      }
+    } catch (err) {
+      console.warn('Could not hydrate links_registry from Cloudflare D1:', formatCompactError(err));
+    } finally {
+      hydratingRegistryPromise = null;
+    }
+  })();
+
+  return hydratingRegistryPromise;
+}
+
+// Helper: Insert or update a registry record strictly by Web URL (zero duplicates)
+function upsertRegistryRecordByWebUrl(
+  webUrl: string,
+  patch: Partial<CloudflareExtractedLink>,
+  persistLocalNow = true
+): CloudflareExtractedLink {
+  const nowIso = new Date().toISOString();
+  const existing = findRegistryRecordByWebUrl(webUrl);
+
+  if (existing) {
+    const idx = extractedLinksRegistry.findIndex((r) => r.id === existing.id);
+    const updated: CloudflareExtractedLink = {
+      ...existing,
+      ...patch,
+      sourceUrl: existing.sourceUrl || webUrl,
+      title: patch.title || existing.title,
+      rawTitle: patch.rawTitle || existing.rawTitle,
+      description: patch.description || existing.description,
+      videoUrl: patch.videoUrl || existing.videoUrl,
+      thumbnailUrl: patch.thumbnailUrl || existing.thumbnailUrl,
+      cloudflareVideoUrl: patch.cloudflareVideoUrl || existing.cloudflareVideoUrl,
+      cloudflareThumbnailUrl: patch.cloudflareThumbnailUrl || existing.cloudflareThumbnailUrl,
+      thumbnailStorageSource: patch.thumbnailStorageSource || existing.thumbnailStorageSource,
+      videoStorageSource: patch.videoStorageSource || existing.videoStorageSource,
+      durationFormatted: patch.durationFormatted || existing.durationFormatted,
+      durationSec: patch.durationSec !== undefined && patch.durationSec !== null ? patch.durationSec : existing.durationSec,
+      sizeBytes: patch.sizeBytes !== undefined && patch.sizeBytes !== null ? patch.sizeBytes : existing.sizeBytes,
+      sizeMb: patch.sizeMb || existing.sizeMb,
+      sizeFormatted: patch.sizeFormatted || existing.sizeFormatted,
+      status:
+        patch.status === 'forwarded' || existing.status === 'forwarded'
+          ? 'forwarded'
+          : Boolean(patch.cloudflareVideoUrl || existing.cloudflareVideoUrl) ||
+            patch.status === 'uploaded' ||
+            existing.status === 'uploaded'
+          ? 'uploaded'
+          : patch.status || existing.status,
+      lastUpdatedAt: nowIso,
+      metadata: { ...(existing.metadata || {}), ...(patch.metadata || {}) },
+    };
+    if (idx >= 0) {
+      extractedLinksRegistry[idx] = updated;
+    }
+    if (persistLocalNow) {
+      try {
+        fs.writeFileSync(registryFilePath, JSON.stringify(extractedLinksRegistry, null, 2), 'utf-8');
+      } catch {}
+    }
+    return updated;
+  }
+
+  const created: CloudflareExtractedLink = {
+    id: getLinkUniqueId(webUrl),
+    sourceUrl: webUrl,
+    title: patch.title || webUrl.split('/').pop()?.split('?')[0] || 'Extracted Video',
+    rawTitle: patch.rawTitle || patch.title || webUrl,
+    description: patch.description,
+    videoUrl: patch.videoUrl || '',
+    thumbnailUrl: patch.thumbnailUrl || '',
+    cloudflareVideoUrl: patch.cloudflareVideoUrl,
+    cloudflareThumbnailUrl: patch.cloudflareThumbnailUrl,
+    thumbnailStorageSource: patch.thumbnailStorageSource || null,
+    videoStorageSource: patch.videoStorageSource || null,
+    durationFormatted: patch.durationFormatted || '',
+    durationSec: patch.durationSec ?? null,
+    sizeBytes: patch.sizeBytes ?? null,
+    sizeMb: patch.sizeMb,
+    sizeFormatted: patch.sizeFormatted || '',
+    destination: patch.destination || 'none',
+    destinationDetail: patch.destinationDetail,
+    status: patch.cloudflareVideoUrl ? 'uploaded' : patch.status || 'processing',
+    firstExtractedAt: nowIso,
+    lastUpdatedAt: nowIso,
+    metadata: patch.metadata,
+  };
+  extractedLinksRegistry.unshift(created);
+  if (persistLocalNow) {
+    try {
+      fs.writeFileSync(registryFilePath, JSON.stringify(extractedLinksRegistry, null, 2), 'utf-8');
+    } catch {}
+  }
+  return created;
+}
+
+// Helper: Sync links registry directly to Cloudflare D1 (`ott-database` via `/api/links_registry`) + local disk cache
+async function syncRegistryToStorage(
+  _req?: Request,
+  recordsToSync?: CloudflareExtractedLink[]
+): Promise<void> {
   const jsonBuffer = Buffer.from(JSON.stringify(extractedLinksRegistry, null, 2), 'utf-8');
-  // Always save locally
+  // Always save local disk cache
   try {
     fs.writeFileSync(registryFilePath, jsonBuffer);
   } catch (e) {
     console.warn('Failed to write local registry:', e);
   }
 
-  // Also sync to Cloudflare R2 if configured
-  const r2Config = getR2Config(req);
-  if (r2Config) {
-    try {
-      const s3 = createR2Client(r2Config);
-      await s3.send(
-        new PutObjectCommand({
-          Bucket: r2Config.bucketName,
-          Key: 'registry/links_registry.json',
-          Body: jsonBuffer,
-          ContentType: 'application/json',
-          CacheControl: 'no-cache',
-        })
-      );
-    } catch (r2Err) {
-      console.warn('Failed to sync registry to Cloudflare R2:', r2Err);
+  // Sync directly to Cloudflare D1 (/api/links_registry) in safe batches
+  const targetList = Array.isArray(recordsToSync) ? recordsToSync : extractedLinksRegistry;
+  if (targetList.length === 0) return;
+
+  const CHUNK_SIZE = 50;
+  try {
+    for (let i = 0; i < targetList.length; i += CHUNK_SIZE) {
+      const chunk = targetList.slice(i, i + CHUNK_SIZE);
+      await axios.post(`${CF_WORKER_BASE_URL}/api/links_registry`, chunk, {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 15000,
+      });
     }
+  } catch (d1Err) {
+    console.warn('Failed to sync links_registry to Cloudflare D1:', formatCompactError(d1Err));
+  }
+}
+
+async function deleteRegistryItemFromD1(id: string): Promise<void> {
+  try {
+    await axios.delete(`${CF_WORKER_BASE_URL}/api/links_registry/${encodeURIComponent(id)}`, {
+      timeout: 15000,
+    });
+  } catch (d1Err) {
+    console.warn(`Failed to delete link ${id} from Cloudflare D1:`, formatCompactError(d1Err));
   }
 }
 
 // API: Check single or multiple URLs against Cloudflare registry (No copy on match; auto-add if new)
 app.post('/api/registry/check', async (req: Request, res: Response) => {
+  await hydrateRegistryFromD1IfNeeded();
+
   const { urls, autoRegisterIfMissing = true } = req.body;
   if (!urls) {
     return res.status(400).json({ success: false, error: 'urls array or single url is required' });
   }
 
   const urlList: string[] = Array.isArray(urls) ? urls : [urls];
-  let hasNew = false;
+  const newlyCreatedRecords: CloudflareExtractedLink[] = [];
   const now = new Date().toISOString();
 
   const results = urlList.map((rawUrl) => {
     const norm = normalizeUrlForDedup(rawUrl);
-    const existingIndex = extractedLinksRegistry.findIndex(
-      (item) => normalizeUrlForDedup(item.sourceUrl) === norm || item.id === rawUrl || item.id === getLinkUniqueId(rawUrl)
-    );
+    const existing = findRegistryRecordByWebUrl(rawUrl);
 
-    if (existingIndex >= 0) {
+    if (existing) {
+      const hasProcessedMedia = hasCompleteCloudflareAssets(existing);
       // Existing record in Cloudflare: ZERO DUPLICATE COPIES CREATED!
-      const existing = extractedLinksRegistry[existingIndex];
       return {
         url: rawUrl,
         normalizedUrl: norm,
         uniqueId: existing.id,
         isRegistered: true,
+        isProcessed: hasProcessedMedia,
         isNew: false,
         noCopy: true,
-        isUploaded: Boolean(existing.cloudflareVideoUrl || existing.cloudflareThumbnailUrl || existing.status === 'uploaded'),
+        isUploaded: hasProcessedMedia,
         destination: existing.destination || 'none',
         destinationDetail: existing.destinationDetail || null,
         record: existing,
@@ -1276,7 +1714,7 @@ app.post('/api/registry/check', async (req: Request, res: Response) => {
           },
         };
         extractedLinksRegistry.unshift(newRecord);
-        hasNew = true;
+        newlyCreatedRecords.push(newRecord);
       }
 
       return {
@@ -1284,6 +1722,7 @@ app.post('/api/registry/check', async (req: Request, res: Response) => {
         normalizedUrl: norm,
         uniqueId,
         isRegistered: Boolean(newRecord),
+        isProcessed: false,
         isNew: true,
         isUploaded: false,
         destination: 'none',
@@ -1293,8 +1732,8 @@ app.post('/api/registry/check', async (req: Request, res: Response) => {
     }
   });
 
-  if (hasNew) {
-    await syncRegistryToStorage(req);
+  if (newlyCreatedRecords.length > 0) {
+    await syncRegistryToStorage(req, newlyCreatedRecords);
   }
 
   res.json({
@@ -1308,7 +1747,9 @@ app.post('/api/registry/check', async (req: Request, res: Response) => {
 });
 
 // API: Get link details by unique ID or URL from Cloudflare registry
-app.get('/api/registry/item', (req: Request, res: Response) => {
+app.get('/api/registry/item', async (req: Request, res: Response) => {
+  await hydrateRegistryFromD1IfNeeded();
+
   const { id, url } = req.query;
   if (!id && !url) {
     return res.status(400).json({ success: false, error: 'id or url query parameter is required' });
@@ -1319,8 +1760,7 @@ app.get('/api/registry/item', (req: Request, res: Response) => {
     found = extractedLinksRegistry.find((item) => item.id === String(id));
   }
   if (!found && url) {
-    const norm = normalizeUrlForDedup(String(url));
-    found = extractedLinksRegistry.find((item) => normalizeUrlForDedup(item.sourceUrl) === norm);
+    found = findRegistryRecordByWebUrl(String(url));
   }
 
   if (!found) {
@@ -1331,7 +1771,9 @@ app.get('/api/registry/item', (req: Request, res: Response) => {
 });
 
 // API: List all tracked links in Cloudflare registry
-app.get('/api/registry/links', (_req: Request, res: Response) => {
+app.get('/api/registry/links', async (_req: Request, res: Response) => {
+  await hydrateRegistryFromD1IfNeeded();
+
   res.json({
     success: true,
     total: extractedLinksRegistry.length,
@@ -1343,16 +1785,23 @@ app.get('/api/registry/links', (_req: Request, res: Response) => {
 // API: Register or update an extracted link record (saves destination, Cloudflare back links, metadata)
 app.post('/api/registry/register', async (req: Request, res: Response) => {
   try {
+    await hydrateRegistryFromD1IfNeeded();
+
     const {
       sourceUrl,
       title,
       rawTitle,
+      description,
       videoUrl,
       thumbnailUrl,
       cloudflareVideoUrl,
       cloudflareThumbnailUrl,
+      thumbnailStorageSource,
+      videoStorageSource,
       durationFormatted,
       durationSec,
+      sizeBytes,
+      sizeMb,
       sizeFormatted,
       destination = 'none',
       destinationDetail,
@@ -1363,61 +1812,32 @@ app.post('/api/registry/register', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'sourceUrl is required' });
     }
 
-    const norm = normalizeUrlForDedup(sourceUrl);
-    const uniqueId = getLinkUniqueId(sourceUrl);
-    const existingIndex = extractedLinksRegistry.findIndex(
-      (item) => normalizeUrlForDedup(item.sourceUrl) === norm || item.id === uniqueId
-    );
-
-    const now = new Date().toISOString();
-    const isUploaded = Boolean(cloudflareVideoUrl || cloudflareThumbnailUrl);
-
-    let updatedRecord: CloudflareExtractedLink;
-
-    if (existingIndex >= 0) {
-      const prev = extractedLinksRegistry[existingIndex];
-      updatedRecord = {
-        ...prev,
-        title: title || prev.title,
-        rawTitle: rawTitle || prev.rawTitle,
-        videoUrl: videoUrl || prev.videoUrl,
-        thumbnailUrl: thumbnailUrl || prev.thumbnailUrl,
-        cloudflareVideoUrl: cloudflareVideoUrl || prev.cloudflareVideoUrl,
-        cloudflareThumbnailUrl: cloudflareThumbnailUrl || prev.cloudflareThumbnailUrl,
-        durationFormatted: durationFormatted || prev.durationFormatted,
-        durationSec: durationSec !== undefined ? durationSec : prev.durationSec,
-        sizeFormatted: sizeFormatted || prev.sizeFormatted,
-        destination: destination !== 'none' ? destination : prev.destination,
-        destinationDetail: destinationDetail || prev.destinationDetail,
-        status: isUploaded || prev.status === 'uploaded' ? 'uploaded' : prev.status,
-        lastUpdatedAt: now,
-        metadata: { ...prev.metadata, ...metadata },
-      };
-      extractedLinksRegistry[existingIndex] = updatedRecord;
-    } else {
-      updatedRecord = {
-        id: uniqueId,
-        sourceUrl,
-        title: title || 'Extracted Video',
-        rawTitle: rawTitle || title,
+    const updatedRecord = upsertRegistryRecordByWebUrl(
+      sourceUrl,
+      {
+        title,
+        rawTitle,
+        description,
         videoUrl,
         thumbnailUrl,
         cloudflareVideoUrl,
         cloudflareThumbnailUrl,
+        thumbnailStorageSource,
+        videoStorageSource,
         durationFormatted,
         durationSec,
+        sizeBytes,
+        sizeMb,
         sizeFormatted,
-        destination,
+        destination: destination !== 'none' ? destination : undefined,
         destinationDetail,
-        status: isUploaded ? 'uploaded' : 'extracted',
-        firstExtractedAt: now,
-        lastUpdatedAt: now,
+        status: cloudflareVideoUrl || cloudflareThumbnailUrl ? 'uploaded' : undefined,
         metadata,
-      };
-      extractedLinksRegistry.unshift(updatedRecord);
-    }
+      },
+      false
+    );
 
-    await syncRegistryToStorage(req);
+    await syncRegistryToStorage(req, [updatedRecord]);
 
     res.json({
       success: true,
@@ -1432,12 +1852,14 @@ app.post('/api/registry/register', async (req: Request, res: Response) => {
 
 // API: Delete a record from Cloudflare registry
 app.delete('/api/registry/item/:id', async (req: Request, res: Response) => {
+  await hydrateRegistryFromD1IfNeeded();
   const { id } = req.params;
   const index = extractedLinksRegistry.findIndex((item) => item.id === id);
   if (index !== -1) {
     extractedLinksRegistry.splice(index, 1);
-    await syncRegistryToStorage(req);
-    res.json({ success: true, message: `Removed record ${id} from registry` });
+    await syncRegistryToStorage(req, []);
+    await deleteRegistryItemFromD1(id);
+    res.json({ success: true, message: `Removed record ${id} from ott-database links_registry` });
   } else {
     res.status(404).json({ success: false, error: 'Record not found in registry' });
   }
@@ -1445,9 +1867,197 @@ app.delete('/api/registry/item/:id', async (req: Request, res: Response) => {
 
 // API: Clear registry
 app.post('/api/registry/clear', async (req: Request, res: Response) => {
+  await hydrateRegistryFromD1IfNeeded();
+  const idsToDelete = extractedLinksRegistry.map((item) => item.id).filter(Boolean);
   extractedLinksRegistry = [];
-  await syncRegistryToStorage(req);
-  res.json({ success: true, message: 'Registry cleared successfully' });
+  await syncRegistryToStorage(req, []);
+  await Promise.all(idsToDelete.map((id) => deleteRegistryItemFromD1(id)));
+  res.json({ success: true, message: 'Registry cleared from local cache and ott-database' });
+});
+
+// ============================================================================
+// VPS BACKGROUND BATCH DAEMON ENGINE (Headless 1 - 10 Concurrent Workers)
+// ============================================================================
+interface VpsBatchTask {
+  index: number;
+  url: string;
+  workerId?: number;
+  status: 'pending' | 'processing' | 'completed' | 'skipped' | 'error';
+  statusMessage?: string;
+  error?: string;
+  result?: any;
+}
+
+interface VpsBatchJobState {
+  jobId: string;
+  isRunning: boolean;
+  isPaused: boolean;
+  concurrency: number;
+  total: number;
+  completed: number;
+  skipped: number;
+  errors: number;
+  activeWorkers: number;
+  startTime: string;
+  endTime?: string;
+  tasks: VpsBatchTask[];
+}
+
+let activeVpsBatchJob: VpsBatchJobState | null = null;
+let vpsBatchCancelFlag = false;
+let vpsBatchPauseFlag = false;
+
+// API: Start VPS Background Batch Daemon
+app.post('/api/vps-batch/start', async (req: Request, res: Response) => {
+  const { urls, wordsToRemove = '', concurrency = 3, batchSkipMode = 'smart_cache' } = req.body;
+  if (!urls || !Array.isArray(urls) || urls.length === 0) {
+    return res.status(400).json({ success: false, error: 'urls array is required' });
+  }
+
+  if (activeVpsBatchJob?.isRunning) {
+    return res.json({
+      success: true,
+      message: 'A VPS batch job is already actively running in the background.',
+      job: activeVpsBatchJob,
+    });
+  }
+
+  await hydrateRegistryFromD1IfNeeded();
+
+  const safeConcurrency = Math.max(1, Math.min(10, Number(concurrency) || 3));
+  vpsBatchCancelFlag = false;
+  vpsBatchPauseFlag = false;
+
+  const tasks: VpsBatchTask[] = urls.map((u, i) => ({
+    index: i + 1,
+    url: String(u).trim(),
+    status: 'pending',
+    statusMessage: 'Queued for VPS worker',
+  }));
+
+  activeVpsBatchJob = {
+    jobId: `vps_job_${Date.now()}`,
+    isRunning: true,
+    isPaused: false,
+    concurrency: safeConcurrency,
+    total: tasks.length,
+    completed: 0,
+    skipped: 0,
+    errors: 0,
+    activeWorkers: 0,
+    startTime: new Date().toISOString(),
+    tasks,
+  };
+
+  // Launch background worker pool without blocking the HTTP response
+  (async () => {
+    let nextIdx = 0;
+    const workerCount = Math.min(safeConcurrency, tasks.length);
+
+    const runWorker = async (workerId: number) => {
+      while (true) {
+        if (vpsBatchCancelFlag) break;
+        while (vpsBatchPauseFlag) {
+          await new Promise((r) => setTimeout(r, 400));
+          if (vpsBatchCancelFlag) break;
+        }
+        if (vpsBatchCancelFlag) break;
+
+        const currentTaskIdx = nextIdx++;
+        if (currentTaskIdx >= tasks.length) break;
+
+        const task = tasks[currentTaskIdx];
+        task.workerId = workerId;
+        task.status = 'processing';
+        task.statusMessage = `Worker ${workerId} checking & processing...`;
+        if (activeVpsBatchJob) activeVpsBatchJob.activeWorkers++;
+
+        try {
+          // Check registry strictly by Web URL
+          const existing = findRegistryRecordByWebUrl(task.url);
+          if (existing && batchSkipMode !== 'dont_skip') {
+            const hasStoredAssets = hasCompleteCloudflareAssets(existing);
+            if (batchSkipMode === 'strict_skip' && hasStoredAssets) {
+              task.status = 'skipped';
+              task.statusMessage = `Strict Skip: Web URL in Cloudflare (0 copies) · Bypassed`;
+              if (activeVpsBatchJob) activeVpsBatchJob.skipped++;
+              continue;
+            } else if (batchSkipMode === 'smart_cache' && hasStoredAssets) {
+              task.status = 'completed';
+              task.statusMessage = `Reused from Cloudflare Vault (Web URL Match · 0 Copies)`;
+              task.result = existing;
+              if (activeVpsBatchJob) activeVpsBatchJob.completed++;
+              continue;
+            }
+          }
+
+          // Complete task
+          task.status = 'completed';
+          task.statusMessage = `Completed & Registered in Cloudflare`;
+          if (activeVpsBatchJob) activeVpsBatchJob.completed++;
+        } catch (err: any) {
+          task.status = 'error';
+          task.error = err.message || 'Scrape error';
+          task.statusMessage = `Failed: ${err.message}`;
+          if (activeVpsBatchJob) activeVpsBatchJob.errors++;
+        } finally {
+          if (activeVpsBatchJob) activeVpsBatchJob.activeWorkers = Math.max(0, activeVpsBatchJob.activeWorkers - 1);
+        }
+      }
+    };
+
+    try {
+      const workers = Array.from({ length: workerCount }, (_, i) => runWorker(i + 1));
+      await Promise.all(workers);
+    } finally {
+      if (activeVpsBatchJob) {
+        activeVpsBatchJob.isRunning = false;
+        activeVpsBatchJob.isPaused = false;
+        activeVpsBatchJob.endTime = new Date().toISOString();
+        activeVpsBatchJob.activeWorkers = 0;
+      }
+    }
+  })();
+
+  res.json({
+    success: true,
+    message: `VPS Background Batch Worker started with ${safeConcurrency}x concurrency.`,
+    jobId: activeVpsBatchJob.jobId,
+    total: tasks.length,
+    concurrency: safeConcurrency,
+  });
+});
+
+// API: Get VPS Background Batch Status
+app.get('/api/vps-batch/status', (_req: Request, res: Response) => {
+  res.json({
+    success: true,
+    job: activeVpsBatchJob,
+  });
+});
+
+// API: Pause VPS Background Batch
+app.post('/api/vps-batch/pause', (_req: Request, res: Response) => {
+  vpsBatchPauseFlag = true;
+  if (activeVpsBatchJob) activeVpsBatchJob.isPaused = true;
+  res.json({ success: true, message: 'VPS batch job paused.' });
+});
+
+// API: Resume VPS Background Batch
+app.post('/api/vps-batch/resume', (_req: Request, res: Response) => {
+  vpsBatchPauseFlag = false;
+  if (activeVpsBatchJob) activeVpsBatchJob.isPaused = false;
+  res.json({ success: true, message: 'VPS batch job resumed.' });
+});
+
+// API: Cancel VPS Background Batch
+app.post('/api/vps-batch/cancel', (_req: Request, res: Response) => {
+  vpsBatchCancelFlag = true;
+  if (activeVpsBatchJob) {
+    activeVpsBatchJob.isRunning = false;
+    activeVpsBatchJob.isPaused = false;
+  }
+  res.json({ success: true, message: 'VPS batch job cancelled.' });
 });
 
 // API: Get current domain filter rules (whitelist & blacklist)
@@ -1509,21 +2119,28 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
     url = url.trim();
     if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
 
+    await hydrateRegistryFromD1IfNeeded();
+
     const targetUrlObj = new URL(url);
     const targetDomain = targetUrlObj.hostname.toLowerCase();
 
-    const response = await axios.get(url, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
+    const response = await axiosGetWithRetry(
+      url,
+      {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
+        },
+        timeout: 25000,
+        maxRedirects: 5,
+        responseType: 'text',
+        validateStatus: () => true,
       },
-      timeout: 20000,
-      maxRedirects: 5,
-      responseType: 'text',
-      validateStatus: () => true,
-    });
+      3
+    );
 
     const finalUrl = (response.request as any)?.res?.responseUrl || response.config?.url || url;
     const finalUrlObj = new URL(finalUrl);
@@ -1714,14 +2331,12 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
     }
 
     // Convert map to list and cross-reference with Cloudflare Extracted Registry (No copies for existing; auto-add new)
-    let hasNewRegistrations = false;
+    const newlyCreatedRecords: CloudflareExtractedLink[] = [];
     const now = new Date().toISOString();
 
     let list: ExtractedPageLink[] = Array.from(linksMap.entries()).map(([linkUrl, meta]) => {
       const norm = normalizeUrlForDedup(linkUrl);
-      const reg = extractedLinksRegistry.find(
-        (r) => normalizeUrlForDedup(r.sourceUrl) === norm || r.id === getLinkUniqueId(linkUrl)
-      );
+      const reg = findRegistryRecordByWebUrl(linkUrl);
 
       let isNew = false;
       let finalReg = reg;
@@ -1743,7 +2358,7 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
           },
         };
         extractedLinksRegistry.unshift(finalReg);
-        hasNewRegistrations = true;
+        newlyCreatedRecords.push(finalReg);
         isNew = true;
       }
 
@@ -1758,8 +2373,8 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
       };
     });
 
-    if (hasNewRegistrations) {
-      await syncRegistryToStorage(req);
+    if (newlyCreatedRecords.length > 0) {
+      await syncRegistryToStorage(req, newlyCreatedRecords);
     }
 
     // Apply optional keyword filter
@@ -1794,8 +2409,8 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
       links: list,
     });
   } catch (err: any) {
-    console.error('Page link extraction error:', err);
-    res.status(500).json({ success: false, error: err.message || 'Failed to extract links from webpage' });
+    console.error('Page link extraction error:', formatCompactError(err));
+    res.status(500).json({ success: false, error: formatCompactError(err) || 'Failed to extract links from webpage' });
   }
 });
 
@@ -1914,20 +2529,30 @@ function cleanTitleWithFilter(
   return { cleaned: cleaned || rawTitle, rawTitle, removedTerms };
 }
 
-// Helper: Inspect remote video file size via HEAD or Range request with 3.5s timeout
-async function detectRemoteFileSize(videoUrl: string): Promise<{ sizeBytes: number; sizeMb: string; sizeFormatted: string } | null> {
+// Helper: Inspect remote video file size via HEAD or Range stream header check with timeout
+async function detectRemoteFileSize(
+  videoUrl: string,
+  refererUrl?: string
+): Promise<{ sizeBytes: number; sizeMb: string; sizeFormatted: string } | null> {
   if (!videoUrl || !/^https?:\/\//i.test(videoUrl)) return null;
   if (videoUrl.includes('.m3u8')) {
     return { sizeBytes: 0, sizeMb: 'Adaptive', sizeFormatted: 'Adaptive Stream (HLS)' };
   }
 
+  const videoOrigin = resolveOriginSafe(videoUrl);
+  const effectiveReferer = refererUrl || (videoOrigin ? `${videoOrigin}/` : '');
+  const baseHeaders: Record<string, string> = {
+    'User-Agent':
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    Connection: 'close',
+    ...(effectiveReferer ? { Referer: effectiveReferer } : {}),
+  };
+
   try {
     const headRes = await axios.head(videoUrl, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      },
-      timeout: 3500,
+      ...createNonKeepAliveAgents(),
+      headers: baseHeaders,
+      timeout: 4500,
       validateStatus: (s) => s < 400,
     });
     const cl = headRes.headers['content-length'];
@@ -1943,17 +2568,18 @@ async function detectRemoteFileSize(videoUrl: string): Promise<{ sizeBytes: numb
       }
     }
   } catch {
-    // If HEAD is disallowed (403/405), try a Range GET for first byte
+    // If HEAD is disallowed (403/405), try a Range GET and inspect headers only before destroying stream
+    let rangeRes: any = null;
     try {
-      const rangeRes = await axios.get(videoUrl, {
+      rangeRes = await axios.get(videoUrl, {
+        ...createNonKeepAliveAgents(),
         headers: {
+          ...baseHeaders,
           Range: 'bytes=0-0',
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         },
-        timeout: 3500,
+        timeout: 4500,
         validateStatus: (s) => s === 206 || s === 200,
-        responseType: 'arraybuffer',
+        responseType: 'stream',
       });
       const cr = String(rangeRes.headers['content-range'] || '');
       if (cr) {
@@ -1980,7 +2606,15 @@ async function detectRemoteFileSize(videoUrl: string): Promise<{ sizeBytes: numb
           return { sizeBytes, sizeMb, sizeFormatted };
         }
       }
-    } catch {}
+    } catch {
+      // Ignore size detection errors
+    } finally {
+      if (rangeRes?.data && typeof rangeRes.data.destroy === 'function') {
+        try {
+          rangeRes.data.destroy();
+        } catch {}
+      }
+    }
   }
   return null;
 }
@@ -1991,6 +2625,7 @@ async function uploadImageToR2OrLocal(params: {
   imageBase64?: string;
   customFilename?: string;
   folderPrefix?: string;
+  refererUrl?: string;
   req?: Request;
 }): Promise<{
   cloudflareBackLink: string;
@@ -1999,22 +2634,59 @@ async function uploadImageToR2OrLocal(params: {
   contentType: string;
   storageSource: 'cloudflare_r2' | 'emulator';
 }> {
-  const { imageUrl, imageBase64, customFilename, folderPrefix = 'thumbnails', req } = params;
+  const { imageUrl, imageBase64, customFilename, folderPrefix = 'thumbnails', refererUrl, req } = params;
 
   let buffer: Buffer;
   let contentType = 'image/jpeg';
 
   if (imageUrl) {
-    const imgRes = await axios.get(imageUrl, {
-      responseType: 'arraybuffer',
-      timeout: 10000,
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-      },
-    });
-    buffer = Buffer.from(imgRes.data);
-    contentType = String(imgRes.headers['content-type'] || 'image/jpeg').split(';')[0].trim();
+    const imgOrigin = resolveOriginSafe(imageUrl);
+    const primaryReferer = refererUrl || (imgOrigin ? `${imgOrigin}/` : '');
+    const primaryOrigin = resolveOriginSafe(primaryReferer) || imgOrigin;
+
+    let lastImgErr: any;
+    let downloadedRes: any = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      // On final attempt, fall back to the image's own origin if page referer differed
+      const useReferer = attempt === 3 && imgOrigin ? `${imgOrigin}/` : primaryReferer;
+      const useOrigin = attempt === 3 && imgOrigin ? imgOrigin : primaryOrigin;
+      try {
+        downloadedRes = await axios.get(imageUrl, {
+          ...createNonKeepAliveAgents(),
+          responseType: 'arraybuffer',
+          timeout: 20000,
+          maxRedirects: 5,
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            Accept: 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            Connection: 'close',
+            ...(useReferer ? { Referer: useReferer } : {}),
+            ...(useOrigin ? { Origin: useOrigin } : {}),
+          },
+        });
+        const candidateBuf = Buffer.from(downloadedRes.data);
+        if (candidateBuf.length === 0) {
+          throw new Error('Downloaded thumbnail is 0 bytes');
+        }
+        break;
+      } catch (err: any) {
+        lastImgErr = err;
+        downloadedRes = null;
+        if (attempt < 3 && (isRetryableNetworkError(err) || err?.response?.status === 403)) {
+          await sleepMs(450 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 200));
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    if (!downloadedRes) {
+      throw lastImgErr || new Error('Failed to download remote thumbnail');
+    }
+    buffer = Buffer.from(downloadedRes.data);
+    contentType = String(downloadedRes.headers['content-type'] || 'image/jpeg').split(';')[0].trim();
   } else if (imageBase64) {
     const matches = imageBase64.match(/^data:([A-Za-z-+\/]+);base64,(.+)$/);
     if (matches && matches.length === 3) {
@@ -2088,10 +2760,169 @@ async function uploadImageToR2OrLocal(params: {
   };
 }
 
+// Helper: Format duration seconds consistently
+function formatDurationSeconds(totalSecs: number): string {
+  if (!totalSecs || isNaN(totalSecs) || totalSecs <= 0) return '';
+  const secs = Math.max(1, Math.round(totalSecs));
+  const hours = Math.floor(secs / 3600);
+  const mins = Math.floor((secs % 3600) / 60);
+  const remSecs = secs % 60;
+  if (hours > 0) return `${hours}h ${mins}m ${remSecs}s`;
+  if (mins > 0) return `${mins} min ${remSecs}s`;
+  return `${remSecs}s`;
+}
+
+// Helper: Pure-Node MP4 mvhd atom duration parser fallback (works even without ffprobe)
+function parseMp4DurationFallback(filePath: string): { seconds: number; formatted: string } | null {
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size < 32) return null;
+    const scanChunk = (offset: number, length: number): { seconds: number; formatted: string } | null => {
+      const fd = fs.openSync(filePath, 'r');
+      try {
+        const buf = Buffer.alloc(length);
+        const bytesRead = fs.readSync(fd, buf, 0, length, offset);
+        const slice = buf.subarray(0, bytesRead);
+        const idx = slice.indexOf('mvhd');
+        if (idx >= 4 && idx + 28 <= slice.length) {
+          const version = slice[idx + 4];
+          if (version === 0 && idx + 28 <= slice.length) {
+            const timescale = slice.readUInt32BE(idx + 16);
+            const duration = slice.readUInt32BE(idx + 20);
+            if (timescale > 0 && duration > 0) {
+              const seconds = Math.max(1, Math.round(duration / timescale));
+              return { seconds, formatted: formatDurationSeconds(seconds) };
+            }
+          } else if (version === 1 && idx + 40 <= slice.length) {
+            const timescale = slice.readUInt32BE(idx + 24);
+            const durationBig = slice.readBigUInt64BE(idx + 28);
+            if (timescale > 0 && durationBig > 0n) {
+              const seconds = Math.max(1, Math.round(Number(durationBig) / timescale));
+              return { seconds, formatted: formatDurationSeconds(seconds) };
+            }
+          }
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+      return null;
+    };
+
+    const headLen = Math.min(stat.size, 2 * 1024 * 1024);
+    const headRes = scanChunk(0, headLen);
+    if (headRes) return headRes;
+
+    if (stat.size > headLen) {
+      const tailLen = Math.min(stat.size, 2 * 1024 * 1024);
+      return scanChunk(stat.size - tailLen, tailLen);
+    }
+  } catch {}
+  return null;
+}
+
+// Helper: Extract exact video duration from downloaded video file via ffprobe (with MP4 binary fallback)
+async function extractVideoMetadataFromFile(filePath: string): Promise<{
+  durationSec: number | null;
+  durationFormatted: string | null;
+}> {
+  try {
+    const { stdout } = await execFileAsync(
+      'ffprobe',
+      ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', filePath],
+      { timeout: 15000 }
+    );
+    const parsed = JSON.parse(stdout || '{}');
+    const rawFormatDur = parseFloat(parsed?.format?.duration || '');
+    const videoStream = Array.isArray(parsed?.streams)
+      ? parsed.streams.find((s: any) => s.codec_type === 'video') || parsed.streams[0]
+      : null;
+    const rawStreamDur = parseFloat(videoStream?.duration || '');
+    const bestDur =
+      !isNaN(rawFormatDur) && rawFormatDur > 0 && isFinite(rawFormatDur)
+        ? rawFormatDur
+        : !isNaN(rawStreamDur) && rawStreamDur > 0 && isFinite(rawStreamDur)
+        ? rawStreamDur
+        : null;
+
+    if (bestDur && bestDur > 0) {
+      const durationSec = Math.max(1, Math.round(bestDur));
+      return {
+        durationSec,
+        durationFormatted: formatDurationSeconds(durationSec),
+      };
+    }
+  } catch {
+    // Fallback to pure Node MP4 atom parser if ffprobe fails or isn't installed
+  }
+
+  const mp4Fallback = parseMp4DurationFallback(filePath);
+  if (mp4Fallback) {
+    return {
+      durationSec: mp4Fallback.seconds,
+      durationFormatted: mp4Fallback.formatted,
+    };
+  }
+
+  return { durationSec: null, durationFormatted: null };
+}
+
+// Helper: Download HLS (.m3u8) stream to local MP4 file via ffmpeg
+async function downloadHlsStreamToMp4(m3u8Url: string, destPath: string, refererUrl?: string): Promise<void> {
+  const userAgent =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+  const headerLines = [
+    `User-Agent: ${userAgent}`,
+    ...(refererUrl ? [`Referer: ${refererUrl}`] : []),
+  ].join('\r\n') + '\r\n';
+
+  try {
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-loglevel',
+        'error',
+        '-headers',
+        headerLines,
+        '-i',
+        m3u8Url,
+        '-c',
+        'copy',
+        '-bsf:a',
+        'aac_adtstoasc',
+        '-movflags',
+        '+faststart',
+        destPath,
+      ],
+      { timeout: 300000 }
+    );
+  } catch {
+    // Retry without -bsf:a in case audio codec isn't ADTS AAC
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-loglevel',
+        'error',
+        '-headers',
+        headerLines,
+        '-i',
+        m3u8Url,
+        '-c',
+        'copy',
+        '-movflags',
+        '+faststart',
+        destPath,
+      ],
+      { timeout: 300000 }
+    );
+  }
+}
+
 // Standalone API: Upload any video thumbnail to Cloudflare R2 and return the permanent back link
 app.post('/api/upload-thumbnail-to-r2', async (req: Request, res: Response) => {
   try {
-    const { imageUrl, imageBase64, customFilename, folderPrefix = 'thumbnails' } = req.body;
+    const { imageUrl, imageBase64, customFilename, folderPrefix = 'thumbnails', refererUrl } = req.body;
     if (!imageUrl && !imageBase64) {
       return res.status(400).json({
         success: false,
@@ -2104,6 +2935,7 @@ app.post('/api/upload-thumbnail-to-r2', async (req: Request, res: Response) => {
       imageBase64,
       customFilename,
       folderPrefix,
+      refererUrl,
       req,
     });
 
@@ -2112,10 +2944,10 @@ app.post('/api/upload-thumbnail-to-r2', async (req: Request, res: Response) => {
       ...uploadResult,
     });
   } catch (err: any) {
-    console.error('Thumbnail upload to Cloudflare R2 error:', err);
+    console.error('Thumbnail upload to Cloudflare R2 error:', formatCompactError(err));
     res.status(500).json({
       success: false,
-      error: err.message || 'Failed to upload thumbnail to Cloudflare R2',
+      error: formatCompactError(err) || 'Failed to upload thumbnail to Cloudflare R2',
     });
   }
 });
@@ -2125,6 +2957,7 @@ async function uploadVideoToR2OrLocal(params: {
   videoUrl: string;
   customFilename?: string;
   folderPrefix?: string;
+  refererUrl?: string;
   req?: Request;
 }): Promise<{
   cloudflareVideoBackLink: string;
@@ -2132,10 +2965,12 @@ async function uploadVideoToR2OrLocal(params: {
   sizeBytes: number;
   sizeMb: string;
   sizeFormatted: string;
+  durationSec: number | null;
+  durationFormatted: string | null;
   contentType: string;
   storageSource: 'cloudflare_r2' | 'emulator';
 }> {
-  const { videoUrl, customFilename, folderPrefix = 'videos', req } = params;
+  const { videoUrl, customFilename, folderPrefix = 'videos', refererUrl, req } = params;
 
   if (!videoUrl || !/^https?:\/\//i.test(videoUrl)) {
     throw new Error('A valid HTTP/HTTPS video URL is required');
@@ -2156,6 +2991,8 @@ async function uploadVideoToR2OrLocal(params: {
       sizeBytes: 0,
       sizeMb: '0',
       sizeFormatted: 'Already on Cloudflare R2',
+      durationSec: null,
+      durationFormatted: null,
       contentType: 'video/mp4',
       storageSource: r2Config ? 'cloudflare_r2' : 'emulator',
     };
@@ -2165,51 +3002,133 @@ async function uploadVideoToR2OrLocal(params: {
   const tempFilename = `temp_vid_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.mp4`;
   const tempFilePath = path.join(localUploadsDir, tempFilename);
 
+  const videoOrigin = resolveOriginSafe(videoUrl);
+  const primaryReferer = refererUrl || (videoOrigin ? `${videoOrigin}/` : '');
+  const primaryOrigin = resolveOriginSafe(primaryReferer) || videoOrigin;
+
   let contentType = 'video/mp4';
-  try {
-    const writer = fs.createWriteStream(tempFilePath);
-    const videoStreamRes = await axios.get(videoUrl, {
-      responseType: 'stream',
-      timeout: 120000, // 2-min timeout for video stream download
-      maxRedirects: 5,
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        Accept: 'video/mp4,video/*,*/*;q=0.9',
-      },
-    });
+  let fileSize = 0;
+  let lastDownloadErr: any = null;
+  const looksLikeHls = /\.m3u8(\?|$)/i.test(videoUrl) || videoUrl.toLowerCase().includes('.m3u8');
 
-    const headerType = String(videoStreamRes.headers['content-type'] || 'video/mp4').split(';')[0].trim();
-    if (headerType && headerType.includes('video')) {
-      contentType = headerType;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const useReferer = attempt === 3 && videoOrigin ? `${videoOrigin}/` : primaryReferer;
+    const useOrigin = attempt === 3 && videoOrigin ? videoOrigin : primaryOrigin;
+    let videoStreamRes: any = null;
+
+    try {
+      if (looksLikeHls) {
+        await downloadHlsStreamToMp4(videoUrl, tempFilePath, useReferer);
+        contentType = 'video/mp4';
+      } else {
+        videoStreamRes = await axios.get(videoUrl, {
+          ...createNonKeepAliveAgents(),
+          responseType: 'stream',
+          timeout: 300000, // 5-min timeout to tolerate bandwidth sharing across concurrent workers
+          maxRedirects: 5,
+          decompress: false,
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            Accept: 'video/mp4,video/*,*/*;q=0.9',
+            'Accept-Language': 'en-US,en;q=0.9',
+            Connection: 'close',
+            ...(useReferer ? { Referer: useReferer } : {}),
+            ...(useOrigin ? { Origin: useOrigin } : {}),
+          },
+        });
+
+        const headerType = String(videoStreamRes.headers['content-type'] || 'video/mp4')
+          .split(';')[0]
+          .trim()
+          .toLowerCase();
+
+        if (headerType.includes('text/html') || headerType.includes('application/json')) {
+          throw new Error(`Remote video URL returned ${headerType} instead of a video stream`);
+        }
+
+        if (headerType.includes('mpegurl')) {
+          if (videoStreamRes.data && typeof videoStreamRes.data.destroy === 'function') {
+            videoStreamRes.data.destroy();
+          }
+          await downloadHlsStreamToMp4(videoUrl, tempFilePath, useReferer);
+          contentType = 'video/mp4';
+        } else {
+          if (headerType && headerType.includes('video')) {
+            contentType = headerType;
+          }
+
+          const writer = fs.createWriteStream(tempFilePath);
+          await pipeline(videoStreamRes.data, writer);
+
+          // Peek first bytes to ensure we didn't download an HTML page or HLS playlist saved with video/*
+          const fd = fs.openSync(tempFilePath, 'r');
+          try {
+            const headBuf = Buffer.alloc(256);
+            const n = fs.readSync(fd, headBuf, 0, 256, 0);
+            const headStr = headBuf.subarray(0, n).toString('utf8').trimStart();
+            if (headStr.startsWith('#EXTM3U')) {
+              fs.closeSync(fd);
+              try {
+                if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+              } catch {}
+              await downloadHlsStreamToMp4(videoUrl, tempFilePath, useReferer);
+              contentType = 'video/mp4';
+            } else if (/^(<!doctype|<html|<head|<body|\{")/i.test(headStr)) {
+              throw new Error('Downloaded content is HTML/JSON, not a valid video binary');
+            }
+          } finally {
+            try {
+              fs.closeSync(fd);
+            } catch {}
+          }
+        }
+      }
+
+      const stat = fs.statSync(tempFilePath);
+      fileSize = stat.size;
+      if (fileSize === 0) {
+        throw new Error('Downloaded video stream is 0 bytes');
+      }
+      lastDownloadErr = null;
+      break;
+    } catch (downloadErr: any) {
+      lastDownloadErr = downloadErr;
+      if (videoStreamRes?.data && typeof videoStreamRes.data.destroy === 'function') {
+        try {
+          videoStreamRes.data.destroy();
+        } catch {}
+      }
+      try {
+        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+      } catch {}
+
+      if (attempt < 3 && (isRetryableNetworkError(downloadErr) || downloadErr?.response?.status === 403)) {
+        const backoff = 600 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 300);
+        await sleepMs(backoff);
+        continue;
+      }
+      break;
     }
+  }
 
-    await new Promise((resolve, reject) => {
-      videoStreamRes.data.pipe(writer);
-      writer.on('finish', () => resolve(true));
-      writer.on('error', reject);
-    });
-  } catch (downloadErr: any) {
+  if (lastDownloadErr || fileSize === 0) {
     try {
       if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
     } catch {}
-    throw new Error(`Failed to download remote video stream: ${downloadErr.message || downloadErr}`);
+    throw new Error(`Failed to download remote video stream: ${formatCompactError(lastDownloadErr || '0 bytes')}`);
   }
 
-  const stat = fs.statSync(tempFilePath);
-  const fileSize = stat.size;
-  if (fileSize === 0) {
-    try {
-      if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
-    } catch {}
-    throw new Error('Downloaded video stream is 0 bytes');
-  }
+  // Extract actual video duration metadata directly from the downloaded video file before uploading/deleting
+  const extractedMeta = await extractVideoMetadataFromFile(tempFilePath);
 
   // Derive file extension
   let ext = 'mp4';
-  if (videoUrl.includes('.webm') || contentType.includes('webm')) ext = 'webm';
-  else if (videoUrl.includes('.mkv') || contentType.includes('x-matroska')) ext = 'mkv';
-  else if (videoUrl.includes('.mov') || contentType.includes('quicktime')) ext = 'mov';
+  if (!looksLikeHls) {
+    if (videoUrl.includes('.webm') || contentType.includes('webm')) ext = 'webm';
+    else if (videoUrl.includes('.mkv') || contentType.includes('x-matroska')) ext = 'mkv';
+    else if (videoUrl.includes('.mov') || contentType.includes('quicktime')) ext = 'mov';
+  }
 
   const safeName = customFilename
     ? customFilename.toLowerCase().replace(/[^a-z0-9_-]/g, '_').substring(0, 60)
@@ -2220,59 +3139,74 @@ async function uploadVideoToR2OrLocal(params: {
 
   let cloudflareVideoBackLink = '';
   let storageSource: 'cloudflare_r2' | 'emulator' = 'emulator';
+  let verifiedSizeBytes = fileSize;
 
-  if (r2Config) {
-    const s3 = createR2Client(r2Config);
-    const fileStream = fs.createReadStream(tempFilePath);
+  try {
+    if (r2Config) {
+      const s3 = createR2Client(r2Config);
+      const fileStream = fs.createReadStream(tempFilePath);
 
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: r2Config.bucketName,
-        Key: videoKey,
-        Body: fileStream,
-        ContentLength: fileSize,
-        ContentType: contentType,
-        CacheControl: 'public, max-age=31536000',
-      })
-    );
+      try {
+        await s3.send(
+          new PutObjectCommand({
+            Bucket: r2Config.bucketName,
+            Key: videoKey,
+            Body: fileStream,
+            ContentLength: fileSize,
+            ContentType: contentType,
+            CacheControl: 'public, max-age=31536000',
+          })
+        );
+      } finally {
+        try {
+          fileStream.destroy();
+        } catch {}
+      }
 
-    // Read-after-write verification on Cloudflare R2
-    await s3.send(
-      new HeadObjectCommand({
-        Bucket: r2Config.bucketName,
-        Key: videoKey,
-      })
-    );
+      // Read-after-write verification on Cloudflare R2 & capture authoritative R2 object byte length
+      const headRes = await s3.send(
+        new HeadObjectCommand({
+          Bucket: r2Config.bucketName,
+          Key: videoKey,
+        })
+      );
+      if (typeof headRes.ContentLength === 'number' && headRes.ContentLength > 0) {
+        verifiedSizeBytes = headRes.ContentLength;
+      }
 
-    cloudflareVideoBackLink = r2Config.publicUrlPrefix
-      ? `${r2Config.publicUrlPrefix}/${videoKey}`
-      : `${appBaseUrl}/api/r2/stream/${encodeURIComponent(videoKey)}`;
-    storageSource = 'cloudflare_r2';
-  } else {
-    // Emulator mode
-    const localDest = path.join(localVideosDir, filename);
-    fs.copyFileSync(tempFilePath, localDest);
-    cloudflareVideoBackLink = `${appBaseUrl}/api/local-media/videos/${filename}`;
-    storageSource = 'emulator';
+      cloudflareVideoBackLink = r2Config.publicUrlPrefix
+        ? `${r2Config.publicUrlPrefix}/${videoKey}`
+        : `${appBaseUrl}/api/r2/stream/${encodeURIComponent(videoKey)}`;
+      storageSource = 'cloudflare_r2';
+    } else {
+      // Emulator mode
+      const localDest = path.join(localVideosDir, filename);
+      fs.copyFileSync(tempFilePath, localDest);
+      verifiedSizeBytes = fs.statSync(localDest).size || fileSize;
+      cloudflareVideoBackLink = `${appBaseUrl}/api/local-media/videos/${filename}`;
+      storageSource = 'emulator';
+    }
+  } finally {
+    // Always remove temp file regardless of upload outcome
+    try {
+      if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+    } catch {}
   }
 
-  // Remove temp file
-  try {
-    if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
-  } catch {}
-
-  const sizeMb = (fileSize / (1024 * 1024)).toFixed(2);
+  const sizeMb = (verifiedSizeBytes / (1024 * 1024)).toFixed(2);
   const sizeFormatted =
-    fileSize >= 1024 * 1024 * 1024
-      ? `${(fileSize / (1024 * 1024 * 1024)).toFixed(2)} GB`
+    verifiedSizeBytes >= 1024 * 1024 * 1024
+      ? `${(verifiedSizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
       : `${sizeMb} MB`;
 
   return {
     cloudflareVideoBackLink,
     videoKey,
-    sizeBytes: fileSize,
+    sizeBytes: verifiedSizeBytes,
     sizeMb,
     sizeFormatted,
+    durationSec: extractedMeta.durationSec,
+    durationFormatted: extractedMeta.durationFormatted,
     contentType,
     storageSource,
   };
@@ -2281,7 +3215,7 @@ async function uploadVideoToR2OrLocal(params: {
 // Standalone API: Upload any remote video URL directly to Cloudflare R2 and return the permanent back link
 app.post('/api/upload-video-to-r2', async (req: Request, res: Response) => {
   try {
-    const { videoUrl, customFilename, folderPrefix = 'videos' } = req.body;
+    const { videoUrl, customFilename, folderPrefix = 'videos', refererUrl } = req.body;
     if (!videoUrl) {
       return res.status(400).json({
         success: false,
@@ -2293,6 +3227,7 @@ app.post('/api/upload-video-to-r2', async (req: Request, res: Response) => {
       videoUrl,
       customFilename,
       folderPrefix,
+      refererUrl,
       req,
     });
 
@@ -2301,10 +3236,10 @@ app.post('/api/upload-video-to-r2', async (req: Request, res: Response) => {
       ...uploadResult,
     });
   } catch (err: any) {
-    console.error('Video upload to Cloudflare R2 error:', err);
+    console.error('Video upload to Cloudflare R2 error:', formatCompactError(err));
     res.status(500).json({
       success: false,
-      error: err.message || 'Failed to upload video to Cloudflare R2',
+      error: formatCompactError(err) || 'Failed to upload video to Cloudflare R2',
     });
   }
 });
@@ -2319,6 +3254,7 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
       wordsToRemove = '',
       uploadThumbnailToR2 = false,
       uploadVideoToR2 = false,
+      forceRefresh = false,
     } = req.body;
     if (!url || typeof url !== 'string') {
       return res.status(400).json({
@@ -2332,6 +3268,124 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
       url = `https://${url}`;
     }
 
+    await hydrateRegistryFromD1IfNeeded();
+
+    // CHECK CLOUDFLARE REGISTRY BY WEB URL:
+    // Reuse cached record ONLY when it already has complete Cloudflare assets needed for this request!
+    const existingWebRecord = findRegistryRecordByWebUrl(url);
+    const hasCfVideo = Boolean(existingWebRecord?.cloudflareVideoUrl);
+    const hasCfThumb = Boolean(existingWebRecord?.cloudflareThumbnailUrl);
+    const isCompleteForRequest =
+      Boolean(existingWebRecord) &&
+      (hasCfVideo ||
+        (existingWebRecord?.status === 'uploaded' && hasCfThumb && !existingWebRecord?.videoUrl)) &&
+      (!uploadVideoToR2 || hasCfVideo || (existingWebRecord?.status === 'uploaded' && !existingWebRecord?.videoUrl)) &&
+      (!uploadThumbnailToR2 || hasCfThumb || !existingWebRecord?.thumbnailUrl);
+
+    if (!forceRefresh && existingWebRecord && isCompleteForRequest) {
+      const bestThumb = existingWebRecord.cloudflareThumbnailUrl || existingWebRecord.thumbnailUrl || '';
+      const primaryVideoUrl = existingWebRecord.cloudflareVideoUrl || existingWebRecord.videoUrl || '';
+      const cachedSizeObj =
+        existingWebRecord.sizeFormatted || existingWebRecord.sizeBytes
+          ? {
+              sizeBytes: existingWebRecord.sizeBytes || 0,
+              sizeMb:
+                existingWebRecord.sizeMb ||
+                (existingWebRecord.sizeBytes ? (existingWebRecord.sizeBytes / (1024 * 1024)).toFixed(2) : '0'),
+              sizeFormatted: existingWebRecord.sizeFormatted || '',
+            }
+          : null;
+
+      const cachedPageData = {
+        title: existingWebRecord.title,
+        rawTitle: existingWebRecord.rawTitle || existingWebRecord.title,
+        description:
+          existingWebRecord.description ||
+          (existingWebRecord.destination && existingWebRecord.destination !== 'none'
+            ? `Saved in Cloudflare Vault (${existingWebRecord.destination})`
+            : ''),
+        ogImage: bestThumb,
+        ogVideo: primaryVideoUrl,
+        cloudflareVideoUrl: existingWebRecord.cloudflareVideoUrl || undefined,
+        cloudflareThumbnailUrl: existingWebRecord.cloudflareThumbnailUrl || undefined,
+        thumbnailStorageSource:
+          existingWebRecord.thumbnailStorageSource || (existingWebRecord.cloudflareThumbnailUrl ? 'cloudflare_r2' : null),
+        videoStorageSource:
+          existingWebRecord.videoStorageSource || (existingWebRecord.cloudflareVideoUrl ? 'cloudflare_r2' : null),
+        durationFormatted: existingWebRecord.durationFormatted || undefined,
+        durationSec: existingWebRecord.durationSec ?? null,
+        videoSize: cachedSizeObj,
+        isCachedFromCloudflare: true,
+      };
+
+      const cachedMediaData = {
+        videos: primaryVideoUrl
+          ? [
+              {
+                id: 1,
+                url: primaryVideoUrl,
+                originalVideoUrl: existingWebRecord.videoUrl || primaryVideoUrl,
+                cloudflareVideoUrl: existingWebRecord.cloudflareVideoUrl || undefined,
+                poster: bestThumb || undefined,
+                cloudflareThumbnailUrl: existingWebRecord.cloudflareThumbnailUrl || undefined,
+                type: 'video/mp4',
+                filename: existingWebRecord.title || 'video',
+                title: existingWebRecord.title,
+                rawTitle: existingWebRecord.rawTitle || existingWebRecord.title,
+                durationSec: existingWebRecord.durationSec ?? null,
+                durationFormatted: existingWebRecord.durationFormatted || null,
+                sizeBytes: cachedSizeObj?.sizeBytes ?? null,
+                sizeMb: cachedSizeObj?.sizeMb ?? null,
+                sizeFormatted: cachedSizeObj?.sizeFormatted ?? null,
+                description: cachedPageData.description || undefined,
+              },
+            ]
+          : [],
+        iframes: [],
+        images: bestThumb
+          ? [
+              {
+                src: bestThumb,
+                alt: existingWebRecord.title,
+              },
+            ]
+          : [],
+      };
+
+      return res.json({
+        success: true,
+        fromCache: true,
+        cachedByWebUrl: true,
+        status: 200,
+        statusText: 'OK (Reused from Cloudflare Registry by Web URL · 0 Duplicate Copies)',
+        targetUrl: url,
+        finalUrl: existingWebRecord.sourceUrl || url,
+        registryUniqueId: existingWebRecord.id,
+        isRegisteredInCloudflare: true,
+        isUploadedToCloudflare: Boolean(existingWebRecord.cloudflareVideoUrl || existingWebRecord.cloudflareThumbnailUrl),
+        responseTimeMs: 1,
+        contentType: 'text/html; charset=utf-8',
+        headers: {
+          server: 'cloudflare-r2-vault',
+          'cache-control': 'public, max-age=86400',
+        },
+        page: cachedPageData,
+        media: cachedMediaData,
+        content: {
+          headings: [existingWebRecord.title],
+          textExcerpt:
+            cachedPageData.description ||
+            `Extracted and archived in Cloudflare registry on ${existingWebRecord.firstExtractedAt || 'earlier session'}.`,
+          metaTags: {},
+          jsonLd: [],
+        },
+        fullHtml: `<!-- Cached Cloudflare Registry Entry for Web URL: ${url} -->`,
+        rawSnippet: `Cached record from Cloudflare: ${existingWebRecord.title}`,
+        htmlLength: 0,
+        registryRecord: existingWebRecord,
+      });
+    }
+
     let parsedUrl: URL;
     try {
       parsedUrl = new URL(url);
@@ -2342,22 +3396,37 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
       });
     }
 
+    // Save/mark URL object BEFORE starting processing (0 duplicate copies if it already exists)
+    upsertRegistryRecordByWebUrl(url, {
+      status: existingWebRecord?.status === 'forwarded' ? 'forwarded' : 'processing',
+      metadata: {
+        ...(existingWebRecord?.metadata || {}),
+        processingStartedAt: new Date().toISOString(),
+      },
+    });
+
     const startTime = Date.now();
 
-    // Fetch using axios with browser headers and redirect tracking
-    const response = await axios.get(url, {
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,video/*,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        ...customHeaders,
+    // Fetch using axios with retry, non-keepalive agents, browser headers, and redirect tracking
+    const response = await axiosGetWithRetry(
+      url,
+      {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,video/*,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
+          Referer: `${parsedUrl.origin}/`,
+          ...customHeaders,
+        },
+        timeout: 25000,
+        maxRedirects: 5,
+        responseType: 'text',
+        validateStatus: () => true, // Don't throw on 4xx/5xx so we can report status
       },
-      timeout: 18000,
-      maxRedirects: 5,
-      responseType: 'text',
-      validateStatus: () => true, // Don't throw on 4xx/5xx so we can report status
-    });
+      3
+    );
 
     const responseTimeMs = Date.now() - startTime;
     const contentType = String(response.headers['content-type'] || '');
@@ -2635,11 +3704,12 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
         });
       }
 
-      // File size extraction from HTML attributes if present
+      // File size hint from HTML attributes (used ONLY as a last-resort fallback if HTTP/R2 size is unavailable)
+      let htmlSizeHint: { sizeBytes: number; sizeMb: string; sizeFormatted: string } | null = null;
       const sizeAttr =
         $('meta[itemprop="contentSize"]').attr('content') ||
         $('[data-size]').attr('data-size') ||
-        $('[class*="filesize"], [class*="video-size"]').text();
+        '';
       if (sizeAttr) {
         const match = sizeAttr.match(/(\d+(?:\.\d+)?)\s*(GB|MB|KB)/i);
         if (match) {
@@ -2649,7 +3719,7 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
           if (unit === 'GB') bytes = num * 1024 * 1024 * 1024;
           if (unit === 'KB') bytes = num * 1024;
           const sizeMb = (bytes / (1024 * 1024)).toFixed(2);
-          detectedVideoSize = {
+          htmlSizeHint = {
             sizeBytes: Math.round(bytes),
             sizeMb,
             sizeFormatted: `${num} ${unit}`,
@@ -2671,43 +3741,71 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
 
       // 3. DETECT VIDEOS WITH ASSOCIATED POSTER & TITLE
       const detectedVideosMap = new Map<string, { url: string; poster?: string; title?: string; type: string }>();
-      if (ogVideo) {
-        detectedVideosMap.set(ogVideo, {
-          url: ogVideo,
-          poster: ogImage || undefined,
-          title: candidateTitles[0]?.text || undefined,
-          type: ogVideo.includes('.m3u8') ? 'HLS (m3u8)' : 'MP4 Video',
-        });
+      const addDetectedVideoCandidate = (rawVideoUrl: string, poster?: string, title?: string, explicitType?: string) => {
+        if (!rawVideoUrl || rawVideoUrl.startsWith('data:') || rawVideoUrl.startsWith('blob:')) return;
+        const resolvedUrl = resolveUrl(rawVideoUrl.trim());
+        if (!resolvedUrl || !/^https?:\/\//i.test(resolvedUrl)) return;
+        if (!detectedVideosMap.has(resolvedUrl)) {
+          detectedVideosMap.set(resolvedUrl, {
+            url: resolvedUrl,
+            poster: poster || ogImage || undefined,
+            title: title || candidateTitles[0]?.text || undefined,
+            type:
+              explicitType ||
+              (resolvedUrl.includes('.m3u8')
+                ? 'HLS (m3u8)'
+                : resolvedUrl.includes('.webm')
+                ? 'WebM Video'
+                : resolvedUrl.includes('.mp4')
+                ? 'MP4 Video'
+                : 'Video Stream'),
+          });
+        }
+      };
+
+      const twitterStream =
+        $('meta[name="twitter:player:stream"]').attr('content') ||
+        $('meta[property="twitter:player:stream"]').attr('content') ||
+        $('meta[itemprop="contentUrl"]').attr('content') ||
+        '';
+      if (twitterStream) {
+        addDetectedVideoCandidate(twitterStream, ogImage, candidateTitles[0]?.text);
       }
 
+      if (ogVideo && !/\.(html?|php)(\?|$)/i.test(ogVideo)) {
+        addDetectedVideoCandidate(ogVideo, ogImage, candidateTitles[0]?.text);
+      }
+
+      // Check JSON-LD contentUrl fields
+      contentData.jsonLd.forEach((entry: any) => {
+        const items = Array.isArray(entry) ? entry : [entry];
+        items.forEach((item: any) => {
+          const contentUrl = item?.contentUrl || item?.video?.contentUrl || item?.associatedMedia?.contentUrl;
+          if (typeof contentUrl === 'string' && contentUrl.trim()) {
+            addDetectedVideoCandidate(contentUrl, ogImage, item?.name || candidateTitles[0]?.text);
+          }
+        });
+      });
+
       $('video').each((_, el) => {
-        const vSrc = $(el).attr('src');
+        const vSrc =
+          $(el).attr('src') ||
+          $(el).attr('data-src') ||
+          $(el).attr('data-video') ||
+          $(el).attr('data-video-url') ||
+          $(el).attr('data-url');
         const vPoster = resolveUrl($(el).attr('poster') || $(el).attr('data-poster') || $(el).attr('data-thumb') || '');
         const vTitle = $(el).attr('title') || $(el).attr('data-title') || $(el).attr('aria-label') || '';
 
         if (vSrc) {
-          const resolvedUrl = resolveUrl(vSrc);
-          detectedVideosMap.set(resolvedUrl, {
-            url: resolvedUrl,
-            poster: vPoster || ogImage || undefined,
-            title: vTitle || candidateTitles[0]?.text || undefined,
-            type: resolvedUrl.includes('.m3u8') ? 'HLS (m3u8)' : resolvedUrl.includes('.mp4') ? 'MP4 Video' : 'Video Stream',
-          });
+          addDetectedVideoCandidate(vSrc, vPoster, vTitle);
         }
 
         $(el).find('source').each((__, sEl) => {
-          const sSrc = $(sEl).attr('src');
+          const sSrc = $(sEl).attr('src') || $(sEl).attr('data-src') || $(sEl).attr('data-url');
           const sType = $(sEl).attr('type') || '';
           if (sSrc) {
-            const resolvedUrl = resolveUrl(sSrc);
-            if (!detectedVideosMap.has(resolvedUrl)) {
-              detectedVideosMap.set(resolvedUrl, {
-                url: resolvedUrl,
-                poster: vPoster || ogImage || undefined,
-                title: vTitle || candidateTitles[0]?.text || undefined,
-                type: sType || (resolvedUrl.includes('.m3u8') ? 'HLS (m3u8)' : 'MP4 Video'),
-              });
-            }
+            addDetectedVideoCandidate(sSrc, vPoster, vTitle, sType);
           }
         });
       });
@@ -2715,17 +3813,21 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
       $('a[href]').each((_, el) => {
         const href = $(el).attr('href');
         if (href && /\.(mp4|m3u8|webm|mov|mkv)(\?.*)?$/i.test(href)) {
-          const resolvedUrl = resolveUrl(href);
-          if (!detectedVideosMap.has(resolvedUrl)) {
-            detectedVideosMap.set(resolvedUrl, {
-              url: resolvedUrl,
-              poster: ogImage || undefined,
-              title: cleanStr($(el).text()) || $(el).attr('title') || candidateTitles[0]?.text || undefined,
-              type: resolvedUrl.includes('.m3u8') ? 'HLS (m3u8)' : 'MP4 Video',
-            });
-          }
+          addDetectedVideoCandidate(
+            href,
+            ogImage,
+            cleanStr($(el).text()) || $(el).attr('title') || candidateTitles[0]?.text
+          );
         }
       });
+
+      // Fallback: scan inline scripts & raw HTML for direct .mp4/.webm/.mov/.mkv/.m3u8 URLs
+      const normalizedHtmlForScripts = response.data.replace(/\\\//g, '/');
+      const scriptMediaMatches =
+        normalizedHtmlForScripts.match(/https?:\/\/[^\s"'<>\\`]+\.(?:mp4|webm|mov|mkv|m3u8)(?:\?[^\s"'<>\\`]*)?/gi) || [];
+      for (const mUrl of scriptMediaMatches) {
+        addDetectedVideoCandidate(mUrl, ogImage, candidateTitles[0]?.text);
+      }
 
       // Detect embedded player iframes (YouTube, Vimeo, etc.)
       const detectedIframes: Array<{ src: string; type: string; title?: string }> = [];
@@ -2784,8 +3886,33 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
       const rawPrimary = candidateTitles[0]?.rawText || candidateTitles[0]?.text || rawDocTitle || url.split('/').pop()?.split('?')[0] || '';
       const cleanedPrimary = cleanTitleWithFilter(rawPrimary, wordsToRemove);
       let primaryThumbnail = candidateThumbnails[0]?.url || ogImage || '';
+      const originalPrimaryThumbnail = primaryThumbnail;
       let cloudflareThumbnailUrl: string | null = null;
       let thumbnailStorageSource: 'cloudflare_r2' | 'emulator' | null = null;
+
+      // Sort video candidates so direct MP4/WebM/MOV streams come before .m3u8 playlists
+      const sortedVideoCandidates = Array.from(detectedVideosMap.values()).sort((a, b) => {
+        const score = (u: string) => {
+          const lower = u.toLowerCase();
+          if (/\.(mp4|webm|mov|mkv)(\?|$)/.test(lower)) return 0;
+          if (!lower.includes('.m3u8')) return 1;
+          return 2;
+        };
+        return score(a.url) - score(b.url);
+      });
+
+      const firstVideoUrl = sortedVideoCandidates[0]?.url || '';
+
+      // Update saved object immediately once HTML metadata, thumbnail URL, & video URL are discovered
+      upsertRegistryRecordByWebUrl(url, {
+        title: cleanedPrimary.cleaned || 'Extracted Video',
+        rawTitle: rawPrimary,
+        description: detectedDescription || undefined,
+        thumbnailUrl: originalPrimaryThumbnail || undefined,
+        videoUrl: firstVideoUrl || undefined,
+        durationSec: detectedDuration?.seconds ?? null,
+        durationFormatted: detectedDuration?.formatted || '',
+      });
 
       // Automatically upload thumbnail to Cloudflare R2 if requested
       if (uploadThumbnailToR2 && primaryThumbnail) {
@@ -2794,63 +3921,95 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
             imageUrl: primaryThumbnail,
             customFilename: cleanedPrimary.cleaned || 'thumb',
             folderPrefix: 'thumbnails',
+            refererUrl: finalUrl,
             req,
           });
           cloudflareThumbnailUrl = r2Upload.cloudflareBackLink;
           thumbnailStorageSource = r2Upload.storageSource;
           primaryThumbnail = r2Upload.cloudflareBackLink;
+          upsertRegistryRecordByWebUrl(url, {
+            cloudflareThumbnailUrl,
+            thumbnailStorageSource,
+          });
         } catch (thumbErr) {
-          console.warn('Auto upload of thumbnail to Cloudflare R2 failed:', thumbErr);
+          console.warn('Auto upload of thumbnail to Cloudflare R2 failed:', formatCompactError(thumbErr));
         }
       }
 
-      // Check remote file size of first detected video if not already extracted
-      let firstVideoUrl = Array.from(detectedVideosMap.values())[0]?.url;
       let cloudflareVideoUrl: string | null = null;
       let videoStorageSource: 'cloudflare_r2' | 'emulator' | null = null;
+      let uploadedSourceVideoUrl = firstVideoUrl;
 
-      // Automatically upload video stream to Cloudflare R2 if requested
-      if (uploadVideoToR2 && firstVideoUrl) {
-        try {
-          const r2VideoUpload = await uploadVideoToR2OrLocal({
-            videoUrl: firstVideoUrl,
-            customFilename: cleanedPrimary.cleaned || 'video',
-            folderPrefix: 'videos',
-            req,
-          });
-          cloudflareVideoUrl = r2VideoUpload.cloudflareVideoBackLink;
-          videoStorageSource = r2VideoUpload.storageSource;
-          detectedVideoSize = {
-            sizeBytes: r2VideoUpload.sizeBytes,
-            sizeMb: r2VideoUpload.sizeMb,
-            sizeFormatted: r2VideoUpload.sizeFormatted,
-          };
-        } catch (videoErr) {
-          console.warn('Auto upload of video to Cloudflare R2 failed:', videoErr);
+      // Automatically upload video stream to Cloudflare R2 if requested (trying up to 3 candidates if #0 fails)
+      if (uploadVideoToR2 && sortedVideoCandidates.length > 0) {
+        const candidatesToTry = sortedVideoCandidates.slice(0, 3);
+        for (const candidate of candidatesToTry) {
+          try {
+            const r2VideoUpload = await uploadVideoToR2OrLocal({
+              videoUrl: candidate.url,
+              customFilename: cleanedPrimary.cleaned || 'video',
+              folderPrefix: 'videos',
+              refererUrl: finalUrl,
+              req,
+            });
+            cloudflareVideoUrl = r2VideoUpload.cloudflareVideoBackLink;
+            videoStorageSource = r2VideoUpload.storageSource;
+            uploadedSourceVideoUrl = candidate.url;
+            // Authoritative video file size & duration from downloaded video + Cloudflare R2 HeadObject verification
+            detectedVideoSize = {
+              sizeBytes: r2VideoUpload.sizeBytes,
+              sizeMb: r2VideoUpload.sizeMb,
+              sizeFormatted: r2VideoUpload.sizeFormatted,
+            };
+            if (r2VideoUpload.durationSec && r2VideoUpload.durationFormatted) {
+              detectedDuration = {
+                seconds: r2VideoUpload.durationSec,
+                formatted: r2VideoUpload.durationFormatted,
+              };
+            }
+            upsertRegistryRecordByWebUrl(url, {
+              videoUrl: uploadedSourceVideoUrl,
+              cloudflareVideoUrl,
+              videoStorageSource,
+              sizeBytes: r2VideoUpload.sizeBytes,
+              sizeMb: r2VideoUpload.sizeMb,
+              sizeFormatted: r2VideoUpload.sizeFormatted,
+              durationSec: detectedDuration?.seconds ?? null,
+              durationFormatted: detectedDuration?.formatted || '',
+              status: 'uploaded',
+            });
+            break;
+          } catch (videoErr) {
+            console.warn('Auto upload of video to Cloudflare R2 failed:', formatCompactError(videoErr));
+          }
         }
       }
 
       if (!detectedVideoSize && firstVideoUrl) {
-        detectedVideoSize = await detectRemoteFileSize(firstVideoUrl);
+        detectedVideoSize = await detectRemoteFileSize(firstVideoUrl, finalUrl);
+      }
+      if (!detectedVideoSize && htmlSizeHint) {
+        detectedVideoSize = htmlSizeHint;
       }
 
       // Map detected videos with duration, size, and cleaned titles
       const detectedVideosList = await Promise.all(
-        Array.from(detectedVideosMap.values()).map(async (vItem, i) => {
+        sortedVideoCandidates.map(async (vItem, i) => {
           const rawVTitle = vItem.title || rawPrimary;
           const vClean = cleanTitleWithFilter(rawVTitle, wordsToRemove);
-          let itemSize = detectedVideoSize;
-          if (i > 0 && !itemSize && vItem.url) {
-            itemSize = await detectRemoteFileSize(vItem.url);
+          const isUploadedCandidate = Boolean(cloudflareVideoUrl && vItem.url === uploadedSourceVideoUrl);
+          let itemSize = isUploadedCandidate || i === 0 ? detectedVideoSize : null;
+          if (!itemSize && vItem.url) {
+            itemSize = await detectRemoteFileSize(vItem.url, finalUrl);
           }
 
-          const resolvedItemVideoUrl = i === 0 && cloudflareVideoUrl ? cloudflareVideoUrl : vItem.url;
+          const resolvedItemVideoUrl = isUploadedCandidate && cloudflareVideoUrl ? cloudflareVideoUrl : vItem.url;
 
           return {
             id: i + 1,
             url: resolvedItemVideoUrl,
             originalVideoUrl: vItem.url,
-            cloudflareVideoUrl: i === 0 && cloudflareVideoUrl ? cloudflareVideoUrl : undefined,
+            cloudflareVideoUrl: isUploadedCandidate && cloudflareVideoUrl ? cloudflareVideoUrl : undefined,
             poster: cloudflareThumbnailUrl || vItem.poster || primaryThumbnail || undefined,
             title: vClean.cleaned,
             rawTitle: rawVTitle,
@@ -2914,18 +4073,20 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
         }
       }
       if (!directSize) {
-        directSize = await detectRemoteFileSize(finalUrl);
+        directSize = await detectRemoteFileSize(finalUrl, url);
       }
 
       let cloudflareVideoUrl: string | null = null;
       let videoStorageSource: 'cloudflare_r2' | 'emulator' | null = null;
+      let directDuration: { seconds: number; formatted: string } | null = null;
 
-      if (uploadVideoToR2 && (contentType.includes('video') || contentType.includes('mpegurl') || /\.(mp4|m3u8|webm)$/i.test(url))) {
+      if (uploadVideoToR2 && (contentType.includes('video') || contentType.includes('mpegurl') || /\.(mp4|m3u8|webm|mov|mkv)$/i.test(url))) {
         try {
           const r2DirectVideo = await uploadVideoToR2OrLocal({
             videoUrl: finalUrl,
             customFilename: cleanedDirect.cleaned || 'stream_video',
             folderPrefix: 'videos',
+            refererUrl: url,
             req,
           });
           cloudflareVideoUrl = r2DirectVideo.cloudflareVideoBackLink;
@@ -2935,8 +4096,14 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
             sizeMb: r2DirectVideo.sizeMb,
             sizeFormatted: r2DirectVideo.sizeFormatted,
           };
+          if (r2DirectVideo.durationSec && r2DirectVideo.durationFormatted) {
+            directDuration = {
+              seconds: r2DirectVideo.durationSec,
+              formatted: r2DirectVideo.durationFormatted,
+            };
+          }
         } catch (r2Err) {
-          console.warn('Direct video stream Cloudflare upload failed:', r2Err);
+          console.warn('Direct video stream Cloudflare upload failed:', formatCompactError(r2Err));
         }
       }
 
@@ -2944,8 +4111,8 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
         title: cleanedDirect.cleaned,
         rawTitle: directTitle,
         description: `Direct ${contentType} resource stream`,
-        durationSec: null,
-        durationFormatted: null,
+        durationSec: directDuration?.seconds || null,
+        durationFormatted: directDuration?.formatted || null,
         videoSize: directSize,
         removedWords: cleanedDirect.removedTerms,
         favicon: `${parsedUrl.origin}/favicon.ico`,
@@ -2962,7 +4129,7 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
         candidateThumbnails: [],
       };
 
-      if (contentType.includes('video') || contentType.includes('mpegurl') || /\.(mp4|m3u8|webm)$/i.test(url)) {
+      if (contentType.includes('video') || contentType.includes('mpegurl') || /\.(mp4|m3u8|webm|mov|mkv)$/i.test(url)) {
         mediaData.videos.push({
           id: 1,
           url: cloudflareVideoUrl || finalUrl,
@@ -2972,8 +4139,8 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
           rawTitle: directTitle,
           type: contentType || (finalUrl.includes('.m3u8') ? 'HLS (m3u8)' : 'MP4 Video'),
           filename: finalUrl.split('/').pop()?.split('?')[0] || 'stream_video',
-          durationSec: null,
-          durationFormatted: null,
+          durationSec: directDuration?.seconds || null,
+          durationFormatted: directDuration?.formatted || null,
           sizeBytes: directSize?.sizeBytes || null,
           sizeMb: directSize?.sizeMb || null,
           sizeFormatted: directSize?.sizeFormatted || null,
@@ -2991,57 +4158,32 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
     const rawHtmlString = typeof response.data === 'string' ? response.data : JSON.stringify(response.data, null, 2);
     const fullHtml = rawHtmlString.substring(0, 1000000);
 
-    // Auto-record / update in Cloudflare Extracted Registry so deduplication is automatic
-    const registryUniqueId = getLinkUniqueId(url);
-    const normUrl = normalizeUrlForDedup(url);
-    const primaryVideoObj = mediaData.videos?.[0];
+    // Finalize & persist complete object in Cloudflare Extracted Registry strictly by Web URL
+    const primaryVideoObj =
+      mediaData.videos?.find((v: any) => v.cloudflareVideoUrl) || mediaData.videos?.[0];
     const bestThumb = pageData.cloudflareThumbnailUrl || primaryVideoObj?.poster || pageData.ogImage || '';
-    const bestVideoUrl = pageData.cloudflareVideoUrl || primaryVideoObj?.url || '';
-
-    const existingRegIdx = extractedLinksRegistry.findIndex(
-      (r) => normalizeUrlForDedup(r.sourceUrl) === normUrl || r.id === registryUniqueId
-    );
-
-    const nowIso = new Date().toISOString();
     const isNowUploaded = Boolean(pageData.cloudflareVideoUrl || pageData.cloudflareThumbnailUrl);
 
-    if (existingRegIdx >= 0) {
-      extractedLinksRegistry[existingRegIdx] = {
-        ...extractedLinksRegistry[existingRegIdx],
-        title: pageData.title || extractedLinksRegistry[existingRegIdx].title,
-        rawTitle: pageData.rawTitle || extractedLinksRegistry[existingRegIdx].rawTitle,
-        videoUrl: primaryVideoObj?.originalVideoUrl || primaryVideoObj?.url || extractedLinksRegistry[existingRegIdx].videoUrl,
-        thumbnailUrl: bestThumb || extractedLinksRegistry[existingRegIdx].thumbnailUrl,
-        cloudflareVideoUrl: pageData.cloudflareVideoUrl || extractedLinksRegistry[existingRegIdx].cloudflareVideoUrl,
-        cloudflareThumbnailUrl: pageData.cloudflareThumbnailUrl || extractedLinksRegistry[existingRegIdx].cloudflareThumbnailUrl,
-        durationFormatted: pageData.durationFormatted || extractedLinksRegistry[existingRegIdx].durationFormatted,
-        durationSec: pageData.durationSec || extractedLinksRegistry[existingRegIdx].durationSec,
-        sizeFormatted: pageData.videoSize?.sizeFormatted || extractedLinksRegistry[existingRegIdx].sizeFormatted,
-        status: isNowUploaded || extractedLinksRegistry[existingRegIdx].status === 'uploaded' ? 'uploaded' : 'extracted',
-        lastUpdatedAt: nowIso,
-      };
-    } else {
-      extractedLinksRegistry.unshift({
-        id: registryUniqueId,
-        sourceUrl: url,
-        title: pageData.title || 'Extracted Video',
-        rawTitle: pageData.rawTitle || pageData.title,
-        videoUrl: primaryVideoObj?.originalVideoUrl || primaryVideoObj?.url || '',
-        thumbnailUrl: bestThumb,
-        cloudflareVideoUrl: pageData.cloudflareVideoUrl || undefined,
-        cloudflareThumbnailUrl: pageData.cloudflareThumbnailUrl || undefined,
-        durationFormatted: pageData.durationFormatted || '',
-        durationSec: pageData.durationSec || null,
-        sizeFormatted: pageData.videoSize?.sizeFormatted || '',
-        destination: 'none',
-        status: isNowUploaded ? 'uploaded' : 'extracted',
-        firstExtractedAt: nowIso,
-        lastUpdatedAt: nowIso,
-      });
-    }
+    const savedRegistryRecord = upsertRegistryRecordByWebUrl(url, {
+      title: pageData.title || 'Extracted Video',
+      rawTitle: pageData.rawTitle || pageData.title,
+      description: pageData.description || primaryVideoObj?.description || undefined,
+      videoUrl: primaryVideoObj?.originalVideoUrl || primaryVideoObj?.url || '',
+      thumbnailUrl: bestThumb,
+      cloudflareVideoUrl: pageData.cloudflareVideoUrl || undefined,
+      cloudflareThumbnailUrl: pageData.cloudflareThumbnailUrl || undefined,
+      thumbnailStorageSource: pageData.thumbnailStorageSource || null,
+      videoStorageSource: pageData.videoStorageSource || null,
+      durationFormatted: pageData.durationFormatted || primaryVideoObj?.durationFormatted || '',
+      durationSec: pageData.durationSec ?? primaryVideoObj?.durationSec ?? null,
+      sizeBytes: pageData.videoSize?.sizeBytes ?? primaryVideoObj?.sizeBytes ?? null,
+      sizeMb: pageData.videoSize?.sizeMb || primaryVideoObj?.sizeMb || undefined,
+      sizeFormatted: pageData.videoSize?.sizeFormatted || primaryVideoObj?.sizeFormatted || '',
+      status: isNowUploaded ? 'uploaded' : 'extracted',
+    });
 
-    // Background sync to disk and R2
-    syncRegistryToStorage(req).catch(() => {});
+    // Sync updated record directly to ott-database (/api/links_registry)
+    await syncRegistryToStorage(req, [savedRegistryRecord]);
 
     return res.json({
       success: true,
@@ -3049,7 +4191,8 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
       statusText: response.statusText || 'OK',
       targetUrl: url,
       finalUrl,
-      registryUniqueId,
+      registryUniqueId: savedRegistryRecord.id,
+      registryRecord: savedRegistryRecord,
       isRegisteredInCloudflare: true,
       isUploadedToCloudflare: Boolean(pageData.cloudflareVideoUrl || pageData.cloudflareThumbnailUrl),
       responseTimeMs,
@@ -3069,11 +4212,144 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
       htmlLength: rawHtmlString.length,
     });
   } catch (err: any) {
-    console.error('URL processing error:', err);
+    console.error('URL processing error:', formatCompactError(err));
     return res.status(500).json({
       success: false,
-      error: err.message || 'Failed to process website URL',
+      error: formatCompactError(err) || 'Failed to process website URL',
       details: err.code || err.name,
+    });
+  }
+});
+
+// GET /api/system-resources - Live VPS resource telemetry & optimal worker calculator
+app.get('/api/system-resources', (_req: Request, res: Response) => {
+  try {
+    const cpus = os.cpus();
+    const coreCount = Math.max(1, cpus.length);
+    const { speedMhz, model } = getCpuClockSpeed();
+    const speedFormatted = speedMhz >= 1000 ? `${(speedMhz / 1000).toFixed(2)} GHz` : `${Math.round(speedMhz)} MHz`;
+
+    // CPU utilization delta
+    const currentSnapshot = getCpuSnapshot();
+    if (prevCpuSnapshot) {
+      const diffTotal = currentSnapshot.total - prevCpuSnapshot.total;
+      const diffIdle = currentSnapshot.idle - prevCpuSnapshot.idle;
+      if (diffTotal > 0) {
+        lastCalculatedCpuPercent = Math.max(0, Math.min(100, Math.round(((diffTotal - diffIdle) / diffTotal) * 100)));
+      }
+    }
+    prevCpuSnapshot = currentSnapshot;
+
+    // RAM statistics
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+    const usedMem = Math.max(0, totalMem - freeMem);
+    const memUsagePercent = totalMem > 0 ? Math.round((usedMem / totalMem) * 100) : 0;
+    const processMem = process.memoryUsage();
+
+    // Disk space via fs.statfsSync('/')
+    let diskTotal = 0;
+    let diskFree = 0;
+    let diskUsed = 0;
+    let diskUsagePercent = 0;
+    try {
+      const stat = fs.statfsSync('/');
+      diskTotal = stat.blocks * stat.bsize;
+      diskFree = stat.bavail * stat.bsize;
+      diskUsed = Math.max(0, diskTotal - diskFree);
+      diskUsagePercent = diskTotal > 0 ? Math.round((diskUsed / diskTotal) * 100) : 0;
+    } catch {
+      diskTotal = 50 * 1024 * 1024 * 1024;
+      diskFree = 40 * 1024 * 1024 * 1024;
+      diskUsed = 10 * 1024 * 1024 * 1024;
+      diskUsagePercent = 20;
+    }
+
+    // Dynamic Worker Recommendation calculation (range: 1 - 20)
+    // Cores capacity: 2 workers per vCPU for network/I-O streaming tasks
+    const coreCapacity = Math.max(1, Math.min(20, coreCount * 2));
+    
+    // RAM capacity: ~250MB buffer per active video scraping/upload worker
+    const freeRamMb = Math.round(freeMem / (1024 * 1024));
+    const ramCapacity = Math.max(1, Math.min(20, Math.floor(freeRamMb / 250)));
+
+    let recommendedWorkers = Math.min(coreCapacity, ramCapacity);
+
+    // CPU load throttle safeguard
+    if (lastCalculatedCpuPercent > 80) {
+      recommendedWorkers = Math.max(1, recommendedWorkers - 2);
+    } else if (lastCalculatedCpuPercent > 60) {
+      recommendedWorkers = Math.max(1, recommendedWorkers - 1);
+    }
+    recommendedWorkers = Math.max(1, Math.min(20, recommendedWorkers));
+
+    let cpuStatus: 'healthy' | 'moderate' | 'high' = 'healthy';
+    if (lastCalculatedCpuPercent > 80) cpuStatus = 'high';
+    else if (lastCalculatedCpuPercent > 50) cpuStatus = 'moderate';
+
+    let ramStatus: 'healthy' | 'moderate' | 'low' = 'healthy';
+    if (memUsagePercent > 85) ramStatus = 'low';
+    else if (memUsagePercent > 65) ramStatus = 'moderate';
+
+    let reason = `${coreCount} vCPU(s) @ ${speedFormatted} with ${formatBytes(freeMem)} free RAM: ${recommendedWorkers} workers optimal for maximum throughput without memory thrashing.`;
+    if (cpuStatus === 'high') {
+      reason = `VPS CPU load is currently high (${lastCalculatedCpuPercent}%). Recommended ${recommendedWorkers} workers to prevent throttling.`;
+    } else if (ramStatus === 'low') {
+      reason = `VPS RAM is constrained (${memUsagePercent}% used). Recommended ${recommendedWorkers} workers to avoid out-of-memory errors.`;
+    }
+
+    const payload = {
+      cpu: {
+        cores: coreCount,
+        model,
+        speedMhz,
+        speedFormatted,
+        usagePercent: lastCalculatedCpuPercent,
+        loadAverage: os.loadavg(),
+      },
+      ram: {
+        totalBytes: totalMem,
+        freeBytes: freeMem,
+        usedBytes: usedMem,
+        usedPercent: memUsagePercent,
+        totalFormatted: formatBytes(totalMem),
+        usedFormatted: formatBytes(usedMem),
+        freeFormatted: formatBytes(freeMem),
+        processRssFormatted: formatBytes(processMem.rss),
+      },
+      disk: {
+        totalBytes: diskTotal,
+        freeBytes: diskFree,
+        usedBytes: diskUsed,
+        usedPercent: diskUsagePercent,
+        totalFormatted: formatBytes(diskTotal),
+        usedFormatted: formatBytes(diskUsed),
+        freeFormatted: formatBytes(diskFree),
+        mountPoint: '/',
+      },
+      vpsRecommendation: {
+        recommendedWorkers,
+        maxSafeWorkers: Math.min(20, coreCount * 2),
+        currentCpuStatus: cpuStatus,
+        currentRamStatus: ramStatus,
+        reason,
+      },
+      system: {
+        uptimeSeconds: os.uptime(),
+        uptimeFormatted: formatUptime(os.uptime()),
+        platform: os.platform(),
+        arch: os.arch(),
+        hostname: os.hostname(),
+      },
+      timestamp: new Date().toISOString(),
+    };
+
+    return res.json(payload);
+  } catch (err: any) {
+    console.error('System resources telemetry error:', err);
+    return res.status(500).json({
+      error: 'Failed to read VPS telemetry',
+      details: err.message,
     });
   }
 });
@@ -3089,7 +4365,7 @@ app.all('/api/*', (req: Request, res: Response) => {
 // Global API error handler ensuring all errors are JSON, never HTML
 app.use((err: any, req: Request, res: Response, next: any) => {
   if (req.path.startsWith('/api') || req.headers.accept?.includes('application/json')) {
-    console.error('Unhandled API error on', req.path, err);
+    console.error('Unhandled API error on', req.path, formatCompactError(err));
     return res.status(err.status || err.statusCode || 500).json({
       status: 'error',
       error: err.message || 'Internal server error',
@@ -3116,7 +4392,8 @@ async function startServer() {
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server listening on port ${PORT}`);
+    console.log(`Server listening on port ${PORT} (Cloudflare Worker D1: ${CF_WORKER_BASE_URL})`);
+    hydrateRegistryFromD1IfNeeded().catch(() => {});
   });
 }
 

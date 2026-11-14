@@ -49,9 +49,10 @@ export interface ExtractedPageLink {
     title: string;
     destination?: string;
     destinationDetail?: string;
+    videoUrl?: string;
     cloudflareVideoUrl?: string;
     cloudflareThumbnailUrl?: string;
-    status: 'extracted' | 'uploaded' | 'forwarded';
+    status: 'extracted' | 'processing' | 'uploaded' | 'forwarded';
   } | null;
 }
 
@@ -983,17 +984,35 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
                       <td className="p-3 align-top space-y-1">
                         {isRegistered && record ? (
                           <div className="space-y-0.5">
-                            {item.isNewInCloudflare ? (
-                              <span className="px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-bold text-[10px] flex items-center gap-1 w-fit">
-                                <Plus className="w-2.5 h-2.5" />
-                                <span>New Link Added</span>
-                              </span>
-                            ) : (
-                              <span className="px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-bold text-[10px] flex items-center gap-1 w-fit">
-                                <ShieldCheck className="w-2.5 h-2.5" />
-                                <span>In Cloudflare (0 Copy)</span>
-                              </span>
-                            )}
+                            {(() => {
+                              const hasProcessed = Boolean(
+                                record.cloudflareVideoUrl ||
+                                record.cloudflareThumbnailUrl ||
+                                record.videoUrl ||
+                                record.status === 'uploaded'
+                              );
+                              if (item.isNewInCloudflare) {
+                                return (
+                                  <span className="px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-bold text-[10px] flex items-center gap-1 w-fit">
+                                    <Plus className="w-2.5 h-2.5" />
+                                    <span>New Link Added</span>
+                                  </span>
+                                );
+                              }
+                              if (hasProcessed) {
+                                return (
+                                  <span className="px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-bold text-[10px] flex items-center gap-1 w-fit">
+                                    <ShieldCheck className="w-2.5 h-2.5" />
+                                    <span>Processed in Cloudflare (0 Copy)</span>
+                                  </span>
+                                );
+                              }
+                              return (
+                                <span className="px-2 py-0.5 rounded-full bg-slate-800 text-slate-300 border border-slate-700 font-semibold text-[10px] flex items-center gap-1 w-fit">
+                                  <span>Tracked Link (Not Processed Yet)</span>
+                                </span>
+                              );
+                            })()}
                             {record.destination && record.destination !== 'none' && (
                               <p className="text-[10px] text-yellow-400 font-medium">
                                 Saved to: <strong>{record.destination}</strong>

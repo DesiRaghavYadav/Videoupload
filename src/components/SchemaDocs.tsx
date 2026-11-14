@@ -26,7 +26,7 @@ export const SchemaDocs: React.FC = () => {
   };
 
   const JS_HELPER_CODE = `export async function uploadToCloudflare(endpoint, payload) {
-  const url = \`https://ott-api.5abhishektrialhae.workers.dev/api/\${endpoint}\`;
+  const url = \`https://ott-api.fussionbhakti3.workers.dev/api/\${endpoint}\`;
   const response = await fetch(url, {
     method: "POST",
     headers: {

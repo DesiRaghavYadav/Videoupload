@@ -39,6 +39,13 @@ interface HeaderProps {
   onOpenSettings: () => void;
   activeTab: AppTabType;
   setActiveTab: (tab: AppTabType) => void;
+  webProcessorBatchStatus?: {
+    isRunning: boolean;
+    completedCount: number;
+    totalCount: number;
+    activeWorkers: number;
+    concurrency: number;
+  } | null;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -46,6 +53,7 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenSettings,
   activeTab,
   setActiveTab,
+  webProcessorBatchStatus,
 }) => {
   const isR2Live = Boolean(r2Status?.configured);
 
@@ -138,6 +146,11 @@ export const Header: React.FC<HeaderProps> = ({
               >
                 <Icon className={`w-3.5 h-3.5 ${isActive ? 'text-white' : 'text-slate-400'}`} />
                 <span>{item.label}</span>
+                {item.id === 'webprocessor' && webProcessorBatchStatus?.isRunning && (
+                  <span className="ml-0.5 px-1.5 py-0.2 rounded-full bg-cyan-400 text-slate-950 font-extrabold text-[9px] animate-pulse">
+                    {webProcessorBatchStatus.completedCount}/{webProcessorBatchStatus.totalCount}
+                  </span>
+                )}
               </button>
             );
           })}

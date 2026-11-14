@@ -1,10 +1,10 @@
 /**
  * Cloudflare Worker REST API Service
- * Base URL: https://ott-api.5abhishektrialhae.workers.dev
+ * Base URL: https://ott-api.fussionbhakti3.workers.dev
  * Handles Content Management for OTT / Streaming platform
  */
 
-export const CF_WORKER_BASE_URL = 'https://ott-api.5abhishektrialhae.workers.dev';
+export const CF_WORKER_BASE_URL = 'https://ott-api.fussionbhakti3.workers.dev';
 
 export interface BatchVideoEpisode {
   videoIndex: number;
@@ -257,10 +257,14 @@ export async function addVideoToCategory(
   const streamUrl = (newVideo.reelsUrl || newVideo.videoUrl || '').trim();
   const title = (newVideo.title || '').trim();
 
-  // Duplicate Check: Check if video with same stream URL or title already exists in THIS category
+  const genericTitles = new Set(['extracted video', 'processed video', 'untitled video', 'video']);
+  const isNonGenericTitle = Boolean(title) && !genericTitles.has(title.toLowerCase());
+
+  // Duplicate Check: Check if video with same stream URL or same non-generic title (when URL absent) already exists
   const alreadyExists = category.videos.some(
-    (v) => (streamUrl && v.reelsUrl?.trim().toLowerCase() === streamUrl.toLowerCase()) ||
-           (title && v.title?.trim().toLowerCase() === title.toLowerCase())
+    (v) =>
+      (streamUrl && v.reelsUrl?.trim().toLowerCase() === streamUrl.toLowerCase()) ||
+      (!streamUrl && isNonGenericTitle && v.title?.trim().toLowerCase() === title.toLowerCase())
   );
 
   if (alreadyExists && !newVideo.forcePush) {
@@ -330,10 +334,14 @@ export async function addBatchVideosToCategory(
     const streamUrl = (item.reelsUrl || item.videoUrl || '').trim();
     const title = (item.title || '').trim();
 
+    const genericTitles = new Set(['extracted video', 'processed video', 'untitled video', 'video']);
+    const isNonGenericTitle = Boolean(title) && !genericTitles.has(title.toLowerCase());
+
     // Check if already exists in this target category
     const duplicate = existingVideos.some(
-      (v) => (streamUrl && v.reelsUrl?.trim().toLowerCase() === streamUrl.toLowerCase()) ||
-             (title && v.title?.trim().toLowerCase() === title.toLowerCase())
+      (v) =>
+        (streamUrl && v.reelsUrl?.trim().toLowerCase() === streamUrl.toLowerCase()) ||
+        (!streamUrl && isNonGenericTitle && v.title?.trim().toLowerCase() === title.toLowerCase())
     );
 
     if (duplicate && !item.forcePush) {

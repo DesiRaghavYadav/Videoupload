@@ -1,0 +1,10 @@
+name = "ott-api"
+main = "worker.ts"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ott-database"
+# Replace with the database_id printed when you run:
+#   npx wrangler d1 create ott-database
+database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"

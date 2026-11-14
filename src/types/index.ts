@@ -167,3 +167,50 @@ export interface PipelineProgress {
   error?: string;
   auditTrail?: VerificationStep[];
 }
+
+export interface SystemResourcesResponse {
+  cpu: {
+    cores: number;
+    model: string;
+    speedMhz: number;
+    speedFormatted: string;
+    usagePercent: number;
+    loadAverage: number[];
+  };
+  ram: {
+    totalBytes: number;
+    freeBytes: number;
+    usedBytes: number;
+    usedPercent: number;
+    totalFormatted: string;
+    usedFormatted: string;
+    freeFormatted: string;
+    processRssFormatted: string;
+  };
+  disk: {
+    totalBytes: number;
+    freeBytes: number;
+    usedBytes: number;
+    usedPercent: number;
+    totalFormatted: string;
+    usedFormatted: string;
+    freeFormatted: string;
+    mountPoint: string;
+  };
+  vpsRecommendation: {
+    recommendedWorkers: number;
+    maxSafeWorkers: number;
+    currentCpuStatus: 'healthy' | 'moderate' | 'high';
+    currentRamStatus: 'healthy' | 'moderate' | 'low';
+    reason: string;
+  };
+  system: {
+    uptimeSeconds: number;
+    uptimeFormatted: string;
+    platform: string;
+    arch: string;
+    hostname: string;
+  };
+  timestamp: string;
+}
+

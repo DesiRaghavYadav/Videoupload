@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Header, AppTabType } from './components/Header';
 import { VideoUploader } from './components/VideoUploader';
 import { ProcessingProgress } from './components/ProcessingProgress';
@@ -16,6 +16,7 @@ import { ChannelsAdmin } from './components/admin/ChannelsAdmin';
 import { VideoCategoriesAdmin } from './components/admin/VideoCategoriesAdmin';
 import { WebProcessor } from './components/WebProcessor';
 import { PageLinkExtractor } from './components/PageLinkExtractor';
+import { VpsResourceBar } from './components/VpsResourceBar';
 import {
   R2StatusResponse,
   ProcessedVideoResponse,
@@ -27,7 +28,7 @@ import {
   fetchUploadHistory,
   deleteVideoRecord,
 } from './utils/r2Service';
-import { Cloud, ShieldCheck, HardDrive, Zap } from 'lucide-react';
+import { Cloud, ShieldCheck, HardDrive, Zap, Globe, ArrowRight } from 'lucide-react';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<AppTabType>('dashboard');
@@ -38,6 +39,14 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [forwardedMediaData, setForwardedMediaData] = useState<any>(null);
   const [forwardedBatchVideos, setForwardedBatchVideos] = useState<any[] | null>(null);
+  const [webProcessorBatchStatus, setWebProcessorBatchStatus] = useState<{
+    isRunning: boolean;
+    isPaused: boolean;
+    concurrency: number;
+    completedCount: number;
+    totalCount: number;
+    activeWorkers: number;
+  } | null>(null);
   const [progress, setProgress] = useState<PipelineProgress>({
     stage: 'idle',
     percent: 0,
@@ -185,14 +194,48 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
+  const handleBatchProgressUpdate = useCallback((batchStatus: any) => {
+    setWebProcessorBatchStatus((prev) => {
+      if (!batchStatus && !prev) return null;
+      if (
+        prev &&
+        batchStatus &&
+        prev.isRunning === batchStatus.isRunning &&
+        prev.isPaused === batchStatus.isPaused &&
+        prev.concurrency === batchStatus.concurrency &&
+        prev.completedCount === batchStatus.completedCount &&
+        prev.totalCount === batchStatus.totalCount &&
+        prev.activeWorkers === batchStatus.activeWorkers
+      ) {
+        return prev;
+      }
+      return batchStatus;
+    });
+  }, []);
+
+  const [vpsConcurrency, setVpsConcurrency] = useState<number>(3);
+
+  const handleApplyOptimalWorkers = useCallback((workerCount: number) => {
+    setVpsConcurrency(workerCount);
+  }, []);
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
+      {/* Real-time VPS Telemetry Header (CPU Cores & Speed, RAM, Disk, Optimal Workers) */}
+      <VpsResourceBar
+        currentConcurrency={vpsConcurrency}
+        onApplyOptimalWorkers={handleApplyOptimalWorkers}
+        activeBatchWorkers={webProcessorBatchStatus?.activeWorkers ?? 0}
+        isBatchRunning={Boolean(webProcessorBatchStatus?.isRunning)}
+      />
+
       {/* Top Bar & Section Nav */}
       <Header
         r2Status={r2Status}
         onOpenSettings={() => setIsSettingsOpen(true)}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
+        webProcessorBatchStatus={webProcessorBatchStatus}
       />
 
       {/* Main Content Viewport */}
@@ -202,9 +245,11 @@ export default function App() {
           <AdminStatsDashboard onNavigateTab={(t) => setActiveTab(t as AppTabType)} />
         )}
 
-        {/* TAB 0.5: WEB PROCESSOR & SCRAPER (AXIOS / CHEERIO) */}
-        {activeTab === 'webprocessor' && (
+        {/* TAB 0.5: WEB PROCESSOR & SCRAPER (KEPT MOUNTED IN BACKGROUND) */}
+        <div className={activeTab === 'webprocessor' ? 'block' : 'hidden'}>
           <WebProcessor
+            externalConcurrency={vpsConcurrency}
+            onConcurrencyChange={setVpsConcurrency}
             onNavigateTab={(t, initialData) => {
               if (Array.isArray(initialData)) {
                 setForwardedBatchVideos(initialData);
@@ -215,11 +260,12 @@ export default function App() {
               }
               setActiveTab(t);
             }}
+            onBatchProgressUpdate={handleBatchProgressUpdate}
           />
-        )}
+        </div>
 
-        {/* TAB 0.8: DEDICATED WEBPAGE URL & LINK EXTRACTOR */}
-        {activeTab === 'linkextractor' && (
+        {/* TAB 0.8: DEDICATED WEBPAGE URL & LINK EXTRACTOR (KEPT MOUNTED IN BACKGROUND) */}
+        <div className={activeTab === 'linkextractor' ? 'block' : 'hidden'}>
           <PageLinkExtractor
             onNavigateTab={(t, initialData) => {
               if (Array.isArray(initialData)) {
@@ -232,7 +278,7 @@ export default function App() {
               setActiveTab(t);
             }}
           />
-        )}
+        </div>
 
         {/* TAB 1: BATCH VIDEOS / WEB SERIES */}
         {activeTab === 'batchvideo' && (
@@ -408,6 +454,39 @@ export default function App() {
           </div>
         </div>
       </footer>
+
+      {/* Floating Background Processor Monitor (Visible while user browses other tabs) */}
+      {webProcessorBatchStatus?.isRunning && activeTab !== 'webprocessor' && (
+        <div className="fixed bottom-6 right-6 z-50 p-4 bg-slate-900/95 border border-cyan-500/50 rounded-2xl shadow-2xl backdrop-blur-md flex items-center gap-4 text-xs animate-fadeIn max-w-md ring-1 ring-cyan-500/30">
+          <div className="flex items-center gap-3">
+            <div className="relative shrink-0">
+              <span className="w-3 h-3 rounded-full bg-cyan-400 block animate-ping absolute" />
+              <span className="w-3 h-3 rounded-full bg-cyan-500 block" />
+            </div>
+            <div className="space-y-0.5">
+              <div className="flex items-center gap-2">
+                <span className="font-bold text-white text-xs flex items-center gap-1">
+                  <Globe className="w-3.5 h-3.5 text-cyan-400" />
+                  <span>Web Processor Active</span>
+                </span>
+                <span className="px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 font-mono text-[10px] font-bold border border-cyan-500/30">
+                  {webProcessorBatchStatus.concurrency}x Workers
+                </span>
+              </div>
+              <p className="text-slate-400 text-[11px]">
+                {webProcessorBatchStatus.completedCount} / {webProcessorBatchStatus.totalCount} completed ({Math.round((webProcessorBatchStatus.completedCount / Math.max(1, webProcessorBatchStatus.totalCount)) * 100)}%) · Running in background
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => setActiveTab('webprocessor')}
+            className="px-3 py-1.5 bg-gradient-to-r from-cyan-500 to-teal-500 hover:from-cyan-400 hover:to-teal-400 text-slate-950 font-bold rounded-xl transition-all shadow-md shrink-0 flex items-center gap-1"
+          >
+            <span>Open</span>
+            <ArrowRight className="w-3 h-3" />
+          </button>
+        </div>
+      )}
 
       {/* Cloudflare R2 Settings Modal */}
       <R2SettingsModal
