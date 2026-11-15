@@ -193,6 +193,25 @@ export async function fetchUploadHistory(): Promise<ProcessedVideoResponse[]> {
 }
 
 /**
+ * Update a processed video record
+ */
+export async function updateVideoRecord(
+  id: string,
+  updates: Record<string, any>
+): Promise<ProcessedVideoResponse> {
+  const res = await fetch(`/api/videos/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Failed to update video record' }));
+    throw new Error(err.error || `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+/**
  * Delete a processed video
  */
 export async function deleteVideoRecord(id: string): Promise<boolean> {

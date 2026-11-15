@@ -7,9 +7,13 @@ import {
   addVideoToCategory,
   addBatchVideosToCategory,
   removeVideoFromCategory,
+  updateCategory,
+  updateVideoInCategory,
+  deleteFromCloudflare,
   uploadToCloudflare,
   CF_WORKER_BASE_URL,
 } from '../../services/cloudflareWorkerApi';
+import { JsonObjectEditorModal } from './JsonObjectEditorModal';
 import { ProcessedVideoResponse } from '../../types';
 import {
   FolderTree,
@@ -37,6 +41,7 @@ import {
   ListPlus,
   ArrowRight,
   CheckCheck,
+  Pencil,
 } from 'lucide-react';
 
 interface VideoCategoriesAdminProps {
@@ -130,8 +135,13 @@ export function VideoCategoriesAdmin({
     skippedItems?: Array<{ video: Partial<VideoItem>; reason: string }>;
   } | null>(null);
 
-  // Inspector modal
+  // Inspector / Editor modals
   const [inspectCategory, setInspectCategory] = useState<VideoCategory | null>(null);
+  const [editingVideoTarget, setEditingVideoTarget] = useState<{
+    categoryId: string;
+    categoryName: string;
+    video: VideoItem;
+  } | null>(null);
   const [copiedJson, setCopiedJson] = useState(false);
   const [previewVideoUrl, setPreviewVideoUrl] = useState<string | null>(null);
 
@@ -1419,7 +1429,7 @@ export function VideoCategoriesAdmin({
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       <button
                         onClick={() => {
                           setSelectedCategoryId(cat.id);
@@ -1433,10 +1443,10 @@ export function VideoCategoriesAdmin({
 
                       <button
                         onClick={() => setInspectCategory(cat)}
-                        className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors"
+                        className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-yellow-300 border border-slate-700 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors"
                       >
-                        <FileJson className="w-3.5 h-3.5 text-yellow-400" />
-                        <span>Inspect JSON</span>
+                        <Pencil className="w-3.5 h-3.5 text-yellow-400" />
+                        <span>Edit Category &amp; JSON</span>
                       </button>
                     </div>
                   </div>
@@ -1526,13 +1536,31 @@ export function VideoCategoriesAdmin({
                                 {v.likesCount || '1.2k'}
                               </span>
 
-                              <button
-                                onClick={() => handleRemoveVideo(cat.id, v.id, v.title)}
-                                className="text-slate-500 hover:text-rose-400 transition-colors p-1"
-                                title="Remove from category"
-                              >
-                                <Trash2 className="w-3 h-3" />
-                              </button>
+                              <div className="flex items-center gap-1">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setEditingVideoTarget({
+                                      categoryId: cat.id,
+                                      categoryName: cat.name,
+                                      video: v,
+                                    })
+                                  }
+                                  className="text-slate-400 hover:text-yellow-400 transition-colors p-1 flex items-center gap-1"
+                                  title="Edit video details & object"
+                                >
+                                  <Pencil className="w-3 h-3" />
+                                  <span>Edit</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveVideo(cat.id, v.id, v.title)}
+                                  className="text-slate-500 hover:text-rose-400 transition-colors p-1"
+                                  title="Remove from category"
+                                >
+                                  <Trash2 className="w-3 h-3" />
+                                </button>
+                              </div>
                             </div>
                           </div>
                         </div>
@@ -1560,49 +1588,61 @@ export function VideoCategoriesAdmin({
       )}
 
       {/* ============================================================== */}
-      {/* JSON INSPECTOR MODAL                                           */}
+      {/* EDIT CATEGORY & JSON OBJECT MODAL                              */}
       {/* ============================================================== */}
       {inspectCategory && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-2xl w-full max-h-[85vh] flex flex-col shadow-2xl overflow-hidden">
-            <div className="p-4 border-b border-slate-800 flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <FileJson className="w-4 h-4 text-yellow-400" />
-                <h3 className="font-bold text-white text-sm">
-                  {inspectCategory.name} · Category JSON Object
-                </h3>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => copyToClipboard(JSON.stringify(inspectCategory, null, 2))}
-                  className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-semibold flex items-center gap-1"
-                >
-                  {copiedJson ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedJson ? 'Copied' : 'Copy'}</span>
-                </button>
-                <button
-                  onClick={() => setInspectCategory(null)}
-                  className="p-1 text-slate-400 hover:text-white"
-                >
-                  ✕
-                </button>
-              </div>
-            </div>
+        <JsonObjectEditorModal
+          isOpen={true}
+          title={`Edit Category: ${inspectCategory.name}`}
+          subtitle={`POST /api/video_categories · ID: ${inspectCategory.id}`}
+          initialData={inspectCategory}
+          accentColor="yellow"
+          saveLabel="Save Category to D1"
+          deleteLabel="Delete Category"
+          onClose={() => setInspectCategory(null)}
+          onSave={async (updatedObj) => {
+            await updateCategory({
+              ...updatedObj,
+              id: updatedObj.id || inspectCategory.id,
+            });
+            await loadCategories(updatedObj.id || inspectCategory.id);
+          }}
+          onDelete={async () => {
+            await deleteFromCloudflare('video_categories', inspectCategory.id);
+            await loadCategories();
+          }}
+        />
+      )}
 
-            <div className="p-4 overflow-y-auto flex-1 font-mono text-[11px] text-slate-300 bg-slate-950">
-              <pre>{JSON.stringify(inspectCategory, null, 2)}</pre>
-            </div>
-
-            <div className="p-3 border-t border-slate-800 bg-slate-900/90 text-right text-xs">
-              <button
-                onClick={() => setInspectCategory(null)}
-                className="px-4 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl"
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
+      {/* ============================================================== */}
+      {/* EDIT INDIVIDUAL VIDEO IN CATEGORY MODAL                        */}
+      {/* ============================================================== */}
+      {editingVideoTarget && (
+        <JsonObjectEditorModal
+          isOpen={true}
+          title={`Edit Video: ${editingVideoTarget.video.title}`}
+          subtitle={`Category: ${editingVideoTarget.categoryName} (${editingVideoTarget.categoryId}) · Video ID: ${editingVideoTarget.video.id}`}
+          initialData={editingVideoTarget.video}
+          accentColor="yellow"
+          saveLabel="Update Video in Category"
+          deleteLabel="Remove from Category"
+          onClose={() => setEditingVideoTarget(null)}
+          onSave={async (updatedVideo) => {
+            await updateVideoInCategory(
+              editingVideoTarget.categoryId,
+              editingVideoTarget.video.id,
+              updatedVideo
+            );
+            await loadCategories(editingVideoTarget.categoryId);
+          }}
+          onDelete={async () => {
+            await removeVideoFromCategory(
+              editingVideoTarget.categoryId,
+              editingVideoTarget.video.id
+            );
+            await loadCategories(editingVideoTarget.categoryId);
+          }}
+        />
       )}
 
       {/* ============================================================== */}

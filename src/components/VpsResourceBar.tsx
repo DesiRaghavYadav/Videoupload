@@ -13,6 +13,7 @@ import {
   Gauge,
   CheckCircle2,
   AlertTriangle,
+  Wifi,
 } from 'lucide-react';
 import { SystemResourcesResponse } from '../types';
 import { fetchSystemResources } from '../utils/vpsTelemetryService';
@@ -35,7 +36,21 @@ export const VpsResourceBar: React.FC<VpsResourceBarProps> = ({
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [isExpanded, setIsExpanded] = useState(false);
   const [appliedNotice, setAppliedNotice] = useState(false);
+  const [isTestingSpeed, setIsTestingSpeed] = useState(false);
   const isMountedRef = useRef(true);
+
+  const handleRunSpeedTest = async () => {
+    if (isTestingSpeed) return;
+    setIsTestingSpeed(true);
+    try {
+      await fetch('/api/network-speed-test', { method: 'POST' });
+      await loadMetrics();
+    } catch (err) {
+      console.warn('Network speed test failed:', err);
+    } finally {
+      if (isMountedRef.current) setIsTestingSpeed(false);
+    }
+  };
 
   const loadMetrics = useCallback(async () => {
     setIsLoading(true);
@@ -96,7 +111,7 @@ export const VpsResourceBar: React.FC<VpsResourceBarProps> = ({
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-2">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
           {/* Main Resource Cards Grid */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3 flex-1">
+          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-2 sm:gap-2.5 flex-1">
             {/* 1. CPU & CLOCK SPEED */}
             <div className="bg-slate-950/70 border border-slate-800/80 rounded-xl px-3 py-2 flex items-center justify-between gap-2 hover:border-slate-700/80 transition-colors">
               <div className="flex items-center gap-2.5 min-w-0">
@@ -188,6 +203,46 @@ export const VpsResourceBar: React.FC<VpsResourceBarProps> = ({
                   style={{ width: `${Math.min(100, Math.max(3, telemetry?.disk.usedPercent ?? 0))}%` }}
                 />
               </div>
+            </div>
+
+            {/* 4. NETWORK BANDWIDTH & CONNECTION SPEED */}
+            <div className="bg-slate-950/70 border border-slate-800/80 rounded-xl px-3 py-2 flex items-center justify-between gap-2 hover:border-slate-700/80 transition-colors">
+              <div className="flex items-center gap-2 min-w-0">
+                <div className="p-1.5 rounded-lg bg-sky-500/10 text-sky-400 border border-sky-500/20 shrink-0">
+                  <Wifi className="w-3.5 h-3.5" />
+                </div>
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-semibold text-white tracking-tight text-[11px] truncate">
+                      {telemetry?.network?.connectionSpeedMbps
+                        ? `Net: ${telemetry.network.connectionSpeedMbps >= 1000 ? `${(telemetry.network.connectionSpeedMbps / 1000).toFixed(1)} Gbps` : `${telemetry.network.connectionSpeedMbps} Mbps`}`
+                        : 'Net Speed'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleRunSpeedTest}
+                      disabled={isTestingSpeed}
+                      title="Run live server download/upload connection speed test"
+                      className="px-1.5 py-0.5 rounded bg-sky-500/15 hover:bg-sky-500/30 text-sky-300 text-[9px] font-bold border border-sky-500/30 transition-colors shrink-0"
+                    >
+                      {isTestingSpeed ? '...' : telemetry?.network?.connectionSpeedMbps ? 'Retest' : 'Test'}
+                    </button>
+                  </div>
+                  <div className="flex items-center gap-1.5 text-[10px] font-mono truncate">
+                    <span className="text-emerald-400">↓{telemetry?.network ? telemetry.network.downloadMbps.toFixed(1) : '0.0'}</span>
+                    <span className="text-amber-400">↑{telemetry?.network ? telemetry.network.uploadMbps.toFixed(1) : '0.0'}</span>
+                    <span className="text-slate-500">Mbps</span>
+                  </div>
+                </div>
+              </div>
+              {telemetry?.network?.usagePercent !== null && telemetry?.network?.usagePercent !== undefined && (
+                <div className="w-8 h-1.5 bg-slate-800 rounded-full overflow-hidden shrink-0" title={`${telemetry.network.usagePercent}% of connection capacity`}>
+                  <div
+                    className="h-full bg-sky-400 transition-all duration-500"
+                    style={{ width: `${Math.min(100, Math.max(4, telemetry.network.usagePercent))}%` }}
+                  />
+                </div>
+              )}
             </div>
 
             {/* 4. OPTIMAL WORKER RECOMMENDATION */}
@@ -287,7 +342,7 @@ export const VpsResourceBar: React.FC<VpsResourceBarProps> = ({
 
         {/* Expandable Technical Telemetry Drawer */}
         {isExpanded && telemetry && (
-          <div className="mt-3 pt-3 border-t border-slate-800/80 grid grid-cols-1 md:grid-cols-3 gap-3 animate-fadeIn text-[11px]">
+          <div className="mt-3 pt-3 border-t border-slate-800/80 grid grid-cols-1 md:grid-cols-4 gap-3 animate-fadeIn text-[11px]">
             {/* CPU & Host Details */}
             <div className="bg-slate-950/60 p-2.5 rounded-xl border border-slate-800/60 space-y-1">
               <div className="text-[10px] uppercase font-bold text-cyan-400 tracking-wider flex items-center gap-1">
@@ -343,6 +398,45 @@ export const VpsResourceBar: React.FC<VpsResourceBarProps> = ({
                   {telemetry.system.platform} ({telemetry.system.arch})
                 </span>
               </div>
+            </div>
+
+            {/* Network Bandwidth & Connection Capacity */}
+            <div className="bg-slate-950/60 p-2.5 rounded-xl border border-slate-800/60 space-y-1">
+              <div className="text-[10px] uppercase font-bold text-sky-400 tracking-wider flex items-center justify-between gap-1">
+                <span className="flex items-center gap-1">
+                  <Wifi className="w-3 h-3" />
+                  <span>Network Speed &amp; Bandwidth</span>
+                </span>
+                <button
+                  type="button"
+                  onClick={handleRunSpeedTest}
+                  disabled={isTestingSpeed}
+                  className="px-1.5 py-0.5 rounded bg-sky-500/20 hover:bg-sky-500/30 text-sky-300 text-[9px] font-bold"
+                >
+                  {isTestingSpeed ? 'Testing...' : 'Run Speed Test'}
+                </button>
+              </div>
+              <div className="flex justify-between text-slate-300 text-[10px]">
+                <span>Live Download Used:</span>
+                <span className="font-mono text-emerald-400">{telemetry.network?.downloadFormatted || '0.0 Mbps'}</span>
+              </div>
+              <div className="flex justify-between text-slate-300 text-[10px]">
+                <span>Live Upload Used:</span>
+                <span className="font-mono text-amber-400">{telemetry.network?.uploadFormatted || '0.0 Mbps'}</span>
+              </div>
+              <div className="flex justify-between text-slate-400 text-[10px] pt-1 border-t border-slate-800/60">
+                <span>Max Connection:</span>
+                <span className="font-mono text-sky-300">
+                  {telemetry.network?.connectionSpeedMbps
+                    ? `${telemetry.network.connectionSpeedMbps} Mbps (${telemetry.network.connectionSpeedSource})`
+                    : 'Click Run Speed Test'}
+                </span>
+              </div>
+              {telemetry.network?.lastSpeedTest && (
+                <div className="text-[9px] text-slate-500 font-mono">
+                  Test: ↓{telemetry.network.lastSpeedTest.downloadMbps} / ↑{telemetry.network.lastSpeedTest.uploadMbps} Mbps · {telemetry.network.lastSpeedTest.latencyMs}ms
+                </div>
+              )}
             </div>
           </div>
         )}

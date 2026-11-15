@@ -40,9 +40,11 @@ import {
   Trash2,
   ShieldCheck,
   Zap,
+  Pencil,
 } from 'lucide-react';
 import { AppTabType } from './Header';
 import { getR2Headers } from '../utils/r2Service';
+import { JsonObjectEditorModal } from './admin/JsonObjectEditorModal';
 
 export interface WebProcessorBatchProgress {
   isRunning: boolean;
@@ -115,6 +117,12 @@ export interface ProcessedWebResult {
       sizeMb: string;
       sizeFormatted: string;
     } | null;
+    videoCompression?: {
+      compressed: boolean;
+      quality?: VideoCompressionQuality;
+      originalSizeBytes?: number;
+      savedPercent?: number;
+    } | null;
     removedWords?: string[];
     candidateTitles?: CandidateTitle[];
     candidateThumbnails?: CandidateThumbnail[];
@@ -186,6 +194,8 @@ export interface BatchQueueItem {
   destination?: string;
   destinationDetail?: string;
   registryUniqueId?: string;
+  attempts?: number;
+  serverUsed?: string;
 }
 
 // Case-insensitive title word removal and bracket/separator normalization
@@ -257,6 +267,19 @@ export function extractUrlsFromText(text: string): string[] {
 }
 
 export type BatchSkipMode = 'smart_cache' | 'strict_skip' | 'dont_skip';
+export type VideoCompressionQuality = 'high' | 'balanced' | 'compact' | 'low';
+
+export const COMPRESSION_QUALITY_OPTIONS: Array<{
+  value: VideoCompressionQuality;
+  label: string;
+  shortLabel: string;
+  detail: string;
+}> = [
+  { value: 'high', label: 'High · 1080p (CRF 22)', shortLabel: '1080p High', detail: 'Best quality · light compression' },
+  { value: 'balanced', label: 'Balanced · 720p (CRF 26)', shortLabel: '720p Balanced', detail: 'Recommended · sharp & smaller' },
+  { value: 'compact', label: 'Compact · 480p (CRF 29)', shortLabel: '480p Compact', detail: 'Small files · fast upload' },
+  { value: 'low', label: 'Low · 360p (CRF 32)', shortLabel: '360p Low', detail: 'Ultra small · max savings' },
+];
 
 export const WebProcessor: React.FC<WebProcessorProps> = ({
   onNavigateTab,
@@ -272,6 +295,8 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
   const [wordsToRemove, setWordsToRemove] = useState('');
   const [autoUploadToR2, setAutoUploadToR2] = useState(true);
   const [autoUploadVideoToR2, setAutoUploadVideoToR2] = useState(true);
+  const [compressVideo, setCompressVideo] = useState(false); // Default OFF
+  const [compressionQuality, setCompressionQuality] = useState<VideoCompressionQuality>('balanced');
   const [isProcessing, setIsProcessing] = useState(false);
   const [result, setResult] = useState<ProcessedWebResult | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -298,6 +323,12 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
   const [activeDurationFormatted, setActiveDurationFormatted] = useState('');
   const [activeDurationSec, setActiveDurationSec] = useState<number | null>(null);
   const [activeVideoSize, setActiveVideoSize] = useState('');
+  const [activeCompressionInfo, setActiveCompressionInfo] = useState<{
+    compressed: boolean;
+    quality?: VideoCompressionQuality;
+    originalSizeBytes?: number;
+    savedPercent?: number;
+  } | null>(null);
   const [showRawComparison, setShowRawComparison] = useState(false);
 
   // Multi-Link Batch Queue state & VPS Multi-Worker Concurrency (1 - 20)
@@ -316,16 +347,22 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
   const runWorkerFnRef = useRef<((id: number) => Promise<void>) | null>(null);
 
   const handleSetConcurrency = (num: number) => {
-    const clamped = Math.max(1, Math.min(20, num));
+    const clamped = Math.max(1, Math.min(50, num));
     setConcurrency(clamped);
     concurrencyRef.current = clamped;
     if (onConcurrencyChange) {
       onConcurrencyChange(clamped);
     }
 
-    // Dynamic adjustment while batch is actively running:
-    // If increased: immediately spawn additional workers to grab next queue items right now!
-    // If decreased: active workers finish their current video, and exit when completing that item.
+    if (isBatchRunning) {
+      fetch('/api/vps-batch/concurrency', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ concurrency: clamped }),
+      }).catch(() => {});
+    }
+
+    // Dynamic adjustment while local batch is actively running
     if (isBatchRunningRef.current && !cancelRef.current && !pauseRef.current && runWorkerFnRef.current) {
       const targetCount = Math.min(clamped, currentQueueRef.current.length);
       const deficit = targetCount - runningWorkerCountRef.current;
@@ -338,12 +375,12 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
     }
   };
 
-  // Sync external concurrency changes from the top VPS telemetry bar (up to 20 workers)
+  // Sync external concurrency changes from the top VPS telemetry bar (up to 50 workers)
   useEffect(() => {
     if (
       externalConcurrency !== undefined &&
       externalConcurrency >= 1 &&
-      externalConcurrency <= 20 &&
+      externalConcurrency <= 50 &&
       externalConcurrency !== concurrency
     ) {
       handleSetConcurrency(externalConcurrency);
@@ -355,12 +392,103 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
   const [isBatchPaused, setIsBatchPaused] = useState(false);
   const [activeBatchIndex, setActiveBatchIndex] = useState<number>(-1);
   const [batchSkipMode, setBatchSkipMode] = useState<BatchSkipMode>('smart_cache');
+  const [autoRetryIncomplete, setAutoRetryIncomplete] = useState<boolean>(true);
+  const [maxAutoRetryPasses, setMaxAutoRetryPasses] = useState<number>(3);
+  const [serverPoolText, setServerPoolText] = useState<string>('');
+  const [isFetchingFreeProxies, setIsFetchingFreeProxies] = useState<boolean>(false);
+  const [freeProxyMessage, setFreeProxyMessage] = useState<string | null>(null);
+  const [showCfRelayCode, setShowCfRelayCode] = useState<boolean>(false);
+  const [serverJobPass, setServerJobPass] = useState<{
+    current: number;
+    max: number;
+    message?: string;
+    incompleteCount?: number;
+    pausedForLoadCount?: number;
+    activeCompressions?: number;
+    currentCpuPercent?: number;
+  } | null>(null);
   const [singleRegistryRecord, setSingleRegistryRecord] = useState<any | null>(null);
+  const [editingRegistryRecord, setEditingRegistryRecord] = useState<any | null>(null);
   const pauseRef = useRef(false);
   const cancelRef = useRef(false);
   const onBatchProgressUpdateRef = useRef(onBatchProgressUpdate);
   onBatchProgressUpdateRef.current = onBatchProgressUpdate;
   const lastBroadcastRef = useRef<string>('');
+
+  const applyServerBatchJob = (job: any, switchToBatchIfRunning = false) => {
+    if (!job || !Array.isArray(job.tasks)) return;
+    setBatchQueue(job.tasks);
+    setIsBatchRunning(Boolean(job.isRunning));
+    setIsBatchPaused(Boolean(job.isPaused));
+    setActiveWorkers(Number(job.activeWorkers || 0));
+    setServerJobPass({
+      current: Number(job.currentPass || 1),
+      max: 1 + Number(job.maxAutoRetryPasses || 0),
+      message: job.statusMessage || '',
+      incompleteCount: Number(job.incompleteCount || 0),
+      pausedForLoadCount: Number(job.pausedForLoadCount || 0),
+      activeCompressions: Number(job.activeCompressions || 0),
+      currentCpuPercent: typeof job.currentCpuPercent === 'number' ? job.currentCpuPercent : undefined,
+    });
+    if (typeof job.concurrency === 'number' && job.concurrency >= 1 && job.concurrency <= 50) {
+      setConcurrency(job.concurrency);
+      concurrencyRef.current = job.concurrency;
+    }
+    if (typeof job.autoRetryIncomplete === 'boolean') {
+      setAutoRetryIncomplete(job.autoRetryIncomplete);
+    }
+    if (typeof job.maxAutoRetryPasses === 'number') {
+      setMaxAutoRetryPasses(job.maxAutoRetryPasses);
+    }
+    if (typeof job.compressVideo === 'boolean') {
+      setCompressVideo(job.compressVideo);
+    }
+    if (
+      job.compressionQuality === 'high' ||
+      job.compressionQuality === 'balanced' ||
+      job.compressionQuality === 'compact' ||
+      job.compressionQuality === 'low'
+    ) {
+      setCompressionQuality(job.compressionQuality);
+    }
+    if (Array.isArray(job.serverPool) && job.serverPool.length > 0 && !serverPoolText.trim()) {
+      setServerPoolText(job.serverPool.join('\n'));
+    }
+    if (switchToBatchIfRunning && job.isRunning) {
+      setInputMode('batch');
+    }
+  };
+
+  // Restore saved/running server background job on mount & poll while running
+  useEffect(() => {
+    let cancelled = false;
+    const loadStatus = async (initial = false) => {
+      try {
+        const res = await fetch('/api/vps-batch/status');
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        if (data?.job && Array.isArray(data.job.tasks) && data.job.tasks.length > 0) {
+          applyServerBatchJob(data.job, initial);
+          if (initial && !batchRawText.trim()) {
+            setBatchRawText(data.job.tasks.map((t: any) => t.url).filter(Boolean).join('\n'));
+          }
+        } else if (initial && Array.isArray(data?.defaultServerPool) && data.defaultServerPool.length > 0) {
+          setServerPoolText(data.defaultServerPool.join('\n'));
+        }
+      } catch {}
+    };
+    loadStatus(true);
+    const interval = setInterval(() => {
+      if (isBatchRunning) {
+        loadStatus(false);
+      }
+    }, 2000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [isBatchRunning]);
 
   // Broadcast background batch status so other tabs in App.tsx show live progress
   useEffect(() => {
@@ -553,6 +681,8 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
           customFilename: activeTitle || 'video',
           folderPrefix: 'videos',
           refererUrl: result?.finalUrl || result?.targetUrl || urlInput.trim() || undefined,
+          compressVideo,
+          compressionQuality,
         }),
       });
 
@@ -566,6 +696,14 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
       setActiveStreamUrl(backLink); // Set permanent Cloudflare video link as active stream
       if (data.sizeFormatted) {
         setActiveVideoSize(data.sizeFormatted);
+      }
+      if (data.compressed) {
+        setActiveCompressionInfo({
+          compressed: true,
+          quality: data.compressionQuality || compressionQuality,
+          originalSizeBytes: data.originalSizeBytes,
+          savedPercent: data.savedPercent,
+        });
       }
       if (data.durationSec) {
         setActiveDurationSec(data.durationSec);
@@ -625,7 +763,7 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
         const checkRes = await fetch('/api/registry/check', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ urls: [target], autoRegisterIfMissing: true }),
+          body: JSON.stringify({ urls: [target], autoRegisterIfMissing: false }),
         });
         const checkData = await checkRes.json();
         const checkItem = checkData.results?.[0];
@@ -760,6 +898,8 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
         return;
       }
 
+      setActiveCompressionInfo(null);
+
       // Step 3: Fetch via /api/process-url (server will also check Web URL cache unless forceRefresh)
       const response = await fetch('/api/process-url', {
         method: 'POST',
@@ -772,6 +912,8 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
           wordsToRemove: wordsToRemove.trim(),
           uploadThumbnailToR2: autoUploadToR2,
           uploadVideoToR2: autoUploadVideoToR2,
+          compressVideo,
+          compressionQuality,
           forceRefresh,
         }),
       });
@@ -812,6 +954,7 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
       setActiveDurationFormatted(bestDurationFormatted);
       setActiveDurationSec(bestDurationSec);
       setActiveVideoSize(bestSize);
+      setActiveCompressionInfo(data.page?.videoCompression || null);
 
       if (data.media?.videos?.length > 0) {
         setActiveSubTab('media');
@@ -868,7 +1011,7 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
         const checkRes = await fetch('/api/registry/check', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ urls: [item.url], autoRegisterIfMissing: true }),
+          body: JSON.stringify({ urls: [item.url], autoRegisterIfMissing: false }),
         });
         const checkData = await checkRes.json();
         const checkItem = checkData.results?.[0];
@@ -1068,6 +1211,8 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
               customFilename: title,
               folderPrefix: 'videos',
               refererUrl: data.finalUrl || item.url,
+              compressVideo,
+              compressionQuality,
             }),
           });
           const upVidData = await upVidRes.json();
@@ -1163,154 +1308,147 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
     }
   };
 
-  // Concurrent Multi-Worker Batch Queue Processor: Supports 1 - 20 parallel workers for VPS capacity
+  // Persistent Server Background Multi-Worker Batch Queue (safe to close browser!)
   const handleStartSequentialBatch = async () => {
-    // Sync queue with newly pasted links in batchRawText if queue is empty OR textarea URLs changed
-    let currentQueue = [...batchQueue];
-    const queueUrlsJoined = currentQueue.map((q) => q.url).join('\n');
-    const detectedJoined = detectedLinksInBatch.join('\n');
+    const urlsToProcess =
+      detectedLinksInBatch.length > 0
+        ? detectedLinksInBatch
+        : batchQueue.map((q) => q.url).filter(Boolean);
 
-    if (
-      (currentQueue.length === 0 && detectedLinksInBatch.length > 0) ||
-      (detectedLinksInBatch.length > 0 && queueUrlsJoined !== detectedJoined)
-    ) {
-      currentQueue = detectedLinksInBatch.map((url, index) => ({
-        id: `queue_${Date.now()}_${index}`,
-        url,
-        index: index + 1,
-        status: 'pending',
-        statusMessage: 'Ready in queue',
-      }));
-      setBatchQueue(currentQueue);
-    } else if (batchSkipMode === 'dont_skip' && currentQueue.length > 0) {
-      // If user chose "Don't Skip (Force Done Again)", reset completed/skipped items to pending so they re-run
-      currentQueue = currentQueue.map((q) => ({
-        ...q,
-        status: 'pending',
-        statusMessage: 'Ready for forced re-scrape',
-      }));
-      setBatchQueue(currentQueue);
-    }
-
-    if (currentQueue.length === 0) {
+    if (urlsToProcess.length === 0) {
       setErrorMessage('Please enter or paste at least one video link to process.');
       return;
     }
 
-    setIsBatchRunning(true);
-    setIsBatchPaused(false);
-    pauseRef.current = false;
-    cancelRef.current = false;
+    setErrorMessage(null);
+    const serverPool = serverPoolText
+      .split(/[\n,]+/)
+      .map((s) => s.trim())
+      .filter((s) => /^https?:\/\//i.test(s));
 
-    // Concurrency control: 1 to 20 parallel workers with live dynamic scaling
-    isBatchRunningRef.current = true;
-    currentQueueRef.current = currentQueue;
-    nextIndexRef.current = 0;
-    runningWorkerCountRef.current = 0;
-    workerIdCounterRef.current = 0;
-
-    const runWorker = async (workerId: number) => {
-      runningWorkerCountRef.current++;
-      try {
-        while (true) {
-          if (cancelRef.current) break;
-
-          // Handle pause loop
-          while (pauseRef.current) {
-            await new Promise((r) => setTimeout(r, 400));
-            if (cancelRef.current) break;
-          }
-          if (cancelRef.current) break;
-
-          // Dynamic scale-down check:
-          // If user reduced worker count while this worker was processing a video,
-          // gracefully stop this worker now that its previous video is complete!
-          if (runningWorkerCountRef.current > concurrencyRef.current) {
-            break;
-          }
-
-          const targetIndex = nextIndexRef.current++;
-          if (targetIndex >= currentQueueRef.current.length) {
-            break;
-          }
-
-          const targetItem = currentQueueRef.current[targetIndex];
-          // Skip already completed unless reset
-          if (targetItem.status === 'completed' || targetItem.status === 'skipped_in_cloudflare') {
-            continue;
-          }
-
-          setActiveWorkers((prev) => prev + 1);
-          try {
-            await processSingleBatchItem(targetIndex, workerId, targetItem);
-          } finally {
-            setActiveWorkers((prev) => Math.max(0, prev - 1));
-          }
-
-          // Check again after item completion: if concurrency decreased during processing, exit gracefully
-          if (runningWorkerCountRef.current > concurrencyRef.current) {
-            break;
-          }
-
-          // Small breathing delay if running single worker
-          if (concurrencyRef.current === 1) {
-            await new Promise((r) => setTimeout(r, 400));
-          }
-        }
-      } finally {
-        runningWorkerCountRef.current = Math.max(0, runningWorkerCountRef.current - 1);
-
-        // If all running workers have completed and no items left or cancelled, clean up batch
-        if (runningWorkerCountRef.current === 0) {
-          setIsBatchRunning(false);
-          setIsBatchPaused(false);
-          isBatchRunningRef.current = false;
-          setActiveWorkers(0);
-          setActiveBatchIndex(-1);
-        }
+    try {
+      const res = await fetch('/api/vps-batch/start', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getR2Headers(),
+        },
+        body: JSON.stringify({
+          urls: urlsToProcess,
+          wordsToRemove: wordsToRemove.trim(),
+          concurrency,
+          batchSkipMode,
+          uploadThumbnailToR2: true,
+          uploadVideoToR2: true,
+          compressVideo,
+          compressionQuality,
+          autoRetryIncomplete,
+          maxAutoRetryPasses,
+          serverPool,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Failed to start background server queue');
       }
-    };
-
-    runWorkerFnRef.current = runWorker;
-
-    // Launch initial workers (1 - 20)
-    const safeConcurrency = Math.max(1, Math.min(20, concurrencyRef.current));
-    const initialWorkerCount = Math.min(safeConcurrency, currentQueue.length);
-
-    for (let i = 0; i < initialWorkerCount; i++) {
-      const workerId = ++workerIdCounterRef.current;
-      runWorker(workerId);
+      if (data.job) {
+        applyServerBatchJob(data.job);
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Failed to start server background queue');
     }
   };
 
-  const handlePauseBatch = () => {
+  const handlePauseBatch = async () => {
     pauseRef.current = true;
     setIsBatchPaused(true);
+    try {
+      const res = await fetch('/api/vps-batch/pause', { method: 'POST' });
+      const data = await res.json();
+      if (data.job) applyServerBatchJob(data.job);
+    } catch {}
   };
 
-  const handleResumeBatch = () => {
+  const handleResumeBatch = async () => {
     pauseRef.current = false;
     setIsBatchPaused(false);
-    // If worker count dropped below current concurrency target, spawn workers
-    if (runWorkerFnRef.current && isBatchRunningRef.current) {
-      const targetCount = Math.min(concurrencyRef.current, currentQueueRef.current.length);
-      const deficit = targetCount - runningWorkerCountRef.current;
-      if (deficit > 0 && nextIndexRef.current < currentQueueRef.current.length) {
-        for (let i = 0; i < deficit; i++) {
-          const newWorkerId = ++workerIdCounterRef.current;
-          runWorkerFnRef.current(newWorkerId);
-        }
-      }
-    }
+    try {
+      const res = await fetch('/api/vps-batch/resume', {
+        method: 'POST',
+        headers: { ...getR2Headers() },
+      });
+      const data = await res.json();
+      if (data.job) applyServerBatchJob(data.job);
+    } catch {}
   };
 
-  const handleCancelBatch = () => {
+  const handleCancelBatch = async () => {
     cancelRef.current = true;
     isBatchRunningRef.current = false;
     setIsBatchRunning(false);
     setIsBatchPaused(false);
     setActiveWorkers(0);
     setActiveBatchIndex(-1);
+    try {
+      const res = await fetch('/api/vps-batch/cancel', { method: 'POST' });
+      const data = await res.json();
+      if (data.job) applyServerBatchJob(data.job);
+    } catch {}
+  };
+
+  const handleRetryIncompleteBatch = async () => {
+    setErrorMessage(null);
+    try {
+      const res = await fetch('/api/vps-batch/retry-incomplete', {
+        method: 'POST',
+        headers: { ...getR2Headers() },
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Failed to restart incomplete links');
+      }
+      if (data.job) applyServerBatchJob(data.job);
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Could not restart incomplete websites');
+    }
+  };
+
+  const handleFetchFreeProxies = async () => {
+    if (isFetchingFreeProxies) return;
+    setIsFetchingFreeProxies(true);
+    setFreeProxyMessage('Fetching public proxy lists & running live 3s HTTPS checks...');
+    try {
+      const res = await fetch('/api/proxies/fetch-free', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ limit: 8 }),
+      });
+      const data = await res.json();
+      if (Array.isArray(data.proxies) && data.proxies.length > 0) {
+        const existing = serverPoolText
+          .split(/[\n,]+/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        const merged = Array.from(new Set([...existing, ...data.proxies]));
+        setServerPoolText(merged.join('\n'));
+      }
+      setFreeProxyMessage(data.message || `Found ${data.workingCount || 0} working proxies.`);
+    } catch (err: any) {
+      setFreeProxyMessage(err?.message || 'Failed to test public free proxies.');
+    } finally {
+      setIsFetchingFreeProxies(false);
+    }
+  };
+
+  const handleClearBatchQueue = async () => {
+    setBatchQueue([]);
+    setIsBatchRunning(false);
+    setIsBatchPaused(false);
+    setActiveWorkers(0);
+    setServerJobPass(null);
+    try {
+      await fetch('/api/vps-batch/clear', { method: 'POST' });
+    } catch {}
   };
 
   const copyToClipboard = (text: string, key: string) => {
@@ -1565,6 +1703,41 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
                     <span>Auto-upload Thumbnail to Cloudflare R2</span>
                   </span>
                 </label>
+
+                <div className="flex items-center gap-2 flex-wrap px-2.5 py-1 rounded-lg bg-slate-950/90 border border-slate-800">
+                  <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 select-none">
+                    <input
+                      type="checkbox"
+                      checked={compressVideo}
+                      onChange={(e) => setCompressVideo(e.target.checked)}
+                      className="rounded border-slate-700 text-indigo-500 focus:ring-0 bg-slate-900"
+                    />
+                    <span className="font-medium text-xs">
+                      Compress Before Upload
+                    </span>
+                    <span
+                      className={`text-[10px] font-mono px-1.5 py-0.2 rounded ${
+                        compressVideo ? 'bg-indigo-500/20 text-indigo-300 font-bold' : 'bg-slate-800 text-slate-400'
+                      }`}
+                    >
+                      {compressVideo ? 'ON' : 'OFF'}
+                    </span>
+                  </label>
+
+                  <select
+                    value={compressionQuality}
+                    onChange={(e) => setCompressionQuality(e.target.value as VideoCompressionQuality)}
+                    disabled={!compressVideo}
+                    aria-label="Compression Quality"
+                    className="bg-slate-900 border border-slate-700 rounded-md px-2 py-0.5 text-[11px] text-slate-200 outline-none focus:border-indigo-400 disabled:opacity-45 cursor-pointer"
+                  >
+                    {COMPRESSION_QUALITY_OPTIONS.map((opt) => (
+                      <option key={opt.value} value={opt.value}>
+                        {opt.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
 
               {/* Quick Filter Chips */}
@@ -1701,12 +1874,12 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
               </div>
             </div>
 
-            {/* VPS Multi-Worker Concurrency Bar (1 - 20 Parallel Workers) */}
+            {/* VPS Multi-Worker Concurrency Bar (1 - 50 Parallel Workers) */}
             <div className="p-3 bg-gradient-to-r from-cyan-950/40 via-slate-950 to-slate-950 border border-cyan-500/30 rounded-xl space-y-2.5 text-xs">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                 <div className="flex items-center gap-2 flex-wrap">
                   <Zap className="w-4 h-4 text-cyan-400" />
-                  <span className="font-bold text-white text-xs">VPS Multi-Worker Concurrency (1 - 20 at a time)</span>
+                  <span className="font-bold text-white text-xs">VPS Multi-Worker Concurrency (1 - 50 at a time)</span>
                   <span className="px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 font-mono text-[10px] font-bold border border-cyan-500/30">
                     {concurrency}x Parallel {concurrency === 1 ? 'Worker' : 'Workers'}
                   </span>
@@ -1722,10 +1895,10 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
                   )}
                 </div>
 
-                {/* Quick Presets: 1x, 2x, 3x, 5x, 8x, 10x, 15x, 20x */}
+                {/* Quick Presets: 1x, 3x, 5x, 10x, 15x, 25x, 35x, 50x */}
                 <div className="flex items-center gap-1.5 flex-wrap">
                   <span className="text-[11px] text-slate-400 mr-0.5">Presets:</span>
-                  {[1, 2, 3, 5, 8, 10, 15, 20].map((num) => (
+                  {[1, 3, 5, 10, 15, 25, 35, 50].map((num) => (
                     <button
                       key={num}
                       type="button"
@@ -1736,26 +1909,26 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
                           : 'bg-slate-900 border-slate-700 text-slate-300 hover:border-slate-600'
                       }`}
                     >
-                      {num}x{num === 1 ? ' (Seq)' : num === 5 ? ' (Rec)' : num === 20 ? ' (Max)' : ''}
+                      {num}x{num === 1 ? ' (Seq)' : num === 25 ? ' (High)' : num === 50 ? ' (Max)' : ''}
                     </button>
                   ))}
                 </div>
               </div>
 
-              {/* Slider for smooth 1 - 20 selection */}
+              {/* Slider for smooth 1 - 50 selection */}
               <div className="flex items-center gap-3 pt-0.5">
                 <span className="text-[11px] text-slate-400 font-mono w-16">1 Worker</span>
                 <input
                   type="range"
                   min={1}
-                  max={20}
+                  max={50}
                   step={1}
                   value={concurrency}
                   onChange={(e) => handleSetConcurrency(Number(e.target.value))}
                   className="flex-1 accent-cyan-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
                 />
                 <span className="text-[11px] text-cyan-400 font-mono font-bold w-28 text-right">
-                  20 Workers (Max)
+                  50 Workers (Max)
                 </span>
               </div>
               <p className="text-[11px] text-slate-400 leading-tight">
@@ -1842,6 +2015,137 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
                     Bypass cache check and force live live re-scrape and re-upload to Cloudflare.
                   </p>
                 </button>
+              </div>
+            </div>
+
+            {/* Video Compression & Output Quality Before R2 Upload (Default OFF) */}
+            <div className="p-3 bg-slate-950/90 border border-slate-800 rounded-xl space-y-2 text-xs">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <label className="flex items-center gap-2 cursor-pointer text-slate-200 font-semibold select-none">
+                  <input
+                    type="checkbox"
+                    checked={compressVideo}
+                    onChange={(e) => setCompressVideo(e.target.checked)}
+                    className="accent-indigo-500 w-3.5 h-3.5 rounded"
+                  />
+                  <span>Compress Videos Before Uploading to Cloudflare R2 (FFmpeg)</span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded font-mono text-[10px] font-bold ${
+                      compressVideo
+                        ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30'
+                        : 'bg-slate-800 text-slate-400 border border-slate-700'
+                    }`}
+                  >
+                    {compressVideo ? 'ON' : 'OFF (Default)'}
+                  </span>
+                </label>
+
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <span className="text-[11px] text-slate-400">Quality:</span>
+                  {COMPRESSION_QUALITY_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.value}
+                      type="button"
+                      disabled={!compressVideo}
+                      onClick={() => setCompressionQuality(opt.value)}
+                      title={opt.detail}
+                      className={`px-2 py-0.5 rounded border text-[11px] font-mono font-bold transition-all disabled:opacity-40 ${
+                        compressionQuality === opt.value
+                          ? 'bg-indigo-500 text-white border-indigo-400'
+                          : 'bg-slate-900 border-slate-700 text-slate-300 hover:border-slate-600'
+                      }`}
+                    >
+                      {opt.shortLabel}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <p className="text-[11px] text-slate-400 leading-tight">
+                {compressVideo
+                  ? `Active (${COMPRESSION_QUALITY_OPTIONS.find((o) => o.value === compressionQuality)?.label}): Videos transcode to H.264/AAC MP4 before R2 upload. When CPU load hits >= 80% or FFmpeg slots fill up, other workers automatically pause for cool-off until load drops (< 72%).`
+                  : 'Off by default for maximum speed: Original video stream uploads directly to R2 with zero re-encoding. Enable to shrink large videos before upload.'}
+              </p>
+            </div>
+
+            {/* Persistent Background Auto-Retry & Multi-Server Anti-Rate-Limit Panel */}
+            <div className="p-3 bg-slate-950/90 border border-slate-800 rounded-xl space-y-3 text-xs">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <label className="flex items-center gap-2 cursor-pointer text-slate-200 font-semibold">
+                  <input
+                    type="checkbox"
+                    checked={autoRetryIncomplete}
+                    onChange={(e) => setAutoRetryIncomplete(e.target.checked)}
+                    className="accent-emerald-500 w-3.5 h-3.5 rounded"
+                  />
+                  <span>Auto-Restart Failed &amp; Incomplete Websites When Queue Ends</span>
+                </label>
+
+                {autoRetryIncomplete && (
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-[11px] text-slate-400">Max Retry Passes:</span>
+                    {[1, 2, 3, 5].map((p) => (
+                      <button
+                        key={p}
+                        type="button"
+                        onClick={() => setMaxAutoRetryPasses(p)}
+                        className={`px-2 py-0.5 rounded border text-[11px] font-mono font-bold ${
+                          maxAutoRetryPasses === p
+                            ? 'bg-emerald-500 text-slate-950 border-emerald-400'
+                            : 'bg-slate-900 border-slate-700 text-slate-300'
+                        }`}
+                      >
+                        {p}x
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2 flex-wrap">
+                  <span className="text-[11px] font-semibold text-cyan-300">
+                    Multi-Server Relay / Proxy Pool (Anti-Rate-Limit · Optional)
+                  </span>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={handleFetchFreeProxies}
+                      disabled={isFetchingFreeProxies}
+                      className="px-2 py-0.5 rounded bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 text-cyan-300 text-[10px] font-semibold transition-colors disabled:opacity-50"
+                    >
+                      {isFetchingFreeProxies ? 'Testing Free Proxies...' : 'Auto-Test Free Proxies'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowCfRelayCode((v) => !v)}
+                      className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 text-[10px] font-semibold transition-colors"
+                    >
+                      {showCfRelayCode ? 'Hide Free CF Relay Code' : 'Free CF Worker Relay (100k/day)'}
+                    </button>
+                  </div>
+                </div>
+                {freeProxyMessage && (
+                  <p className="text-[10px] text-amber-300 bg-amber-500/10 border border-amber-500/20 rounded px-2 py-1">
+                    {freeProxyMessage}
+                  </p>
+                )}
+                {showCfRelayCode && (
+                  <pre className="p-2 bg-slate-950 border border-slate-800 rounded-lg text-[10px] font-mono text-emerald-300 overflow-x-auto select-all">{`// Deploy free on workers.cloudflare.com (100,000 req/day FREE), then paste its URL below:
+export default {
+  async fetch(req) {
+    const target = new URL(req.url).searchParams.get("url");
+    if (!target) return new Response("Missing ?url=", { status: 400 });
+    return fetch(target, { headers: { "User-Agent": req.headers.get("User-Agent") || "Mozilla/5.0" } });
+  }
+};`}</pre>
+                )}
+                <textarea
+                  value={serverPoolText}
+                  onChange={(e) => setServerPoolText(e.target.value)}
+                  rows={2}
+                  placeholder="Optional extra fetch servers or HTTP proxies (one per line):&#10;https://my-relay-worker.workers.dev/?url=&#10;http://ip:port"
+                  className="w-full p-2 bg-slate-900/90 border border-slate-800 focus:border-cyan-500 rounded-lg text-[11px] font-mono text-slate-300 outline-none"
+                />
               </div>
             </div>
 
@@ -2003,6 +2307,16 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
 
             <button
               type="button"
+              onClick={() => setEditingRegistryRecord(singleRegistryRecord)}
+              className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/30 font-semibold rounded-lg text-xs transition-colors flex items-center gap-1"
+              title="Edit this links_registry database object"
+            >
+              <Pencil className="w-3.5 h-3.5" />
+              <span>Edit Object</span>
+            </button>
+
+            <button
+              type="button"
               onClick={() => setSingleRegistryRecord(null)}
               className="px-2.5 py-1.5 text-slate-400 hover:text-white rounded-lg bg-slate-800 text-xs"
             >
@@ -2050,21 +2364,47 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
         <div className="p-5 bg-slate-900/90 border border-slate-800 rounded-2xl shadow-xl space-y-5 animate-fadeIn">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
             <div className="space-y-1">
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
                 <span className="p-1 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
                   <Cloud className="w-4 h-4" />
                 </span>
                 <h3 className="font-bold text-white text-sm">
-                  Sequential Queue: Link-by-Link Cloudflare Pipeline
+                  Server Background Queue (Safe to Close Browser)
                 </h3>
+                {serverJobPass && (
+                  <span className="px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono text-[10px] font-bold">
+                    Pass {serverJobPass.current} / {serverJobPass.max}
+                  </span>
+                )}
+                {Boolean(serverJobPass?.activeCompressions || serverJobPass?.pausedForLoadCount) && (
+                  <span className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 font-mono text-[10px] font-bold">
+                    FFmpeg: {serverJobPass?.activeCompressions || 0} active
+                    {serverJobPass?.pausedForLoadCount ? ` · ${serverJobPass.pausedForLoadCount} paused (CPU ${serverJobPass.currentCpuPercent ?? 0}%)` : ''}
+                  </span>
+                )}
               </div>
               <p className="text-xs text-slate-400">
-                Processing Link 1 ➔ Uploads thumbnail to Cloudflare R2 ➔ Obtains back link ➔ Moves to Link 2 automatically.
+                {serverJobPass?.message ||
+                  'Persisted on server & ott-database D1. Runs in background even after closing browser and restarts failed/incomplete items automatically.'}
               </p>
             </div>
 
             {/* Batch Export Actions */}
             <div className="flex flex-wrap items-center gap-2">
+              {!isBatchRunning &&
+                batchQueue.some(
+                  (q) => q.status === 'error' || (q.status === 'completed' && !q.cloudflareVideoUrl) || q.status === 'pending'
+                ) && (
+                  <button
+                    type="button"
+                    onClick={handleRetryIncompleteBatch}
+                    className="px-3.5 py-1.5 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/40 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-sm"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>Restart Failed &amp; Incomplete</span>
+                  </button>
+                )}
+
               {completedBatchItems.length > 0 && (
                 <>
                   <button
@@ -2123,9 +2463,9 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
 
               <button
                 type="button"
-                onClick={() => setBatchQueue([])}
+                onClick={handleClearBatchQueue}
                 className="p-1.5 text-slate-500 hover:text-rose-400 rounded-lg hover:bg-slate-800 transition-colors"
-                title="Clear queue"
+                title="Clear saved server queue"
               >
                 <Trash2 className="w-4 h-4" />
               </button>
@@ -2365,6 +2705,42 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
                           <FolderTree className="w-3.5 h-3.5" />
                         </button>
                       )}
+
+                      {(item.registryUniqueId || item.status === 'skipped_in_cloudflare' || item.status === 'completed') && (
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            try {
+                              const q = encodeURIComponent(item.url);
+                              const res = await fetch(`/api/registry/item?url=${q}`);
+                              const data = await res.json().catch(() => null);
+                              if (res.ok && data?.record) {
+                                setEditingRegistryRecord(data.record);
+                                return;
+                              }
+                            } catch {
+                              // Fallback to opening item fields
+                            }
+                            setEditingRegistryRecord({
+                              id: item.registryUniqueId || `url_${Date.now()}`,
+                              sourceUrl: item.url,
+                              title: item.title || '',
+                              description: item.description || '',
+                              videoUrl: item.videoStreamUrl || '',
+                              thumbnailUrl: item.originalThumbnailUrl || item.cloudflareThumbnailUrl || '',
+                              cloudflareVideoUrl: item.cloudflareVideoUrl || '',
+                              cloudflareThumbnailUrl: item.cloudflareThumbnailUrl || '',
+                              durationFormatted: item.durationFormatted || '',
+                              durationSec: item.durationSec ?? null,
+                              sizeFormatted: item.sizeFormatted || '',
+                            });
+                          }}
+                          className="p-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 rounded-lg flex items-center gap-1 text-[11px] font-semibold"
+                          title="Edit registry database object in Cloudflare D1"
+                        >
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -2575,9 +2951,14 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
                 <p className="font-bold text-white text-sm">
                   {activeVideoSize || 'Adaptive / Unknown'}
                 </p>
-                <span className="text-[10px] text-slate-500">
+                <span className="text-[10px] text-slate-500 block">
                   {activeStreamUrl?.includes('.m3u8') ? 'HLS Adaptive' : 'HTTP Content-Length'}
                 </span>
+                {activeCompressionInfo?.compressed && (
+                  <span className="inline-block text-[10px] font-semibold text-indigo-300 bg-indigo-500/15 border border-indigo-500/30 rounded px-1.5 py-0.5">
+                    Compressed {activeCompressionInfo.quality} (-{activeCompressionInfo.savedPercent}%)
+                  </span>
+                )}
               </div>
 
               {/* Metric 4: Cloudflare Vault Status (Both Video & Thumb) */}
@@ -3507,6 +3888,63 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {/* Registry Database Object Editor Modal */}
+      {editingRegistryRecord && (
+        <JsonObjectEditorModal
+          isOpen={true}
+          title={`Edit Cloudflare Registry Record: ${editingRegistryRecord.title || editingRegistryRecord.id}`}
+          subtitle={`PATCH /api/registry/item/${editingRegistryRecord.id} · Collection: links_registry`}
+          initialData={editingRegistryRecord}
+          accentColor="amber"
+          saveLabel="Save to links_registry (D1)"
+          deleteLabel="Delete from Registry"
+          onClose={() => setEditingRegistryRecord(null)}
+          onSave={async (updatedObj) => {
+            const res = await fetch(
+              `/api/registry/item/${encodeURIComponent(editingRegistryRecord.id)}`,
+              {
+                method: 'PATCH',
+                headers: {
+                  'Content-Type': 'application/json',
+                  ...getR2Headers(),
+                },
+                body: JSON.stringify(updatedObj),
+              }
+            );
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok || !data?.success) {
+              throw new Error(data?.error || `HTTP ${res.status}: Failed to update registry item`);
+            }
+            const savedRecord = data.record || updatedObj;
+            setSingleRegistryRecord(savedRecord);
+            setEditingRegistryRecord(savedRecord);
+            if (savedRecord.title) setActiveTitle(savedRecord.title);
+            if (savedRecord.cloudflareVideoUrl) {
+              setActiveStreamUrl(savedRecord.cloudflareVideoUrl);
+              setActiveCloudflareVideo(savedRecord.cloudflareVideoUrl);
+            }
+            if (savedRecord.cloudflareThumbnailUrl) {
+              setActiveThumbnail(savedRecord.cloudflareThumbnailUrl);
+              setActiveCloudflareThumbnail(savedRecord.cloudflareThumbnailUrl);
+            }
+          }}
+          onDelete={async () => {
+            const res = await fetch(
+              `/api/registry/item/${encodeURIComponent(editingRegistryRecord.id)}`,
+              {
+                method: 'DELETE',
+                headers: getR2Headers(),
+              }
+            );
+            if (!res.ok) {
+              const errData = await res.json().catch(() => ({}));
+              throw new Error(errData?.error || 'Failed to delete registry record');
+            }
+            setSingleRegistryRecord(null);
+          }}
+        />
       )}
     </div>
   );

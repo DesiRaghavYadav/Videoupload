@@ -26,6 +26,7 @@ import {
   fetchR2Status,
   uploadVideoAndThumbnail,
   fetchUploadHistory,
+  updateVideoRecord,
   deleteVideoRecord,
 } from './utils/r2Service';
 import { Cloud, ShieldCheck, HardDrive, Zap, Globe, ArrowRight } from 'lucide-react';
@@ -186,6 +187,15 @@ export default function App() {
         setCurrentResult(null);
       }
     }
+  };
+
+  const handleUpdateRecord = async (id: string, updates: any) => {
+    const updated = await updateVideoRecord(id, updates);
+    setHistoryRecords((prev) => prev.map((r) => (r.id === id ? updated : r)));
+    if (currentResult?.id === id) {
+      setCurrentResult(updated);
+    }
+    setCurrentBatchResults((prev) => prev.map((r) => (r.id === id ? updated : r)));
   };
 
   const handleSelectRecord = (record: ProcessedVideoResponse) => {
@@ -379,6 +389,7 @@ export default function App() {
                 onNavigateToCategories={() => setActiveTab('categories')}
                 onNavigateToDatabase={() => setActiveTab('database')}
                 onNavigateToReels={() => setActiveTab('reels')}
+                onUpdateRecord={handleUpdateRecord}
               />
             ) : (
               <div className="space-y-6">
@@ -411,6 +422,7 @@ export default function App() {
                   records={historyRecords.slice(0, 3)}
                   onSelectRecord={handleSelectRecord}
                   onDeleteRecord={handleDeleteRecord}
+                  onUpdateRecord={handleUpdateRecord}
                 />
               </div>
             )}
@@ -423,6 +435,7 @@ export default function App() {
             records={historyRecords}
             onSelectRecord={handleSelectRecord}
             onDeleteRecord={handleDeleteRecord}
+            onUpdateRecord={handleUpdateRecord}
           />
         )}
 

@@ -3,8 +3,10 @@ import {
   ChannelPayload,
   uploadToCloudflare,
   fetchFromCloudflare,
+  deleteFromCloudflare,
   CF_WORKER_BASE_URL,
 } from '../../services/cloudflareWorkerApi';
+import { JsonObjectEditorModal } from './JsonObjectEditorModal';
 import {
   Tv,
   Send,
@@ -17,6 +19,8 @@ import {
   ExternalLink,
   Layers,
   Radio,
+  Pencil,
+  FileJson,
 } from 'lucide-react';
 
 const DEFAULT_SAMPLE_CHANNEL: ChannelPayload = {
@@ -24,6 +28,7 @@ const DEFAULT_SAMPLE_CHANNEL: ChannelPayload = {
   name: 'Live Cinema HD 24/7',
   imageUrl:
     'https://images.unsplash.com/photo-1544005313-94ddf0286df2?auto=format&fit=crop&w=300&q=80',
+  streamUrl: '',
 };
 
 export function ChannelsAdmin() {
@@ -40,6 +45,7 @@ export function ChannelsAdmin() {
   const [existingChannels, setExistingChannels] = useState<any[]>([]);
   const [isLoadingChannels, setIsLoadingChannels] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [editingChannelObj, setEditingChannelObj] = useState<any | null>(null);
 
   const loadExistingChannels = async () => {
     setIsLoadingChannels(true);
@@ -218,6 +224,17 @@ export function ChannelsAdmin() {
                 />
               </div>
 
+              <div className="space-y-1.5">
+                <label className="text-slate-300 font-semibold">Live Stream URL (HLS .m3u8 / MP4)</label>
+                <input
+                  type="url"
+                  value={formData.streamUrl || ''}
+                  onChange={(e) => setFormData({ ...formData, streamUrl: e.target.value })}
+                  placeholder="https://example.com/live/stream.m3u8"
+                  className="w-full px-3 py-2 bg-slate-950 border border-slate-800 focus:border-sky-500 rounded-lg text-slate-100 font-mono text-xs outline-none"
+                />
+              </div>
+
               {/* Logo Preview */}
               {formData.imageUrl && (
                 <div className="p-3 bg-slate-950/80 rounded-xl border border-slate-800 flex items-center gap-4">
@@ -310,11 +327,65 @@ export function ChannelsAdmin() {
                       ID #{channel.id || idx + 1}
                     </span>
                   </div>
+                  <div className="pt-2 border-t border-slate-800/80 w-full flex items-center justify-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSubmitResult(null);
+                        setFormData({
+                          id: Number(channel.id) || Date.now(),
+                          name: channel.name || '',
+                          imageUrl: channel.imageUrl || '',
+                          streamUrl: channel.streamUrl || '',
+                        });
+                        setActiveSubTab('create');
+                        window.scrollTo({ top: 0, behavior: 'smooth' });
+                      }}
+                      className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-sky-300 border border-slate-700 text-[10px] font-semibold flex items-center gap-1"
+                      title="Edit Channel in Form"
+                    >
+                      <Pencil className="w-3 h-3" />
+                      <span>Edit</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditingChannelObj(channel)}
+                      className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-[10px] font-semibold flex items-center gap-1"
+                      title="Edit Channel JSON Object"
+                    >
+                      <FileJson className="w-3 h-3 text-sky-400" />
+                      <span>JSON</span>
+                    </button>
+                  </div>
                 </div>
               ))}
             </div>
           )}
         </div>
+      )}
+
+      {/* Edit Channel Object Modal */}
+      {editingChannelObj && (
+        <JsonObjectEditorModal
+          isOpen={true}
+          title={`Edit Channel: ${editingChannelObj.name || editingChannelObj.id}`}
+          subtitle={`POST /api/channels · ID: ${editingChannelObj.id}`}
+          initialData={editingChannelObj}
+          accentColor="sky"
+          saveLabel="Save Channel to D1"
+          deleteLabel="Delete Channel"
+          onClose={() => setEditingChannelObj(null)}
+          onSave={async (updatedObj) => {
+            await uploadToCloudflare('channels', updatedObj);
+            await loadExistingChannels();
+          }}
+          onDelete={async () => {
+            if (editingChannelObj.id !== undefined) {
+              await deleteFromCloudflare('channels', editingChannelObj.id);
+              await loadExistingChannels();
+            }
+          }}
+        />
       )}
     </div>
   );

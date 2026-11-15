@@ -204,6 +204,23 @@ export interface SystemResourcesResponse {
     currentRamStatus: 'healthy' | 'moderate' | 'low';
     reason: string;
   };
+  network?: {
+    interfaces: string[];
+    downloadMbps: number;
+    uploadMbps: number;
+    totalActiveMbps: number;
+    downloadFormatted: string;
+    uploadFormatted: string;
+    connectionSpeedMbps: number | null;
+    connectionSpeedSource: 'nic' | 'speedtest' | 'untested';
+    usagePercent: number | null;
+    lastSpeedTest?: {
+      downloadMbps: number;
+      uploadMbps: number;
+      latencyMs: number;
+      testedAt: string;
+    } | null;
+  };
   system: {
     uptimeSeconds: number;
     uptimeFormatted: string;

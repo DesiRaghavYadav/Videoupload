@@ -4,8 +4,10 @@ import {
   ComicChapter,
   uploadToCloudflare,
   fetchFromCloudflare,
+  deleteFromCloudflare,
   CF_WORKER_BASE_URL,
 } from '../../services/cloudflareWorkerApi';
+import { JsonObjectEditorModal } from './JsonObjectEditorModal';
 import {
   BookOpen,
   Plus,
@@ -21,6 +23,8 @@ import {
   Layers,
   Image,
   FileText,
+  Pencil,
+  FileJson,
 } from 'lucide-react';
 
 const DEFAULT_SAMPLE_COMIC: ComicPayload = {
@@ -559,17 +563,42 @@ export function ComicsAdmin() {
                     </div>
                   </div>
 
-                  <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
+                  <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between gap-2 text-xs text-slate-400">
                     <span>
                       {Array.isArray(comic.chapters) ? comic.chapters.length : 0} Chapters
                     </span>
-                    <button
-                      onClick={() => setSelectedComicDetails(comic)}
-                      className="text-violet-400 hover:text-violet-300 font-medium flex items-center gap-1 text-[11px]"
-                    >
-                      <Eye className="w-3.5 h-3.5" />
-                      View JSON
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSubmitResult(null);
+                          setFormData({
+                            id: Number(comic.id) || Date.now(),
+                            title: comic.title || '',
+                            category: comic.category || 'General',
+                            imageUrl: comic.imageUrl || '',
+                            description: comic.description || '',
+                            likesCount: comic.likesCount || '0',
+                            isPremium: comic.isPremium ? 1 : 0,
+                            chapters: Array.isArray(comic.chapters) ? comic.chapters : [],
+                          });
+                          setActiveSubTab('create');
+                          window.scrollTo({ top: 0, behavior: 'smooth' });
+                        }}
+                        className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-violet-300 border border-slate-700 font-medium flex items-center gap-1 text-[11px]"
+                      >
+                        <Pencil className="w-3 h-3" />
+                        <span>Edit</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setSelectedComicDetails(comic)}
+                        className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-slate-700 font-medium flex items-center gap-1 text-[11px]"
+                      >
+                        <FileJson className="w-3 h-3" />
+                        <span>Edit JSON</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -578,28 +607,28 @@ export function ComicsAdmin() {
         </div>
       )}
 
-      {/* JSON Inspector Modal */}
+      {/* Editable JSON Object Modal */}
       {selectedComicDetails && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-xl w-full max-h-[85vh] flex flex-col shadow-2xl">
-            <div className="p-4 border-b border-slate-800 flex items-center justify-between">
-              <h3 className="font-bold text-white text-sm">
-                Comic: {selectedComicDetails.title}
-              </h3>
-              <button
-                onClick={() => setSelectedComicDetails(null)}
-                className="text-slate-400 hover:text-white text-xs px-2 py-1 bg-slate-800 rounded"
-              >
-                Close
-              </button>
-            </div>
-            <div className="p-4 overflow-y-auto text-xs">
-              <pre className="p-3 bg-slate-950 rounded-xl font-mono text-emerald-400 text-xs overflow-x-auto">
-                {JSON.stringify(selectedComicDetails, null, 2)}
-              </pre>
-            </div>
-          </div>
-        </div>
+        <JsonObjectEditorModal
+          isOpen={true}
+          title={`Edit Comic: ${selectedComicDetails.title || selectedComicDetails.id}`}
+          subtitle={`POST /api/comics · ID: ${selectedComicDetails.id}`}
+          initialData={selectedComicDetails}
+          accentColor="violet"
+          saveLabel="Save Comic to D1"
+          deleteLabel="Delete Comic"
+          onClose={() => setSelectedComicDetails(null)}
+          onSave={async (updatedObj) => {
+            await uploadToCloudflare('comics', updatedObj);
+            await loadExistingComics();
+          }}
+          onDelete={async () => {
+            if (selectedComicDetails.id !== undefined) {
+              await deleteFromCloudflare('comics', selectedComicDetails.id);
+              await loadExistingComics();
+            }
+          }}
+        />
       )}
     </div>
   );

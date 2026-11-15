@@ -61,16 +61,71 @@ export default {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
 
+    const url = new URL(request.url);
+    const pathname = url.pathname.replace(/\/+$/, '') || '/';
+    const segments = pathname.split('/').filter(Boolean);
+
+    // Relay Fetch route: works both on the main D1 Worker (ott-api) AND standalone relay Workers without D1
+    const directRelayUrl = pathname === '/' ? url.searchParams.get('url') : null;
+    if (pathname === '/api/relay-fetch' || directRelayUrl) {
+      try {
+        let rawTarget = (directRelayUrl || url.searchParams.get('url') || request.headers.get('x-target-url') || '').trim();
+        if (!rawTarget && request.method === 'POST') {
+          const body = await readJsonBody(request).catch(() => ({}));
+          rawTarget = String(body?.url || '').trim();
+        }
+        if (!rawTarget || !/^https?:\/\//i.test(rawTarget)) {
+          return jsonResponse({ success: false, error: 'Valid http(s) ?url= parameter is required' }, 400);
+        }
+        const parsedTarget = new URL(rawTarget);
+        const host = parsedTarget.hostname.toLowerCase();
+        if (
+          host === 'localhost' ||
+          host === '127.0.0.1' ||
+          host === '0.0.0.0' ||
+          host.startsWith('10.') ||
+          host.startsWith('192.168.') ||
+          host.startsWith('169.254.') ||
+          /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+        ) {
+          return jsonResponse({ success: false, error: 'Private hostnames are blocked' }, 400);
+        }
+        const upstream = await fetch(rawTarget, {
+          method: 'GET',
+          redirect: 'follow',
+          headers: {
+            'User-Agent':
+              request.headers.get('User-Agent') ||
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': request.headers.get('Accept-Language') || 'en-US,en;q=0.9',
+            Referer: `${parsedTarget.origin}/`,
+          },
+        });
+        const html = await upstream.text();
+        return jsonResponse({
+          success: true,
+          status: upstream.status,
+          statusText: upstream.statusText || 'OK',
+          finalUrl: upstream.url || rawTarget,
+          headers: {
+            'content-type': upstream.headers.get('content-type') || '',
+            'content-length': upstream.headers.get('content-length') || '',
+            'retry-after': upstream.headers.get('retry-after') || '',
+          },
+          html,
+        });
+      } catch (relayErr) {
+        return jsonResponse({ success: false, error: relayErr?.message || 'Relay fetch failed' }, 502);
+      }
+    }
+
     if (!env.DB) {
       return jsonResponse(
         { error: 'D1 binding "DB" is missing. Go to Worker Settings -> Bindings and add D1 database as DB.' },
         500
       );
     }
-
-    const url = new URL(request.url);
-    const pathname = url.pathname.replace(/\/+$/, '') || '/';
-    const segments = pathname.split('/').filter(Boolean);
 
     try {
       if (pathname === '/' || pathname === '/api' || pathname === '/api/stats') {

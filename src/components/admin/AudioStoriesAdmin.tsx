@@ -3,8 +3,10 @@ import {
   AudioStoryPayload,
   uploadToCloudflare,
   fetchFromCloudflare,
+  deleteFromCloudflare,
   CF_WORKER_BASE_URL,
 } from '../../services/cloudflareWorkerApi';
+import { JsonObjectEditorModal } from './JsonObjectEditorModal';
 import {
   Headphones,
   Send,
@@ -19,6 +21,8 @@ import {
   Volume2,
   Clock,
   Music,
+  Pencil,
+  FileJson,
 } from 'lucide-react';
 
 const DEFAULT_SAMPLE_STORY: AudioStoryPayload = {
@@ -50,6 +54,7 @@ export function AudioStoriesAdmin() {
   const [existingStories, setExistingStories] = useState<any[]>([]);
   const [isLoadingStories, setIsLoadingStories] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [editingStoryObj, setEditingStoryObj] = useState<any | null>(null);
 
   const loadExistingStories = async () => {
     setIsLoadingStories(true);
@@ -396,18 +401,75 @@ export function AudioStoriesAdmin() {
                     </div>
                   )}
 
-                  <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-500 font-mono">
+                  <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between gap-2 text-xs text-slate-500 font-mono">
                     <span className="flex items-center gap-1">
                       <Clock className="w-3.5 h-3.5 text-slate-400" />
-                      {story.duration || 'N/A'}
+                      {story.duration || 'N/A'} · #{story.id || idx + 1}
                     </span>
-                    <span>ID #{story.id || idx + 1}</span>
+                    <div className="flex items-center gap-1.5 font-sans">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSubmitResult(null);
+                          setFormData({
+                            id: Number(story.id) || Date.now(),
+                            title: story.title || '',
+                            category: story.category || 'Audio Story',
+                            imageUrl: story.imageUrl || '',
+                            content: story.content || '',
+                            audioUrl: story.audioUrl || '',
+                            duration: story.duration || '',
+                            isPremium: story.isPremium ? 1 : 0,
+                            releaseDate: Number(story.releaseDate) || Date.now(),
+                            partsJson: story.partsJson,
+                          });
+                          setActiveSubTab('create');
+                          window.scrollTo({ top: 0, behavior: 'smooth' });
+                        }}
+                        className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-slate-700 font-medium flex items-center gap-1 text-[11px]"
+                      >
+                        <Pencil className="w-3 h-3" />
+                        <span>Edit</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditingStoryObj(story)}
+                        className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-medium flex items-center gap-1 text-[11px]"
+                      >
+                        <FileJson className="w-3 h-3 text-emerald-400" />
+                        <span>JSON</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
             </div>
           )}
         </div>
+      )}
+
+      {/* Edit Story Object Modal */}
+      {editingStoryObj && (
+        <JsonObjectEditorModal
+          isOpen={true}
+          title={`Edit Audio Story: ${editingStoryObj.title || editingStoryObj.id}`}
+          subtitle={`POST /api/stories · ID: ${editingStoryObj.id}`}
+          initialData={editingStoryObj}
+          accentColor="emerald"
+          saveLabel="Save Story to D1"
+          deleteLabel="Delete Story"
+          onClose={() => setEditingStoryObj(null)}
+          onSave={async (updatedObj) => {
+            await uploadToCloudflare('stories', updatedObj);
+            await loadExistingStories();
+          }}
+          onDelete={async () => {
+            if (editingStoryObj.id !== undefined) {
+              await deleteFromCloudflare('stories', editingStoryObj.id);
+              await loadExistingStories();
+            }
+          }}
+        />
       )}
     </div>
   );

@@ -1,10 +1,11 @@
-import express, { Request, Response } from 'express';
+import express, { type Request, type Response } from 'express';
 import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import http from 'http';
 import https from 'https';
+import tls from 'tls';
 import { pipeline } from 'stream/promises';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
@@ -21,9 +22,13 @@ import {
   GetObjectCommand,
   HeadObjectCommand,
 } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 
-// Initialize dotenv
+// Initialize dotenv & expand libuv threadpool for parallel DNS/file streaming
 dotenv.config();
+if (!process.env.UV_THREADPOOL_SIZE) {
+  process.env.UV_THREADPOOL_SIZE = '16';
+}
 
 // Format network/Axios errors concisely without dumping raw TLSSocket / ClientRequest internals
 function formatCompactError(err: any): string {
@@ -97,36 +102,364 @@ function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function axiosGetWithRetry(url: string, config: Record<string, any> = {}, maxAttempts = 3) {
-  let lastErr: any;
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const agents = createNonKeepAliveAgents();
-    const attemptConfig = {
-      ...config,
-      ...agents,
+const USER_AGENT_POOL = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+];
+
+const ACCEPT_LANGUAGES = [
+  'en-US,en;q=0.9',
+  'en-GB,en;q=0.9,en-US;q=0.8',
+  'en-US,en;q=0.9,hi;q=0.7',
+];
+
+let serverPoolRoundRobinIdx = 0;
+const serverCooldownUntil = new Map<string, number>();
+const domainLastFetchTime = new Map<string, number>();
+
+function getConfiguredServerPool(extraServers: string[] = []): string[] {
+  const envRaw =
+    process.env.MULTI_SERVER_FETCH_URLS ||
+    process.env.FETCH_RELAY_URLS ||
+    process.env.SERVER_POOL_URLS ||
+    '';
+  const envList = envRaw
+    .split(/[\n,]+/)
+    .map((s) => s.trim())
+    .filter((s) => /^https?:\/\//i.test(s));
+  const extraClean = (Array.isArray(extraServers) ? extraServers : [])
+    .map((s) => String(s || '').trim())
+    .filter((s) => /^https?:\/\//i.test(s));
+  return Array.from(new Set(['direct', ...envList, ...extraClean]));
+}
+
+function isBlockedPrivateHost(targetUrl: string): boolean {
+  try {
+    const parsed = new URL(targetUrl);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return true;
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '::1' ||
+      host === '0.0.0.0' ||
+      host.startsWith('169.254.') ||
+      host.startsWith('10.') ||
+      host.startsWith('192.168.') ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+function parseRetryAfterMs(headers: any): number {
+  const raw = headers?.['retry-after'];
+  if (!raw) return 0;
+  const secs = Number(raw);
+  if (!isNaN(secs) && secs > 0) {
+    return Math.min(15000, Math.round(secs * 1000));
+  }
+  const ts = Date.parse(String(raw));
+  if (!isNaN(ts) && ts > Date.now()) {
+    return Math.min(15000, ts - Date.now());
+  }
+  return 0;
+}
+
+async function paceDomainRequest(targetUrl: string, nodeKey = 'direct'): Promise<void> {
+  try {
+    const host = new URL(targetUrl).hostname.toLowerCase();
+    const bucketKey = `${nodeKey}::${host}`;
+    const now = Date.now();
+    const prev = domainLastFetchTime.get(bucketKey) || 0;
+    const minSpacingMs = 150 + Math.floor(Math.random() * 180);
+    const waitMs = prev + minSpacingMs - now;
+    domainLastFetchTime.set(bucketKey, Math.max(now, prev + minSpacingMs));
+    if (waitMs > 0) {
+      await sleepMs(Math.min(waitMs, 1000));
+    }
+  } catch {}
+}
+
+function createHttpConnectHttpsAgent(proxyUrl: URL, timeoutMs = 10000): https.Agent {
+  const agent = new https.Agent({ keepAlive: false });
+  const proxyHost = proxyUrl.hostname;
+  const proxyPort = Number(proxyUrl.port) || (proxyUrl.protocol === 'https:' ? 443 : 80);
+  const authHeader =
+    proxyUrl.username || proxyUrl.password
+      ? `Basic ${Buffer.from(`${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`).toString('base64')}`
+      : undefined;
+
+  (agent as any).createConnection = (options: any, cb: (err: Error | null, socket?: tls.TLSSocket) => void) => {
+    const targetHost = options.host || options.hostname;
+    const targetPort = Number(options.port) || 443;
+    let settled = false;
+    const finish = (err: Error | null, sock?: tls.TLSSocket) => {
+      if (settled) return;
+      settled = true;
+      cb(err, sock);
+    };
+
+    const connectReq = http.request({
+      host: proxyHost,
+      port: proxyPort,
+      method: 'CONNECT',
+      path: `${targetHost}:${targetPort}`,
       headers: {
-        Connection: 'close',
-        ...(config.headers || {}),
+        Host: `${targetHost}:${targetPort}`,
+        ...(authHeader ? { 'Proxy-Authorization': authHeader } : {}),
       },
+      timeout: timeoutMs,
+    });
+
+    connectReq.on('timeout', () => {
+      connectReq.destroy();
+      finish(new Error(`Proxy CONNECT timeout (${proxyHost}:${proxyPort})`));
+    });
+
+    connectReq.on('error', (err) => {
+      finish(err);
+    });
+
+    connectReq.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        return finish(new Error(`Proxy CONNECT HTTP ${res.statusCode}`));
+      }
+      const tlsSocket = tls.connect({
+        socket,
+        servername: options.servername || targetHost,
+        rejectUnauthorized: options.rejectUnauthorized ?? true,
+      });
+      tlsSocket.setTimeout(timeoutMs, () => {
+        tlsSocket.destroy();
+        finish(new Error(`Proxy TLS timeout (${proxyHost}:${proxyPort})`));
+      });
+      tlsSocket.once('error', (err) => finish(err));
+      finish(null, tlsSocket);
+    });
+
+    connectReq.end();
+  };
+
+  return agent;
+}
+
+function testHttpsConnectProxy(proxyUrlStr: string, timeoutMs = 2200): Promise<{ proxy: string; latencyMs: number } | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let pUrl: URL;
+    try {
+      pUrl = new URL(proxyUrlStr);
+    } catch {
+      return resolve(null);
+    }
+
+    const t0 = Date.now();
+    const timer = setTimeout(() => {
+      done(null);
+    }, timeoutMs);
+
+    let req: http.ClientRequest | null = null;
+    let rawSock: any = null;
+    let tlsSock: tls.TLSSocket | null = null;
+
+    const done = (result: { proxy: string; latencyMs: number } | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { req?.destroy(); } catch {}
+      try { tlsSock?.destroy(); } catch {}
+      try { rawSock?.destroy(); } catch {}
+      resolve(result);
+    };
+
+    req = http.request({
+      host: pUrl.hostname,
+      port: Number(pUrl.port) || 80,
+      method: 'CONNECT',
+      path: 'example.com:443',
+      headers: { Host: 'example.com:443' },
+    });
+
+    req.on('error', () => done(null));
+    req.on('connect', (res, socket) => {
+      rawSock = socket;
+      if (res.statusCode !== 200) {
+        return done(null);
+      }
+      tlsSock = tls.connect({
+        socket,
+        servername: 'example.com',
+      });
+      tlsSock.on('error', () => done(null));
+      tlsSock.once('secureConnect', () => {
+        tlsSock?.write('HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n');
+      });
+      tlsSock.once('data', (chunk) => {
+        const line = chunk.toString('utf8', 0, Math.min(chunk.length, 64));
+        if (/^HTTP\/1\.[01]\s+(200|301|302)/.test(line)) {
+          done({ proxy: proxyUrlStr, latencyMs: Math.max(1, Date.now() - t0) });
+        } else {
+          done(null);
+        }
+      });
+    });
+
+    req.end();
+  });
+}
+
+async function axiosGetWithRetry(
+  url: string,
+  config: Record<string, any> = {},
+  maxAttempts = 3,
+  extraServers: string[] = []
+) {
+  const pool = getConfiguredServerPool(extraServers);
+  const startNodeIdx = serverPoolRoundRobinIdx++ % pool.length;
+  const totalAttempts = Math.max(maxAttempts, Math.min(6, pool.length + 1));
+  let lastErr: any;
+
+  for (let attempt = 1; attempt <= totalAttempts; attempt++) {
+    // Pick next available non-cooled-down server node in the pool
+    let chosenNode = pool[(startNodeIdx + attempt - 1) % pool.length];
+    const now = Date.now();
+    for (let offset = 0; offset < pool.length; offset++) {
+      const candidate = pool[(startNodeIdx + attempt - 1 + offset) % pool.length];
+      if ((serverCooldownUntil.get(candidate) || 0) <= now) {
+        chosenNode = candidate;
+        break;
+      }
+    }
+
+    if (chosenNode === 'direct') {
+      await paceDomainRequest(url, chosenNode);
+    }
+
+    const ua = USER_AGENT_POOL[(attempt + serverPoolRoundRobinIdx) % USER_AGENT_POOL.length];
+    const acceptLang = ACCEPT_LANGUAGES[(attempt + serverPoolRoundRobinIdx) % ACCEPT_LANGUAGES.length];
+    const agents = createNonKeepAliveAgents();
+    const reqHeaders = {
+      Connection: 'close',
+      'User-Agent': ua,
+      'Accept-Language': acceptLang,
+      ...(config.headers || {}),
     };
 
     try {
-      const response = await axios.get(url, attemptConfig);
-      if (RETRYABLE_HTTP_STATUSES.has(response.status) && attempt < maxAttempts) {
+      let response: any;
+      if (chosenNode === 'direct') {
+        response = await axios.get(url, {
+          ...config,
+          ...agents,
+          headers: reqHeaders,
+        });
+      } else {
+        // Check if chosenNode is an HTTP/HTTPS proxy (has explicit port or proxy prefix) vs a relay endpoint
+        const normalizedNode = chosenNode.replace(/^proxy:/i, '');
+        const isProxyFormat =
+          /^proxy:/i.test(chosenNode) ||
+          (!chosenNode.includes('?url=') &&
+            !chosenNode.includes('{url}') &&
+            !chosenNode.includes('/relay-fetch') &&
+            /:\d+$/.test(new URL(normalizedNode).host));
+
+        if (isProxyFormat) {
+          const pUrl = new URL(normalizedNode);
+          const isHttpsTarget = url.toLowerCase().startsWith('https://');
+          if (isHttpsTarget) {
+            response = await axios.get(url, {
+              ...config,
+              headers: reqHeaders,
+              proxy: false,
+              httpsAgent: createHttpConnectHttpsAgent(pUrl, Number(config.timeout) || 12000),
+            });
+          } else {
+            response = await axios.get(url, {
+              ...config,
+              ...agents,
+              headers: reqHeaders,
+              proxy: {
+                protocol: pUrl.protocol.replace(':', ''),
+                host: pUrl.hostname,
+                port: Number(pUrl.port) || (pUrl.protocol === 'https:' ? 443 : 80),
+                ...(pUrl.username
+                  ? { auth: { username: decodeURIComponent(pUrl.username), password: decodeURIComponent(pUrl.password) } }
+                  : {}),
+              },
+            });
+          }
+        } else {
+          // Relay HTTP/Worker fetch node (either Worker `?url=`, `{url}`, or another instance's `/api/relay-fetch`)
+          let relayUrl = '';
+          if (chosenNode.includes('{url}')) {
+            relayUrl = chosenNode.replace('{url}', encodeURIComponent(url));
+          } else if (chosenNode.includes('?url=') || chosenNode.includes('&url=')) {
+            relayUrl = `${chosenNode}${encodeURIComponent(url)}`;
+          } else {
+            const base = chosenNode.replace(/\/+$/, '');
+            const endpoint = base.endsWith('/api/relay-fetch') ? base : `${base}/api/relay-fetch`;
+            relayUrl = `${endpoint}?url=${encodeURIComponent(url)}`;
+          }
+
+          response = await axios.get(relayUrl, {
+            ...config,
+            ...agents,
+            headers: {
+              ...reqHeaders,
+              'x-target-url': url,
+            },
+          });
+          // Unwrap JSON relay response if returned from /api/relay-fetch
+          if (
+            response.data &&
+            typeof response.data === 'object' &&
+            typeof response.data.html === 'string' &&
+            typeof response.data.status === 'number'
+          ) {
+            response = {
+              ...response,
+              status: response.data.status,
+              statusText: response.data.statusText || 'OK',
+              headers: { ...response.headers, ...(response.data.headers || {}) },
+              data: response.data.html,
+              config: { ...response.config, url: response.data.finalUrl || url },
+            };
+          }
+        }
+      }
+
+      if ((RETRYABLE_HTTP_STATUSES.has(response.status) || response.status === 403) && attempt < totalAttempts) {
         if (config.responseType === 'stream' && response.data && typeof response.data.destroy === 'function') {
           try {
             response.data.destroy();
           } catch {}
         }
-        const backoff = 450 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 250);
+        // Put rate-limited server node on cooldown so next attempt uses a different server
+        const retryAfterMs = parseRetryAfterMs(response.headers);
+        const cooldownMs = retryAfterMs || (response.status === 429 ? 8000 : 3000);
+        serverCooldownUntil.set(chosenNode, Date.now() + cooldownMs);
+
+        const backoff = Math.max(retryAfterMs, 550 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 350));
         await sleepMs(backoff);
         continue;
       }
+
+      (response as any)._serverUsed = chosenNode;
       return response;
     } catch (err: any) {
       lastErr = err;
-      if (attempt < maxAttempts && isRetryableNetworkError(err)) {
-        const backoff = 450 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 250);
+      serverCooldownUntil.set(chosenNode, Date.now() + 4000);
+      if (attempt < totalAttempts && (isRetryableNetworkError(err) || err?.response?.status === 403 || err?.response?.status === 429)) {
+        const backoff = 550 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 350);
         await sleepMs(backoff);
         continue;
       }
@@ -159,9 +492,100 @@ function getCpuSnapshot(): CpuSnapshot {
   return { idle, total, time: Date.now() };
 }
 
-// Baseline CPU snapshot on start
+function sampleLiveCpuPercent(): number {
+  const currentSnapshot = getCpuSnapshot();
+  if (prevCpuSnapshot && currentSnapshot.time - prevCpuSnapshot.time >= 700) {
+    const diffTotal = currentSnapshot.total - prevCpuSnapshot.total;
+    const diffIdle = currentSnapshot.idle - prevCpuSnapshot.idle;
+    if (diffTotal > 0) {
+      lastCalculatedCpuPercent = Math.max(0, Math.min(100, Math.round(((diffTotal - diffIdle) / diffTotal) * 100)));
+    }
+    prevCpuSnapshot = currentSnapshot;
+  } else if (!prevCpuSnapshot) {
+    prevCpuSnapshot = currentSnapshot;
+  }
+  const coreCount = Math.max(1, os.cpus().length);
+  const loadRatioPct = Math.round(((os.loadavg()[0] || 0) / coreCount) * 100);
+  return Math.min(100, Math.max(lastCalculatedCpuPercent, loadRatioPct));
+}
+
+// Baseline CPU & Network snapshots on start
 try {
   prevCpuSnapshot = getCpuSnapshot();
+} catch {}
+
+interface NetSnapshot {
+  rxBytes: number;
+  txBytes: number;
+  interfaces: string[];
+  time: number;
+}
+
+function getLinuxNetworkSnapshot(): NetSnapshot {
+  const interfaces: string[] = [];
+  let rxBytes = 0;
+  let txBytes = 0;
+  try {
+    if (fs.existsSync('/proc/net/dev')) {
+      const content = fs.readFileSync('/proc/net/dev', 'utf8');
+      const lines = content.split('\n').slice(2);
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.includes(':')) continue;
+        const [ifaceRaw, rest] = trimmed.split(':');
+        const iface = ifaceRaw.trim();
+        if (!iface || iface === 'lo') continue;
+        const cols = rest.trim().split(/\s+/);
+        if (cols.length >= 9) {
+          const rx = Number(cols[0]) || 0;
+          const tx = Number(cols[8]) || 0;
+          rxBytes += rx;
+          txBytes += tx;
+          interfaces.push(iface);
+        }
+      }
+    }
+  } catch {}
+  return { rxBytes, txBytes, interfaces, time: Date.now() };
+}
+
+function getNicLinkSpeedMbps(): number | null {
+  try {
+    if (fs.existsSync('/sys/class/net')) {
+      const entries = fs.readdirSync('/sys/class/net');
+      let maxSpeed = 0;
+      for (const iface of entries) {
+        if (iface === 'lo') continue;
+        const speedPath = `/sys/class/net/${iface}/speed`;
+        if (fs.existsSync(speedPath)) {
+          const val = Number(fs.readFileSync(speedPath, 'utf8').trim());
+          if (!isNaN(val) && val > maxSpeed) maxSpeed = val;
+        }
+      }
+      if (maxSpeed > 0) return maxSpeed;
+    }
+  } catch {}
+  return null;
+}
+
+let prevNetSnapshot: NetSnapshot | null = null;
+let lastNetworkRates = {
+  interfaces: [] as string[],
+  downloadMbps: 0,
+  uploadMbps: 0,
+  downloadBps: 0,
+  uploadBps: 0,
+};
+let lastSpeedTestResult: {
+  downloadMbps: number;
+  uploadMbps: number;
+  latencyMs: number;
+  testedAt: string;
+} | null = null;
+
+try {
+  prevNetSnapshot = getLinuxNetworkSnapshot();
+  lastNetworkRates.interfaces = prevNetSnapshot.interfaces;
 } catch {}
 
 function getCpuClockSpeed(): { speedMhz: number; model: string } {
@@ -219,7 +643,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const isProduction = process.env.NODE_ENV === 'production';
 const CF_WORKER_BASE_URL = (
   getEnvValue(['CF_WORKER_BASE_URL', 'CLOUDFLARE_WORKER_BASE_URL', 'OTT_API_BASE_URL']) ||
@@ -1132,6 +1556,48 @@ app.get('/api/videos', (_req: Request, res: Response) => {
   res.json(videoRecords);
 });
 
+// Update a processed video record metadata / object
+app.patch('/api/videos/:id', (req: Request, res: Response) => {
+  const index = videoRecords.findIndex((r) => r.id === req.params.id);
+  if (index === -1) {
+    res.status(404).json({ error: 'Video not found' });
+    return;
+  }
+  const updates = req.body && typeof req.body === 'object' ? req.body : {};
+  const existing = videoRecords[index];
+  const merged = {
+    ...existing,
+    ...updates,
+    id: existing.id,
+    metadata:
+      updates.metadata && typeof updates.metadata === 'object'
+        ? { ...existing.metadata, ...updates.metadata }
+        : existing.metadata,
+    cloudflareR2:
+      updates.cloudflareR2 && typeof updates.cloudflareR2 === 'object'
+        ? { ...existing.cloudflareR2, ...updates.cloudflareR2 }
+        : existing.cloudflareR2,
+  };
+  videoRecords[index] = merged;
+  res.json(merged);
+});
+
+app.put('/api/videos/:id', (req: Request, res: Response) => {
+  const index = videoRecords.findIndex((r) => r.id === req.params.id);
+  if (index === -1) {
+    res.status(404).json({ error: 'Video not found' });
+    return;
+  }
+  const updates = req.body && typeof req.body === 'object' ? req.body : {};
+  const merged = {
+    ...videoRecords[index],
+    ...updates,
+    id: videoRecords[index].id,
+  };
+  videoRecords[index] = merged;
+  res.json(merged);
+});
+
 // Delete a video record
 app.delete('/api/videos/:id', (req: Request, res: Response) => {
   const index = videoRecords.findIndex((r) => r.id === req.params.id);
@@ -1237,6 +1703,8 @@ app.post('/api/database/save', async (req: Request, res: Response) => {
     res.status(200).json({
       success: true,
       batchId: sanitizedBatchId,
+      databaseUrl,
+      databaseKey,
       cloudflareR2: {
         bucket: r2Config?.bucketName || 'local-emulator-storage',
         etag,
@@ -1438,9 +1906,21 @@ function findRegistryRecordByWebUrl(webUrl: string): CloudflareExtractedLink | u
   });
 }
 
-// Helper: Determine whether a registry entry actually has its media uploaded to Cloudflare R2 (not just un-uploaded source links)
+function isPreviewVideoUrl(u?: string | null): boolean {
+  if (!u) return false;
+  const lower = u.toLowerCase();
+  return (
+    /thumb-v\d*\./i.test(lower) ||
+    /\.t\.(?:av1\.|h264\.|vp9\.)?(?:mp4|webm|m3u8)(\?|$)/i.test(lower) ||
+    /(?:^|[\/_.-])(preview|trailer|teaser|sample|sprite|thumbvideo)(?:[\/_.-]|$)/i.test(lower) ||
+    /\/\d{2,4}x\d{2,4}\.\d+(?:\.\d+)*\.t\./i.test(lower)
+  );
+}
+
+// Helper: Determine whether a registry entry actually has its real full media uploaded to Cloudflare R2
 function hasCompleteCloudflareAssets(rec?: CloudflareExtractedLink | null): boolean {
   if (!rec) return false;
+  if (rec.videoUrl && isPreviewVideoUrl(rec.videoUrl)) return false;
   if (rec.cloudflareVideoUrl) return true;
   // Only treat as complete without cloudflareVideoUrl if no un-uploaded videoUrl is pending and a CF thumbnail was uploaded
   if (rec.status === 'uploaded' && rec.cloudflareThumbnailUrl && !rec.videoUrl) return true;
@@ -1491,8 +1971,14 @@ function mergeRegistryEntry(
   };
 }
 
-async function hydrateRegistryFromD1IfNeeded(): Promise<void> {
-  if (hasHydratedRegistryFromD1) return;
+const SERVER_INSTANCE_ID = `srv_${(process.env.HOSTNAME || os.hostname() || 'node').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 12)}_${Math.random().toString(36).slice(2, 6)}`;
+const inFlightProcessingIds = new Set<string>();
+let lastD1RegistryRefreshAt = 0;
+
+async function hydrateRegistryFromD1IfNeeded(forceRefresh = false): Promise<void> {
+  const now = Date.now();
+  if (!forceRefresh && hasHydratedRegistryFromD1) return;
+  if (forceRefresh && hasHydratedRegistryFromD1 && now - lastD1RegistryRefreshAt < 400) return;
 
   if (hydratingRegistryPromise) {
     return hydratingRegistryPromise;
@@ -1506,8 +1992,14 @@ async function hydrateRegistryFromD1IfNeeded(): Promise<void> {
       });
       if (response.status >= 200 && response.status < 300 && Array.isArray(response.data)) {
         const remoteList: CloudflareExtractedLink[] = response.data;
+        const remoteById = new Map<string, CloudflareExtractedLink>();
+        const remoteNormUrls = new Set<string>();
+
         for (const remoteItem of remoteList) {
           if (!remoteItem?.sourceUrl && !remoteItem?.id) continue;
+          if (remoteItem.id) remoteById.set(remoteItem.id, remoteItem);
+          if (remoteItem.sourceUrl) remoteNormUrls.add(normalizeUrlForDedup(remoteItem.sourceUrl));
+
           const localExisting = remoteItem.sourceUrl
             ? findRegistryRecordByWebUrl(remoteItem.sourceUrl)
             : extractedLinksRegistry.find((r) => r.id === remoteItem.id);
@@ -1520,10 +2012,20 @@ async function hydrateRegistryFromD1IfNeeded(): Promise<void> {
             }
           }
         }
+
+        // Reconcile deletions performed by other hosted server instances (preserve only URLs actively locked in-flight by THIS server)
+        extractedLinksRegistry = extractedLinksRegistry.filter((localItem) => {
+          if (inFlightProcessingIds.has(localItem.id)) return true;
+          if (remoteById.has(localItem.id)) return true;
+          if (localItem.sourceUrl && remoteNormUrls.has(normalizeUrlForDedup(localItem.sourceUrl))) return true;
+          return false;
+        });
+
         try {
           fs.writeFileSync(registryFilePath, JSON.stringify(extractedLinksRegistry, null, 2), 'utf-8');
         } catch {}
         hasHydratedRegistryFromD1 = true;
+        lastD1RegistryRefreshAt = Date.now();
       } else {
         console.warn(`D1 links_registry hydration returned HTTP ${response.status}`);
       }
@@ -1662,11 +2164,29 @@ async function deleteRegistryItemFromD1(id: string): Promise<void> {
   }
 }
 
-// API: Check single or multiple URLs against Cloudflare registry (No copy on match; auto-add if new)
-app.post('/api/registry/check', async (req: Request, res: Response) => {
-  await hydrateRegistryFromD1IfNeeded();
+async function removeRegistryRecordByWebUrl(webUrl: string, req?: Request): Promise<void> {
+  const norm = normalizeUrlForDedup(webUrl);
+  const deterministicId = getLinkUniqueId(webUrl);
+  const matchingIds = new Set<string>([deterministicId]);
 
-  const { urls, autoRegisterIfMissing = true } = req.body;
+  extractedLinksRegistry = extractedLinksRegistry.filter((item) => {
+    const matchesUrl =
+      (item.sourceUrl && normalizeUrlForDedup(item.sourceUrl) === norm) || item.id === deterministicId;
+    if (matchesUrl && item.id) {
+      matchingIds.add(item.id);
+    }
+    return !matchesUrl;
+  });
+
+  await syncRegistryToStorage(req, []);
+  await Promise.all(Array.from(matchingIds).map((id) => deleteRegistryItemFromD1(id)));
+}
+
+// API: Check single or multiple URLs against live Cloudflare D1 registry (No copy on match)
+app.post('/api/registry/check', async (req: Request, res: Response) => {
+  await hydrateRegistryFromD1IfNeeded(true);
+
+  const { urls, autoRegisterIfMissing = false } = req.body;
   if (!urls) {
     return res.status(400).json({ success: false, error: 'urls array or single url is required' });
   }
@@ -1770,9 +2290,9 @@ app.get('/api/registry/item', async (req: Request, res: Response) => {
   res.json({ success: true, record: found });
 });
 
-// API: List all tracked links in Cloudflare registry
+// API: List all tracked links in Cloudflare registry (refreshes live from D1)
 app.get('/api/registry/links', async (_req: Request, res: Response) => {
-  await hydrateRegistryFromD1IfNeeded();
+  await hydrateRegistryFromD1IfNeeded(true);
 
   res.json({
     success: true,
@@ -1850,6 +2370,38 @@ app.post('/api/registry/register', async (req: Request, res: Response) => {
   }
 });
 
+// API: Edit/update any field of a registry record by ID and sync to D1
+app.patch('/api/registry/item/:id', async (req: Request, res: Response) => {
+  try {
+    await hydrateRegistryFromD1IfNeeded();
+    const { id } = req.params;
+    const updates = req.body && typeof req.body === 'object' ? req.body : {};
+    const index = extractedLinksRegistry.findIndex((item) => item.id === id);
+    const baseRecord =
+      index !== -1
+        ? extractedLinksRegistry[index]
+        : ({ id, sourceUrl: updates.sourceUrl || '', title: updates.title || '' } as CloudflareExtractedLink);
+
+    const updatedRecord: CloudflareExtractedLink = {
+      ...baseRecord,
+      ...updates,
+      id,
+      lastUpdatedAt: new Date().toISOString(),
+    };
+
+    if (index !== -1) {
+      extractedLinksRegistry[index] = updatedRecord;
+    } else {
+      extractedLinksRegistry.unshift(updatedRecord);
+    }
+
+    await syncRegistryToStorage(req, [updatedRecord]);
+    res.json({ success: true, record: updatedRecord });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message || 'Failed to update registry item' });
+  }
+});
+
 // API: Delete a record from Cloudflare registry
 app.delete('/api/registry/item/:id', async (req: Request, res: Response) => {
   await hydrateRegistryFromD1IfNeeded();
@@ -1876,16 +2428,54 @@ app.post('/api/registry/clear', async (req: Request, res: Response) => {
 });
 
 // ============================================================================
-// VPS BACKGROUND BATCH DAEMON ENGINE (Headless 1 - 10 Concurrent Workers)
+// PERSISTENT BACKGROUND BATCH DAEMON ENGINE (Headless 1 - 20 Concurrent Workers)
+// Continues running after browser closes, auto-restarts failed/incomplete items,
+// and persists queue state to disk + Cloudflare D1 (ott-database) with 0 data loss.
 // ============================================================================
 interface VpsBatchTask {
+  id: string;
   index: number;
   url: string;
   workerId?: number;
-  status: 'pending' | 'processing' | 'completed' | 'skipped' | 'error';
+  status:
+    | 'pending'
+    | 'checking_registry'
+    | 'skipped_in_cloudflare'
+    | 'scraping'
+    | 'uploading_cloudflare'
+    | 'completed'
+    | 'error';
   statusMessage?: string;
   error?: string;
-  result?: any;
+  attempts?: number;
+  serverUsed?: string;
+  title?: string;
+  rawTitle?: string;
+  videoStreamUrl?: string;
+  originalVideoUrl?: string;
+  cloudflareVideoUrl?: string;
+  videoStorageSource?: 'cloudflare_r2' | 'emulator';
+  originalThumbnailUrl?: string;
+  cloudflareThumbnailUrl?: string;
+  thumbnailStorageSource?: 'cloudflare_r2' | 'emulator';
+  durationFormatted?: string;
+  durationSec?: number | null;
+  sizeFormatted?: string;
+  description?: string;
+  isRegisteredInCloudflare?: boolean;
+  destination?: string;
+  destinationDetail?: string;
+  registryUniqueId?: string;
+}
+
+type VideoCompressionQuality = 'high' | 'balanced' | 'compact' | 'low';
+
+function normalizeCompressionQuality(q: any): VideoCompressionQuality {
+  const val = String(q || '').toLowerCase().trim();
+  if (val === 'high' || val === 'balanced' || val === 'compact' || val === 'low') {
+    return val;
+  }
+  return 'balanced';
 }
 
 interface VpsBatchJobState {
@@ -1893,23 +2483,530 @@ interface VpsBatchJobState {
   isRunning: boolean;
   isPaused: boolean;
   concurrency: number;
+  batchSkipMode: 'smart_cache' | 'strict_skip' | 'dont_skip';
+  wordsToRemove: string;
+  uploadThumbnailToR2: boolean;
+  uploadVideoToR2: boolean;
+  compressVideo: boolean;
+  compressionQuality: VideoCompressionQuality;
+  autoRetryIncomplete: boolean;
+  currentPass: number;
+  maxAutoRetryPasses: number;
+  serverPool: string[];
   total: number;
   completed: number;
   skipped: number;
   errors: number;
+  incompleteCount: number;
   activeWorkers: number;
+  pausedForLoadCount?: number;
+  activeCompressions?: number;
+  currentCpuPercent?: number;
+  statusMessage?: string;
   startTime: string;
   endTime?: string;
+  lastUpdatedAt: string;
   tasks: VpsBatchTask[];
 }
 
+const vpsJobFilePath = path.join(localRegistryDir, 'vps_batch_job.json');
 let activeVpsBatchJob: VpsBatchJobState | null = null;
+let activeVpsJobR2Config: R2Config | null = null;
+let activeVpsJobAppBaseUrl = 'http://localhost:3000';
 let vpsBatchCancelFlag = false;
 let vpsBatchPauseFlag = false;
+let vpsWorkerLoopActive = false;
+let triggerVpsWorkerScaleUp: (() => void) | null = null;
+let lastD1JobSyncAt = 0;
 
-// API: Start VPS Background Batch Daemon
+// Compression CPU load governor constants & counters
+const COMPRESSION_HIGH_CPU_PERCENT = 80;
+const COMPRESSION_RESUME_CPU_PERCENT = 72;
+const MAX_CONCURRENT_FFMPEG = Math.max(1, Math.min(3, Math.floor(os.cpus().length / 2) || 1));
+let activeFfmpegCompressions = 0;
+let workersPausedForLoad = 0;
+
+function syncLiveLoadCountersOnJob(job: VpsBatchJobState | null): void {
+  if (!job) return;
+  job.activeCompressions = activeFfmpegCompressions;
+  job.pausedForLoadCount = workersPausedForLoad;
+  job.currentCpuPercent = sampleLiveCpuPercent();
+}
+
+function isTaskIncompleteForJob(task: VpsBatchTask, job: VpsBatchJobState): boolean {
+  if (task.status === 'skipped_in_cloudflare') return false;
+  if (
+    task.status === 'error' ||
+    task.status === 'pending' ||
+    task.status === 'checking_registry' ||
+    task.status === 'scraping' ||
+    task.status === 'uploading_cloudflare'
+  ) {
+    return true;
+  }
+  // Even if marked completed, treat as incomplete if Cloudflare upload was requested and video/thumb didn't finish
+  if (job.uploadVideoToR2 && !task.cloudflareVideoUrl) return true;
+  if (job.uploadThumbnailToR2 && task.originalThumbnailUrl && !task.cloudflareThumbnailUrl) return true;
+  if (!task.videoStreamUrl && !task.cloudflareVideoUrl) return true;
+  return false;
+}
+
+function recomputeVpsJobCounters(job: VpsBatchJobState): void {
+  job.total = job.tasks.length;
+  job.completed = job.tasks.filter((t) => t.status === 'completed').length;
+  job.skipped = job.tasks.filter((t) => t.status === 'skipped_in_cloudflare').length;
+  job.errors = job.tasks.filter((t) => t.status === 'error').length;
+  job.incompleteCount = job.tasks.filter((t) => isTaskIncompleteForJob(t, job)).length;
+  job.lastUpdatedAt = new Date().toISOString();
+}
+
+async function persistVpsBatchJob(forceD1 = false): Promise<void> {
+  if (!activeVpsBatchJob) return;
+  recomputeVpsJobCounters(activeVpsBatchJob);
+
+  try {
+    fs.writeFileSync(vpsJobFilePath, JSON.stringify(activeVpsBatchJob, null, 2), 'utf-8');
+  } catch (e) {
+    console.warn('Failed to write vps_batch_job.json:', e);
+  }
+
+  const now = Date.now();
+  if (!forceD1 && now - lastD1JobSyncAt < 3500) {
+    return;
+  }
+  lastD1JobSyncAt = now;
+
+  try {
+    await axios.post(
+      `${CF_WORKER_BASE_URL}/api/ad_config`,
+      {
+        id: 'vps_batch_job_state',
+        ...activeVpsBatchJob,
+        updatedAt: now,
+      },
+      {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 12000,
+      }
+    );
+  } catch (err) {
+    console.warn('Could not sync batch job snapshot to D1 ad_config:', formatCompactError(err));
+  }
+}
+
+function applyRegistryRecordToTask(task: VpsBatchTask, rec: CloudflareExtractedLink): void {
+  task.title = rec.title || task.title;
+  task.rawTitle = rec.rawTitle || rec.title || task.rawTitle;
+  task.description = rec.description || task.description || '';
+  task.videoStreamUrl = rec.cloudflareVideoUrl || rec.videoUrl || task.videoStreamUrl;
+  task.originalVideoUrl = rec.videoUrl || task.originalVideoUrl;
+  task.cloudflareVideoUrl = rec.cloudflareVideoUrl || task.cloudflareVideoUrl;
+  task.videoStorageSource = (rec.videoStorageSource as any) || (rec.cloudflareVideoUrl ? 'cloudflare_r2' : undefined);
+  task.originalThumbnailUrl = rec.thumbnailUrl || task.originalThumbnailUrl;
+  task.cloudflareThumbnailUrl = rec.cloudflareThumbnailUrl || rec.thumbnailUrl || task.cloudflareThumbnailUrl;
+  task.thumbnailStorageSource =
+    (rec.thumbnailStorageSource as any) || (rec.cloudflareThumbnailUrl ? 'cloudflare_r2' : undefined);
+  task.durationFormatted = rec.durationFormatted || task.durationFormatted;
+  task.durationSec = rec.durationSec ?? task.durationSec;
+  task.sizeFormatted = rec.sizeFormatted || task.sizeFormatted;
+  task.isRegisteredInCloudflare = true;
+  task.destination = rec.destination || task.destination;
+  task.destinationDetail = rec.destinationDetail || task.destinationDetail;
+  task.registryUniqueId = rec.id || task.registryUniqueId;
+}
+
+async function runSingleVpsTask(task: VpsBatchTask, workerId: number, job: VpsBatchJobState): Promise<void> {
+  task.workerId = workerId;
+  task.attempts = (task.attempts || 0) + 1;
+  const forceRefreshThisAttempt = job.batchSkipMode === 'dont_skip' || job.currentPass > 1;
+
+  // Step 0: Always check live Cloudflare D1 registry before processing (multi-server safe)
+  task.status = 'checking_registry';
+  task.statusMessage = `[Worker ${workerId} · Pass ${job.currentPass}] Checking live Cloudflare D1 Registry...`;
+  await persistVpsBatchJob(false);
+  await hydrateRegistryFromD1IfNeeded(true);
+
+  const existing = findRegistryRecordByWebUrl(task.url);
+  if (!forceRefreshThisAttempt && existing && !isPreviewVideoUrl(existing.videoUrl)) {
+    const hasCfVideo = Boolean(existing.cloudflareVideoUrl);
+    const hasCfThumb = Boolean(existing.cloudflareThumbnailUrl);
+    const hasCompleteAssets =
+      (hasCfVideo || (existing.status === 'uploaded' && hasCfThumb && !existing.videoUrl)) &&
+      (!job.uploadVideoToR2 || hasCfVideo || (existing.status === 'uploaded' && !existing.videoUrl)) &&
+      (!job.uploadThumbnailToR2 || hasCfThumb || !existing.thumbnailUrl);
+
+    if (hasCompleteAssets) {
+      applyRegistryRecordToTask(task, existing);
+      if (job.batchSkipMode === 'strict_skip') {
+        task.status = 'skipped_in_cloudflare';
+        task.statusMessage = `[Worker ${workerId}] Strict Skip: Found in Cloudflare D1 Registry · Bypassed`;
+      } else {
+        task.status = 'completed';
+        task.statusMessage = `[Worker ${workerId}] Reused from Cloudflare D1 Registry (0 Duplicate Copies)`;
+      }
+      await persistVpsBatchJob(false);
+      return;
+    }
+  }
+
+  // If another hosted server recently started processing this exact URL (< 8 min ago), avoid duplicate simultaneous scraping
+  if (existing && existing.status === 'processing') {
+    const startedMs = Date.parse(existing.metadata?.processingStartedAt || existing.lastUpdatedAt || '') || 0;
+    const otherServerId = existing.metadata?.workerServerId;
+    if (otherServerId && otherServerId !== SERVER_INSTANCE_ID && Date.now() - startedMs < 8 * 60 * 1000) {
+      task.status = 'error';
+      task.error = `Actively processing on server ${otherServerId} (will re-check on next pass)`;
+      task.statusMessage = `[Worker ${workerId}] Another server (${otherServerId}) is currently working on this URL`;
+      await persistVpsBatchJob(false);
+      return;
+    }
+  }
+
+  // Step 1: Scrape webpage + auto-upload thumbnail & video via multi-server pool + R2
+  task.status = 'scraping';
+  task.statusMessage = `[Worker ${workerId} · Pass ${job.currentPass}] Scraping${job.compressVideo ? ` & compressing (${job.compressionQuality})` : ' & uploading'} media...`;
+  await persistVpsBatchJob(false);
+
+  const data = await processUrlCore({
+    url: task.url,
+    wordsToRemove: job.wordsToRemove,
+    uploadThumbnailToR2: job.uploadThumbnailToR2,
+    uploadVideoToR2: job.uploadVideoToR2,
+    compressVideo: Boolean(job.compressVideo),
+    compressionQuality: normalizeCompressionQuality(job.compressionQuality),
+    forceRefresh: forceRefreshThisAttempt,
+    r2ConfigOverride: activeVpsJobR2Config,
+    appBaseUrlOverride: activeVpsJobAppBaseUrl,
+    extraServers: job.serverPool,
+  });
+
+  const primaryVideo = data.media?.videos?.[0];
+  const title = data.page?.title || primaryVideo?.title || task.url.split('/').pop()?.split('?')[0] || `Video ${task.index}`;
+  const rawTitle = data.page?.rawTitle || title;
+  const originalVideoUrl = primaryVideo?.originalVideoUrl || primaryVideo?.url || '';
+  const cloudflareVideoUrl = data.page?.cloudflareVideoUrl || primaryVideo?.cloudflareVideoUrl || undefined;
+  const cloudflareThumb = data.page?.cloudflareThumbnailUrl || primaryVideo?.cloudflareThumbnailUrl || undefined;
+  const originalThumb = data.page?.ogImage || primaryVideo?.poster || data.page?.candidateThumbnails?.[0]?.url || '';
+
+  task.title = title;
+  task.rawTitle = rawTitle;
+  task.description = data.page?.description || primaryVideo?.description || '';
+  task.originalVideoUrl = originalVideoUrl;
+  task.cloudflareVideoUrl = cloudflareVideoUrl;
+  task.videoStreamUrl = cloudflareVideoUrl || originalVideoUrl;
+  task.videoStorageSource = data.page?.videoStorageSource || (cloudflareVideoUrl ? 'cloudflare_r2' : undefined);
+  task.originalThumbnailUrl = originalThumb;
+  task.cloudflareThumbnailUrl = cloudflareThumb || originalThumb;
+  task.thumbnailStorageSource = data.page?.thumbnailStorageSource || (cloudflareThumb ? 'cloudflare_r2' : undefined);
+  task.durationFormatted = data.page?.durationFormatted || primaryVideo?.durationFormatted || '';
+  task.durationSec = data.page?.durationSec ?? primaryVideo?.durationSec ?? null;
+  task.sizeFormatted = data.page?.videoSize?.sizeFormatted || primaryVideo?.sizeFormatted || '';
+  task.isRegisteredInCloudflare = Boolean(data.isRegisteredInCloudflare);
+  task.registryUniqueId = data.registryUniqueId || data.registryRecord?.id;
+  task.serverUsed = data.serverUsed || 'direct';
+
+  const stillIncomplete =
+    (job.uploadVideoToR2 && !cloudflareVideoUrl) || (!task.videoStreamUrl && !cloudflareVideoUrl);
+
+  if (stillIncomplete) {
+    // Ensure failed/incomplete URL is removed from D1 registry so it can be retried cleanly
+    await removeRegistryRecordByWebUrl(task.url);
+    task.isRegisteredInCloudflare = false;
+    task.status = 'error';
+    task.error = !task.videoStreamUrl
+      ? 'No video stream extracted — removed from database for retry'
+      : 'Video upload to Cloudflare R2 incomplete — removed from database for retry';
+    task.statusMessage = `[Worker ${workerId} · Pass ${job.currentPass}] Failed/Incomplete: ${task.error}`;
+  } else {
+    task.status = 'completed';
+    task.error = undefined;
+    const savedInfo = data.page?.videoCompression?.savedPercent
+      ? ` · Compressed ${data.page.videoCompression.quality} (-${data.page.videoCompression.savedPercent}%)`
+      : '';
+    task.statusMessage = data.fromCache
+      ? `[Worker ${workerId}] Reused from Cloudflare D1 Registry (Web URL Match · 0 Duplicate Copies)`
+      : cloudflareVideoUrl
+      ? `[Worker ${workerId}] Completed & Saved in D1: Video + Thumbnail on Cloudflare R2${savedInfo}${task.serverUsed && task.serverUsed !== 'direct' ? ` (${task.serverUsed})` : ''}`
+      : `[Worker ${workerId}] Scraped & Saved in D1 (Website Stream)`;
+  }
+
+  await persistVpsBatchJob(false);
+}
+
+function launchVpsBatchWorkerLoop(): void {
+  if (vpsWorkerLoopActive || !activeVpsBatchJob) return;
+  vpsWorkerLoopActive = true;
+
+  (async () => {
+    try {
+      while (activeVpsBatchJob && !vpsBatchCancelFlag) {
+        const job = activeVpsBatchJob;
+        job.isRunning = true;
+
+        const pendingIndices: number[] = [];
+        for (let idx = 0; idx < job.tasks.length; idx++) {
+          if (job.tasks[idx].status === 'pending') {
+            pendingIndices.push(idx);
+          }
+        }
+
+        if (pendingIndices.length === 0) {
+          // End of current pass: check for failed or incomplete tasks!
+          const incompleteIndices: number[] = [];
+          for (let idx = 0; idx < job.tasks.length; idx++) {
+            if (isTaskIncompleteForJob(job.tasks[idx], job)) {
+              incompleteIndices.push(idx);
+            }
+          }
+
+          if (
+            incompleteIndices.length > 0 &&
+            job.autoRetryIncomplete &&
+            job.currentPass < 1 + job.maxAutoRetryPasses &&
+            !vpsBatchCancelFlag
+          ) {
+            job.currentPass += 1;
+            job.statusMessage = `Pass ${job.currentPass}/${1 + job.maxAutoRetryPasses}: Auto-restarting ${incompleteIndices.length} failed/incomplete link(s) after 5s cooldown...`;
+            for (const idx of incompleteIndices) {
+              job.tasks[idx].status = 'pending';
+              job.tasks[idx].statusMessage = `Pass ${job.currentPass}: Re-queued (incomplete/failed)`;
+            }
+            await persistVpsBatchJob(true);
+
+            // Cooldown wait respecting pause/cancel
+            for (let w = 0; w < 50; w++) {
+              if (vpsBatchCancelFlag) break;
+              await sleepMs(100);
+            }
+            while (vpsBatchPauseFlag && !vpsBatchCancelFlag) {
+              await sleepMs(400);
+            }
+            continue;
+          }
+          break;
+        }
+
+        job.statusMessage = `Pass ${job.currentPass}/${1 + job.maxAutoRetryPasses}: Processing ${pendingIndices.length} queued link(s) with ${job.concurrency}x worker(s)...`;
+        await persistVpsBatchJob(true);
+
+        let cursor = 0;
+        let activeCount = 0;
+        let workerIdSeq = 0;
+        const activePromises = new Set<Promise<void>>();
+
+        const spawnWorker = (workerId: number) => {
+          const p = (async () => {
+            activeCount++;
+            if (activeVpsBatchJob) activeVpsBatchJob.activeWorkers = activeCount;
+            try {
+              while (!vpsBatchCancelFlag && activeVpsBatchJob) {
+                while (vpsBatchPauseFlag && !vpsBatchCancelFlag) {
+                  await sleepMs(400);
+                }
+                if (vpsBatchCancelFlag || !activeVpsBatchJob) break;
+
+                // Graceful scale-down if concurrency reduced live
+                if (activeCount > activeVpsBatchJob.concurrency) break;
+
+                if (cursor >= pendingIndices.length) break;
+
+                // When compressing is enabled, pause excess workers briefly if CPU load is high or FFmpeg slots are full
+                if (activeVpsBatchJob.compressVideo) {
+                  let didPauseWorker = false;
+                  const pauseStartedAt = Date.now();
+                  try {
+                    while (!vpsBatchCancelFlag && !vpsBatchPauseFlag && activeVpsBatchJob) {
+                      const cpuNow = sampleLiveCpuPercent();
+                      const threshold = didPauseWorker ? COMPRESSION_RESUME_CPU_PERCENT : COMPRESSION_HIGH_CPU_PERCENT;
+                      const cpuTooHigh = cpuNow >= threshold;
+                      const ffmpegBusy = activeFfmpegCompressions >= MAX_CONCURRENT_FFMPEG && activeCount > 1;
+                      if (!cpuTooHigh && !ffmpegBusy) break;
+                      if (Date.now() - pauseStartedAt >= 45000 && !ffmpegBusy) break;
+
+                      if (!didPauseWorker) {
+                        didPauseWorker = true;
+                        workersPausedForLoad++;
+                        syncLiveLoadCountersOnJob(activeVpsBatchJob);
+                        activeVpsBatchJob.statusMessage = `Optimizing compression: ${workersPausedForLoad} worker(s) paused temporarily (CPU ${cpuNow}% · ${activeFfmpegCompressions} FFmpeg active)`;
+                        await persistVpsBatchJob(false);
+                      }
+                      await sleepMs(1500);
+                    }
+                  } finally {
+                    if (didPauseWorker) {
+                      workersPausedForLoad = Math.max(0, workersPausedForLoad - 1);
+                      if (activeVpsBatchJob) {
+                        syncLiveLoadCountersOnJob(activeVpsBatchJob);
+                        if (workersPausedForLoad === 0 && activeVpsBatchJob.isRunning) {
+                          activeVpsBatchJob.statusMessage = `CPU cooled (${activeVpsBatchJob.currentCpuPercent ?? 0}%) — resuming workers (Pass ${activeVpsBatchJob.currentPass}/${1 + activeVpsBatchJob.maxAutoRetryPasses})...`;
+                        }
+                      }
+                    }
+                  }
+                  if (vpsBatchCancelFlag || !activeVpsBatchJob) break;
+                }
+
+                if (cursor >= pendingIndices.length) break;
+                const taskIdx = pendingIndices[cursor++];
+                const task = activeVpsBatchJob.tasks[taskIdx];
+                if (!task || task.status !== 'pending') continue;
+
+                try {
+                  await runSingleVpsTask(task, workerId, activeVpsBatchJob);
+                } catch (err: any) {
+                  task.status = 'error';
+                  task.error = formatCompactError(err) || 'Scrape failed';
+                  task.statusMessage = `[Worker ${workerId} · Pass ${activeVpsBatchJob.currentPass}] Failed: ${task.error}`;
+                  await persistVpsBatchJob(false);
+                }
+              }
+            } finally {
+              activeCount = Math.max(0, activeCount - 1);
+              if (activeVpsBatchJob) activeVpsBatchJob.activeWorkers = activeCount;
+            }
+          })();
+          activePromises.add(p);
+          p.finally(() => activePromises.delete(p));
+        };
+
+        triggerVpsWorkerScaleUp = () => {
+          if (!activeVpsBatchJob || vpsBatchCancelFlag || vpsBatchPauseFlag) return;
+          const target = Math.min(activeVpsBatchJob.concurrency, pendingIndices.length - cursor + activeCount);
+          while (activeCount < target && cursor < pendingIndices.length) {
+            spawnWorker(++workerIdSeq);
+          }
+        };
+
+        const initialCount = Math.min(job.concurrency, pendingIndices.length);
+        for (let i = 0; i < initialCount; i++) {
+          spawnWorker(++workerIdSeq);
+        }
+
+        while (activePromises.size > 0) {
+          await Promise.race(Array.from(activePromises));
+        }
+        triggerVpsWorkerScaleUp = null;
+      }
+    } finally {
+      vpsWorkerLoopActive = false;
+      triggerVpsWorkerScaleUp = null;
+      if (activeVpsBatchJob) {
+        activeVpsBatchJob.isRunning = false;
+        activeVpsBatchJob.isPaused = false;
+        activeVpsBatchJob.activeWorkers = 0;
+        activeVpsBatchJob.endTime = new Date().toISOString();
+        recomputeVpsJobCounters(activeVpsBatchJob);
+        activeVpsBatchJob.statusMessage = vpsBatchCancelFlag
+          ? `Cancelled (${activeVpsBatchJob.completed}/${activeVpsBatchJob.total} completed)`
+          : activeVpsBatchJob.incompleteCount > 0
+          ? `Finished ${activeVpsBatchJob.currentPass} pass(es): ${activeVpsBatchJob.completed} done, ${activeVpsBatchJob.incompleteCount} incomplete/failed`
+          : `All ${activeVpsBatchJob.total} link(s) completed on Cloudflare!`;
+        await persistVpsBatchJob(true);
+      }
+    }
+  })();
+}
+
+async function loadAndResumeVpsBatchJob(): Promise<void> {
+  try {
+    let loaded: VpsBatchJobState | null = null;
+    if (fs.existsSync(vpsJobFilePath)) {
+      try {
+        loaded = JSON.parse(fs.readFileSync(vpsJobFilePath, 'utf-8'));
+      } catch {}
+    }
+    if (!loaded) {
+      const d1Res = await axios.get(`${CF_WORKER_BASE_URL}/api/ad_config`, {
+        timeout: 12000,
+        validateStatus: () => true,
+      });
+      if (d1Res.status >= 200 && d1Res.status < 300 && Array.isArray(d1Res.data)) {
+        const doc = d1Res.data.find((x: any) => String(x?.id || x?._id) === 'vps_batch_job_state');
+        if (doc && Array.isArray(doc.tasks)) {
+          loaded = doc as VpsBatchJobState;
+        }
+      }
+    }
+
+    if (loaded && Array.isArray(loaded.tasks) && loaded.tasks.length > 0) {
+      // Recover any mid-flight tasks from a server restart back to pending
+      for (const t of loaded.tasks) {
+        if (t.status === 'checking_registry' || t.status === 'scraping' || t.status === 'uploading_cloudflare') {
+          t.status = 'pending';
+          t.statusMessage = 'Resumed after server restart';
+        }
+      }
+      recomputeVpsJobCounters(loaded);
+      activeVpsBatchJob = loaded;
+      vpsBatchPauseFlag = Boolean(loaded.isPaused);
+      vpsBatchCancelFlag = false;
+      if (loaded.isRunning && !loaded.isPaused) {
+        launchVpsBatchWorkerLoop();
+      }
+    }
+  } catch (err) {
+    console.warn('Could not restore persisted VPS batch job:', formatCompactError(err));
+  }
+}
+
+// API: Multi-server Relay Fetch endpoint (allows secondary instances of this app to act as fetch nodes)
+app.all('/api/relay-fetch', async (req: Request, res: Response) => {
+  try {
+    const rawTarget = String(req.query.url || req.body?.url || '').trim();
+    if (!rawTarget || isBlockedPrivateHost(rawTarget)) {
+      return res.status(400).json({ success: false, error: 'Valid public target url is required' });
+    }
+    const parsed = new URL(rawTarget);
+    const ua = USER_AGENT_POOL[Math.floor(Math.random() * USER_AGENT_POOL.length)];
+    const agents = createNonKeepAliveAgents();
+    const relayRes = await axios.get(rawTarget, {
+      ...agents,
+      timeout: 25000,
+      maxRedirects: 5,
+      responseType: 'text',
+      validateStatus: () => true,
+      headers: {
+        'User-Agent': ua,
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        Referer: `${parsed.origin}/`,
+        Connection: 'close',
+      },
+    });
+    const finalUrl = (relayRes.request as any)?.res?.responseUrl || relayRes.config?.url || rawTarget;
+    return res.json({
+      success: true,
+      status: relayRes.status,
+      statusText: relayRes.statusText || 'OK',
+      finalUrl,
+      headers: {
+        'content-type': relayRes.headers['content-type'] || '',
+        'content-length': relayRes.headers['content-length'] || '',
+        'retry-after': relayRes.headers['retry-after'] || '',
+      },
+      html: typeof relayRes.data === 'string' ? relayRes.data : JSON.stringify(relayRes.data),
+    });
+  } catch (err: any) {
+    return res.status(502).json({ success: false, error: formatCompactError(err) });
+  }
+});
+
+// API: Start Persistent Background Batch Queue (continues running when browser is closed)
 app.post('/api/vps-batch/start', async (req: Request, res: Response) => {
-  const { urls, wordsToRemove = '', concurrency = 3, batchSkipMode = 'smart_cache' } = req.body;
+  const {
+    urls,
+    wordsToRemove = '',
+    concurrency = 3,
+    batchSkipMode = 'smart_cache',
+    uploadThumbnailToR2 = true,
+    uploadVideoToR2 = true,
+    compressVideo = false,
+    compressionQuality = 'balanced',
+    autoRetryIncomplete = true,
+    maxAutoRetryPasses = 3,
+    serverPool = [],
+  } = req.body;
+
   if (!urls || !Array.isArray(urls) || urls.length === 0) {
     return res.status(400).json({ success: false, error: 'urls array is required' });
   }
@@ -1917,22 +3014,36 @@ app.post('/api/vps-batch/start', async (req: Request, res: Response) => {
   if (activeVpsBatchJob?.isRunning) {
     return res.json({
       success: true,
-      message: 'A VPS batch job is already actively running in the background.',
+      alreadyRunning: true,
+      message: 'A background batch job is already actively running on the server.',
       job: activeVpsBatchJob,
     });
   }
 
   await hydrateRegistryFromD1IfNeeded();
 
-  const safeConcurrency = Math.max(1, Math.min(10, Number(concurrency) || 3));
+  // Capture active R2 config in server RAM for this background run (never written to disk/D1!)
+  activeVpsJobR2Config = getR2Config(req);
+  activeVpsJobAppBaseUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+
+  const safeConcurrency = Math.max(1, Math.min(50, Number(concurrency) || 3));
+  const safeMaxRetries = Math.max(0, Math.min(10, Number(maxAutoRetryPasses) || 3));
+  const normalizedQuality = normalizeCompressionQuality(compressionQuality);
+  const shouldCompress = Boolean(compressVideo);
+  const cleanPool = (Array.isArray(serverPool) ? serverPool : [])
+    .map((s: any) => String(s || '').trim())
+    .filter((s: string) => /^https?:\/\//i.test(s));
+
   vpsBatchCancelFlag = false;
   vpsBatchPauseFlag = false;
 
-  const tasks: VpsBatchTask[] = urls.map((u, i) => ({
+  const tasks: VpsBatchTask[] = urls.map((u: any, i: number) => ({
+    id: `queue_${Date.now()}_${i}`,
     index: i + 1,
     url: String(u).trim(),
     status: 'pending',
-    statusMessage: 'Queued for VPS worker',
+    statusMessage: 'Queued on background server...',
+    attempts: 0,
   }));
 
   activeVpsBatchJob = {
@@ -1940,124 +3051,167 @@ app.post('/api/vps-batch/start', async (req: Request, res: Response) => {
     isRunning: true,
     isPaused: false,
     concurrency: safeConcurrency,
+    batchSkipMode,
+    wordsToRemove: String(wordsToRemove || ''),
+    uploadThumbnailToR2: Boolean(uploadThumbnailToR2),
+    uploadVideoToR2: Boolean(uploadVideoToR2),
+    compressVideo: shouldCompress,
+    compressionQuality: normalizedQuality,
+    autoRetryIncomplete: Boolean(autoRetryIncomplete),
+    currentPass: 1,
+    maxAutoRetryPasses: safeMaxRetries,
+    serverPool: cleanPool,
     total: tasks.length,
     completed: 0,
     skipped: 0,
     errors: 0,
+    incompleteCount: tasks.length,
     activeWorkers: 0,
+    statusMessage: `Pass 1/${1 + safeMaxRetries}: Starting ${safeConcurrency}x server worker(s)${shouldCompress ? ` (Compress: ${normalizedQuality})` : ''}...`,
     startTime: new Date().toISOString(),
+    lastUpdatedAt: new Date().toISOString(),
     tasks,
   };
 
-  // Launch background worker pool without blocking the HTTP response
-  (async () => {
-    let nextIdx = 0;
-    const workerCount = Math.min(safeConcurrency, tasks.length);
-
-    const runWorker = async (workerId: number) => {
-      while (true) {
-        if (vpsBatchCancelFlag) break;
-        while (vpsBatchPauseFlag) {
-          await new Promise((r) => setTimeout(r, 400));
-          if (vpsBatchCancelFlag) break;
-        }
-        if (vpsBatchCancelFlag) break;
-
-        const currentTaskIdx = nextIdx++;
-        if (currentTaskIdx >= tasks.length) break;
-
-        const task = tasks[currentTaskIdx];
-        task.workerId = workerId;
-        task.status = 'processing';
-        task.statusMessage = `Worker ${workerId} checking & processing...`;
-        if (activeVpsBatchJob) activeVpsBatchJob.activeWorkers++;
-
-        try {
-          // Check registry strictly by Web URL
-          const existing = findRegistryRecordByWebUrl(task.url);
-          if (existing && batchSkipMode !== 'dont_skip') {
-            const hasStoredAssets = hasCompleteCloudflareAssets(existing);
-            if (batchSkipMode === 'strict_skip' && hasStoredAssets) {
-              task.status = 'skipped';
-              task.statusMessage = `Strict Skip: Web URL in Cloudflare (0 copies) · Bypassed`;
-              if (activeVpsBatchJob) activeVpsBatchJob.skipped++;
-              continue;
-            } else if (batchSkipMode === 'smart_cache' && hasStoredAssets) {
-              task.status = 'completed';
-              task.statusMessage = `Reused from Cloudflare Vault (Web URL Match · 0 Copies)`;
-              task.result = existing;
-              if (activeVpsBatchJob) activeVpsBatchJob.completed++;
-              continue;
-            }
-          }
-
-          // Complete task
-          task.status = 'completed';
-          task.statusMessage = `Completed & Registered in Cloudflare`;
-          if (activeVpsBatchJob) activeVpsBatchJob.completed++;
-        } catch (err: any) {
-          task.status = 'error';
-          task.error = err.message || 'Scrape error';
-          task.statusMessage = `Failed: ${err.message}`;
-          if (activeVpsBatchJob) activeVpsBatchJob.errors++;
-        } finally {
-          if (activeVpsBatchJob) activeVpsBatchJob.activeWorkers = Math.max(0, activeVpsBatchJob.activeWorkers - 1);
-        }
-      }
-    };
-
-    try {
-      const workers = Array.from({ length: workerCount }, (_, i) => runWorker(i + 1));
-      await Promise.all(workers);
-    } finally {
-      if (activeVpsBatchJob) {
-        activeVpsBatchJob.isRunning = false;
-        activeVpsBatchJob.isPaused = false;
-        activeVpsBatchJob.endTime = new Date().toISOString();
-        activeVpsBatchJob.activeWorkers = 0;
-      }
-    }
-  })();
+  await persistVpsBatchJob(true);
+  launchVpsBatchWorkerLoop();
 
   res.json({
     success: true,
-    message: `VPS Background Batch Worker started with ${safeConcurrency}x concurrency.`,
+    message: `Persistent background batch started with ${safeConcurrency}x worker(s). Safe to close browser.`,
     jobId: activeVpsBatchJob.jobId,
-    total: tasks.length,
-    concurrency: safeConcurrency,
-  });
-});
-
-// API: Get VPS Background Batch Status
-app.get('/api/vps-batch/status', (_req: Request, res: Response) => {
-  res.json({
-    success: true,
     job: activeVpsBatchJob,
   });
 });
 
-// API: Pause VPS Background Batch
-app.post('/api/vps-batch/pause', (_req: Request, res: Response) => {
+// API: Get Persistent Background Batch Status (restores queue when reopening browser)
+app.get('/api/vps-batch/status', (_req: Request, res: Response) => {
+  if (activeVpsBatchJob) {
+    recomputeVpsJobCounters(activeVpsBatchJob);
+    syncLiveLoadCountersOnJob(activeVpsBatchJob);
+  }
+  res.json({
+    success: true,
+    job: activeVpsBatchJob,
+    defaultServerPool: getConfiguredServerPool([]).filter((s) => s !== 'direct'),
+  });
+});
+
+// API: Update Concurrency Live on Running Background Job
+app.post('/api/vps-batch/concurrency', async (req: Request, res: Response) => {
+  const safeConcurrency = Math.max(1, Math.min(50, Number(req.body?.concurrency) || 3));
+  if (activeVpsBatchJob) {
+    activeVpsBatchJob.concurrency = safeConcurrency;
+    if (triggerVpsWorkerScaleUp) triggerVpsWorkerScaleUp();
+    await persistVpsBatchJob(false);
+  }
+  res.json({ success: true, concurrency: safeConcurrency, job: activeVpsBatchJob });
+});
+
+// API: Pause Background Batch
+app.post('/api/vps-batch/pause', async (_req: Request, res: Response) => {
   vpsBatchPauseFlag = true;
-  if (activeVpsBatchJob) activeVpsBatchJob.isPaused = true;
-  res.json({ success: true, message: 'VPS batch job paused.' });
+  if (activeVpsBatchJob) {
+    activeVpsBatchJob.isPaused = true;
+    activeVpsBatchJob.statusMessage = 'Paused (saved in database · safe to close browser)';
+    await persistVpsBatchJob(true);
+  }
+  res.json({ success: true, message: 'Background batch paused.', job: activeVpsBatchJob });
 });
 
-// API: Resume VPS Background Batch
-app.post('/api/vps-batch/resume', (_req: Request, res: Response) => {
+// API: Resume Background Batch
+app.post('/api/vps-batch/resume', async (req: Request, res: Response) => {
+  if (!activeVpsJobR2Config) {
+    activeVpsJobR2Config = getR2Config(req);
+  }
   vpsBatchPauseFlag = false;
-  if (activeVpsBatchJob) activeVpsBatchJob.isPaused = false;
-  res.json({ success: true, message: 'VPS batch job resumed.' });
+  vpsBatchCancelFlag = false;
+  if (activeVpsBatchJob) {
+    activeVpsBatchJob.isPaused = false;
+    if (!vpsWorkerLoopActive && activeVpsBatchJob.tasks.some((t) => t.status === 'pending')) {
+      activeVpsBatchJob.isRunning = true;
+      launchVpsBatchWorkerLoop();
+    } else if (triggerVpsWorkerScaleUp) {
+      triggerVpsWorkerScaleUp();
+    }
+    await persistVpsBatchJob(true);
+  }
+  res.json({ success: true, message: 'Background batch resumed.', job: activeVpsBatchJob });
 });
 
-// API: Cancel VPS Background Batch
-app.post('/api/vps-batch/cancel', (_req: Request, res: Response) => {
+// API: Cancel Background Batch
+app.post('/api/vps-batch/cancel', async (_req: Request, res: Response) => {
   vpsBatchCancelFlag = true;
+  vpsBatchPauseFlag = false;
   if (activeVpsBatchJob) {
     activeVpsBatchJob.isRunning = false;
     activeVpsBatchJob.isPaused = false;
+    activeVpsBatchJob.activeWorkers = 0;
+    activeVpsBatchJob.statusMessage = 'Cancelled by user';
+    await persistVpsBatchJob(true);
   }
-  res.json({ success: true, message: 'VPS batch job cancelled.' });
+  res.json({ success: true, message: 'Background batch cancelled.', job: activeVpsBatchJob });
+});
+
+// API: Manually Restart All Failed & Incomplete Tasks in Current Saved Job
+app.post('/api/vps-batch/retry-incomplete', async (req: Request, res: Response) => {
+  if (!activeVpsBatchJob) {
+    return res.status(404).json({ success: false, error: 'No saved background batch job found' });
+  }
+  if (activeVpsBatchJob.isRunning) {
+    return res.json({ success: true, message: 'Job is already running.', job: activeVpsBatchJob });
+  }
+
+  activeVpsJobR2Config = getR2Config(req) || activeVpsJobR2Config;
+  activeVpsJobAppBaseUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+
+  const incompleteTasks = activeVpsBatchJob.tasks.filter((t) =>
+    isTaskIncompleteForJob(t, activeVpsBatchJob!)
+  );
+  if (incompleteTasks.length === 0) {
+    return res.json({
+      success: true,
+      retriedCount: 0,
+      message: 'No failed or incomplete websites remaining.',
+      job: activeVpsBatchJob,
+    });
+  }
+
+  for (const t of incompleteTasks) {
+    t.status = 'pending';
+    t.error = undefined;
+    t.statusMessage = 'Queued for manual retry (failed/incomplete)...';
+  }
+  vpsBatchCancelFlag = false;
+  vpsBatchPauseFlag = false;
+  activeVpsBatchJob.isRunning = true;
+  activeVpsBatchJob.isPaused = false;
+  activeVpsBatchJob.currentPass += 1;
+  activeVpsBatchJob.maxAutoRetryPasses = Math.max(activeVpsBatchJob.maxAutoRetryPasses, activeVpsBatchJob.currentPass);
+  activeVpsBatchJob.statusMessage = `Retrying ${incompleteTasks.length} failed/incomplete link(s)...`;
+  await persistVpsBatchJob(true);
+  launchVpsBatchWorkerLoop();
+
+  res.json({
+    success: true,
+    retriedCount: incompleteTasks.length,
+    message: `Restarted ${incompleteTasks.length} failed/incomplete link(s) in background.`,
+    job: activeVpsBatchJob,
+  });
+});
+
+// API: Clear Saved Background Batch Job
+app.post('/api/vps-batch/clear', async (_req: Request, res: Response) => {
+  vpsBatchCancelFlag = true;
+  vpsBatchPauseFlag = false;
+  activeVpsBatchJob = null;
+  try {
+    if (fs.existsSync(vpsJobFilePath)) fs.unlinkSync(vpsJobFilePath);
+  } catch {}
+  try {
+    await axios.delete(`${CF_WORKER_BASE_URL}/api/ad_config/vps_batch_job_state`, { timeout: 10000 });
+  } catch {}
+  res.json({ success: true, message: 'Saved background batch queue cleared.' });
 });
 
 // API: Get current domain filter rules (whitelist & blacklist)
@@ -2627,6 +3781,8 @@ async function uploadImageToR2OrLocal(params: {
   folderPrefix?: string;
   refererUrl?: string;
   req?: Request;
+  r2ConfigOverride?: R2Config | null;
+  appBaseUrlOverride?: string;
 }): Promise<{
   cloudflareBackLink: string;
   thumbKey: string;
@@ -2634,7 +3790,16 @@ async function uploadImageToR2OrLocal(params: {
   contentType: string;
   storageSource: 'cloudflare_r2' | 'emulator';
 }> {
-  const { imageUrl, imageBase64, customFilename, folderPrefix = 'thumbnails', refererUrl, req } = params;
+  const {
+    imageUrl,
+    imageBase64,
+    customFilename,
+    folderPrefix = 'thumbnails',
+    refererUrl,
+    req,
+    r2ConfigOverride,
+    appBaseUrlOverride,
+  } = params;
 
   let buffer: Buffer;
   let contentType = 'image/jpeg';
@@ -2714,8 +3879,9 @@ async function uploadImageToR2OrLocal(params: {
   const cleanFolder = folderPrefix.replace(/^\/+|\/+$/g, '');
   const thumbKey = cleanFolder ? `${cleanFolder}/${filename}` : filename;
 
-  const r2Config = getR2Config(req);
-  const appBaseUrl = process.env.APP_URL || (req ? `${req.protocol}://${req.get('host')}` : 'http://localhost:3000');
+  const r2Config = r2ConfigOverride !== undefined ? r2ConfigOverride : getR2Config(req);
+  const appBaseUrl =
+    appBaseUrlOverride || process.env.APP_URL || (req ? `${req.protocol}://${req.get('host')}` : 'http://localhost:3000');
 
   let cloudflareBackLink = '';
   let storageSource: 'cloudflare_r2' | 'emulator' = 'emulator';
@@ -2952,13 +4118,153 @@ app.post('/api/upload-thumbnail-to-r2', async (req: Request, res: Response) => {
   }
 });
 
-// Helper: Download a remote video URL and upload directly to Cloudflare R2 or local storage emulator
+const COMPRESSION_PRESETS: Record<
+  VideoCompressionQuality,
+  { maxHeight: number; crf: number; audioBitrate: string; preset: string }
+> = {
+  high: { maxHeight: 1080, crf: 22, audioBitrate: '128k', preset: 'veryfast' },
+  balanced: { maxHeight: 720, crf: 26, audioBitrate: '96k', preset: 'veryfast' },
+  compact: { maxHeight: 480, crf: 29, audioBitrate: '64k', preset: 'veryfast' },
+  low: { maxHeight: 360, crf: 32, audioBitrate: '64k', preset: 'superfast' },
+};
+
+async function compressVideoWithFfmpeg(
+  inputPath: string,
+  quality: VideoCompressionQuality
+): Promise<{
+  outputPath: string;
+  compressedSizeBytes: number;
+  originalSizeBytes: number;
+  savedPercent: number;
+  usedCompressed: boolean;
+}> {
+  const originalSizeBytes = fs.statSync(inputPath).size;
+  const presetCfg = COMPRESSION_PRESETS[quality] || COMPRESSION_PRESETS.balanced;
+  const outputPath = path.join(
+    localUploadsDir,
+    `temp_comp_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.mp4`
+  );
+
+  // Never upscale videos smaller than target height; always enforce even width/height for libx264
+  const scaleFilter = `scale='if(gt(ih,${presetCfg.maxHeight}),-2,trunc(iw/2)*2)':'if(gt(ih,${presetCfg.maxHeight}),${presetCfg.maxHeight},trunc(ih/2)*2)'`;
+
+  // Wait for an FFmpeg slot & healthy CPU headroom so concurrent workers don't overload CPU
+  let waitedForLoad = false;
+  const slotWaitStartedAt = Date.now();
+  try {
+    while (!vpsBatchCancelFlag) {
+      const cpuNow = sampleLiveCpuPercent();
+      const slotsFull = activeFfmpegCompressions >= MAX_CONCURRENT_FFMPEG;
+      const highCpuWhileActive = activeFfmpegCompressions > 0 && cpuNow >= COMPRESSION_HIGH_CPU_PERCENT;
+      if (!slotsFull && (!highCpuWhileActive || Date.now() - slotWaitStartedAt >= 60000)) {
+        break;
+      }
+      if (!waitedForLoad) {
+        waitedForLoad = true;
+        workersPausedForLoad++;
+        if (activeVpsBatchJob) {
+          syncLiveLoadCountersOnJob(activeVpsBatchJob);
+          activeVpsBatchJob.statusMessage = `Optimizing FFmpeg compression: ${workersPausedForLoad} worker(s) paused for CPU cooldown (CPU ${cpuNow}% · ${activeFfmpegCompressions}/${MAX_CONCURRENT_FFMPEG} active)...`;
+        }
+      }
+      await sleepMs(1200);
+    }
+  } finally {
+    if (waitedForLoad) {
+      workersPausedForLoad = Math.max(0, workersPausedForLoad - 1);
+      syncLiveLoadCountersOnJob(activeVpsBatchJob);
+    }
+  }
+
+  activeFfmpegCompressions++;
+  syncLiveLoadCountersOnJob(activeVpsBatchJob);
+
+  try {
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-loglevel',
+        'error',
+        '-i',
+        inputPath,
+        '-map',
+        '0:v:0',
+        '-map',
+        '0:a:0?',
+        '-vf',
+        scaleFilter,
+        '-c:v',
+        'libx264',
+        '-preset',
+        presetCfg.preset,
+        '-crf',
+        String(presetCfg.crf),
+        '-pix_fmt',
+        'yuv420p',
+        '-c:a',
+        'aac',
+        '-b:a',
+        presetCfg.audioBitrate,
+        '-ac',
+        '2',
+        '-movflags',
+        '+faststart',
+        '-threads',
+        '2',
+        outputPath,
+      ],
+      { timeout: 600000 }
+    );
+  } finally {
+    activeFfmpegCompressions = Math.max(0, activeFfmpegCompressions - 1);
+    syncLiveLoadCountersOnJob(activeVpsBatchJob);
+  }
+
+  const compressedSizeBytes = fs.existsSync(outputPath) ? fs.statSync(outputPath).size : 0;
+  if (compressedSizeBytes <= 0) {
+    try {
+      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    } catch {}
+    throw new Error('FFmpeg produced an empty compressed video file');
+  }
+
+  // Keep compressed file only when it actually reduces size; otherwise keep original smaller file
+  if (compressedSizeBytes >= originalSizeBytes) {
+    try {
+      fs.unlinkSync(outputPath);
+    } catch {}
+    return {
+      outputPath: inputPath,
+      compressedSizeBytes: originalSizeBytes,
+      originalSizeBytes,
+      savedPercent: 0,
+      usedCompressed: false,
+    };
+  }
+
+  const savedPercent = Math.max(1, Math.round(((originalSizeBytes - compressedSizeBytes) / originalSizeBytes) * 100));
+  return {
+    outputPath,
+    compressedSizeBytes,
+    originalSizeBytes,
+    savedPercent,
+    usedCompressed: true,
+  };
+}
+
+// Helper: Download a remote video URL (optionally FFmpeg-compressed) and upload directly to Cloudflare R2 or local storage
 async function uploadVideoToR2OrLocal(params: {
   videoUrl: string;
   customFilename?: string;
   folderPrefix?: string;
   refererUrl?: string;
   req?: Request;
+  r2ConfigOverride?: R2Config | null;
+  appBaseUrlOverride?: string;
+  minExpectedDurationSec?: number;
+  compressVideo?: boolean;
+  compressionQuality?: VideoCompressionQuality;
 }): Promise<{
   cloudflareVideoBackLink: string;
   videoKey: string;
@@ -2969,15 +4275,31 @@ async function uploadVideoToR2OrLocal(params: {
   durationFormatted: string | null;
   contentType: string;
   storageSource: 'cloudflare_r2' | 'emulator';
+  compressed?: boolean;
+  compressionQuality?: VideoCompressionQuality;
+  originalSizeBytes?: number;
+  savedPercent?: number;
 }> {
-  const { videoUrl, customFilename, folderPrefix = 'videos', refererUrl, req } = params;
+  const {
+    videoUrl,
+    customFilename,
+    folderPrefix = 'videos',
+    refererUrl,
+    req,
+    r2ConfigOverride,
+    appBaseUrlOverride,
+    minExpectedDurationSec,
+    compressVideo = false,
+    compressionQuality = 'balanced',
+  } = params;
 
   if (!videoUrl || !/^https?:\/\//i.test(videoUrl)) {
     throw new Error('A valid HTTP/HTTPS video URL is required');
   }
 
-  const r2Config = getR2Config(req);
-  const appBaseUrl = process.env.APP_URL || (req ? `${req.protocol}://${req.get('host')}` : 'http://localhost:3000');
+  const r2Config = r2ConfigOverride !== undefined ? r2ConfigOverride : getR2Config(req);
+  const appBaseUrl =
+    appBaseUrlOverride || process.env.APP_URL || (req ? `${req.protocol}://${req.get('host')}` : 'http://localhost:3000');
 
   // If videoUrl is already an R2 URL or local media URL, return as-is
   if (
@@ -3014,6 +4336,7 @@ async function uploadVideoToR2OrLocal(params: {
   for (let attempt = 1; attempt <= 3; attempt++) {
     const useReferer = attempt === 3 && videoOrigin ? `${videoOrigin}/` : primaryReferer;
     const useOrigin = attempt === 3 && videoOrigin ? videoOrigin : primaryOrigin;
+    const rotatedUa = USER_AGENT_POOL[(serverPoolRoundRobinIdx + attempt) % USER_AGENT_POOL.length];
     let videoStreamRes: any = null;
 
     try {
@@ -3028,8 +4351,7 @@ async function uploadVideoToR2OrLocal(params: {
           maxRedirects: 5,
           decompress: false,
           headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'User-Agent': rotatedUa,
             Accept: 'video/mp4,video/*,*/*;q=0.9',
             'Accept-Language': 'en-US,en;q=0.9',
             Connection: 'close',
@@ -3058,8 +4380,17 @@ async function uploadVideoToR2OrLocal(params: {
             contentType = headerType;
           }
 
+          const expectedRemoteBytes = Number(videoStreamRes.headers['content-length'] || 0);
           const writer = fs.createWriteStream(tempFilePath);
           await pipeline(videoStreamRes.data, writer);
+
+          // Reject truncated downloads before verification/upload
+          const downloadedStat = fs.statSync(tempFilePath);
+          if (expectedRemoteBytes > 0 && downloadedStat.size < Math.floor(expectedRemoteBytes * 0.98)) {
+            throw new Error(
+              `Truncated video download (${downloadedStat.size} of ${expectedRemoteBytes} bytes) — retrying`
+            );
+          }
 
           // Peek first bytes to ensure we didn't download an HTML page or HLS playlist saved with video/*
           const fd = fs.openSync(tempFilePath, 'r');
@@ -3103,7 +4434,12 @@ async function uploadVideoToR2OrLocal(params: {
         if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
       } catch {}
 
-      if (attempt < 3 && (isRetryableNetworkError(downloadErr) || downloadErr?.response?.status === 403)) {
+      if (
+        attempt < 3 &&
+        (isRetryableNetworkError(downloadErr) ||
+          downloadErr?.response?.status === 403 ||
+          String(downloadErr?.message || '').includes('Truncated video download'))
+      ) {
         const backoff = 600 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 300);
         await sleepMs(backoff);
         continue;
@@ -3119,8 +4455,23 @@ async function uploadVideoToR2OrLocal(params: {
     throw new Error(`Failed to download remote video stream: ${formatCompactError(lastDownloadErr || '0 bytes')}`);
   }
 
-  // Extract actual video duration metadata directly from the downloaded video file before uploading/deleting
-  const extractedMeta = await extractVideoMetadataFromFile(tempFilePath);
+  // Extract actual video duration metadata directly from the downloaded video file before compression/upload
+  let extractedMeta = await extractVideoMetadataFromFile(tempFilePath);
+
+  // Reject short hover-preview/trailer clips when real page duration is significantly longer
+  if (
+    minExpectedDurationSec &&
+    minExpectedDurationSec >= 30 &&
+    extractedMeta.durationSec &&
+    extractedMeta.durationSec < Math.max(15, Math.floor(minExpectedDurationSec * 0.35))
+  ) {
+    try {
+      if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+    } catch {}
+    throw new Error(
+      `Downloaded clip duration (${extractedMeta.durationSec}s) is much shorter than real video duration (${minExpectedDurationSec}s) — skipping preview clip`
+    );
+  }
 
   // Derive file extension
   let ext = 'mp4';
@@ -3128,6 +4479,35 @@ async function uploadVideoToR2OrLocal(params: {
     if (videoUrl.includes('.webm') || contentType.includes('webm')) ext = 'webm';
     else if (videoUrl.includes('.mkv') || contentType.includes('x-matroska')) ext = 'mkv';
     else if (videoUrl.includes('.mov') || contentType.includes('quicktime')) ext = 'mov';
+  }
+
+  // Optional FFmpeg compression BEFORE uploading to Cloudflare R2 (OFF by default)
+  let uploadFilePath = tempFilePath;
+  let compressedTempPath: string | null = null;
+  let didCompress = false;
+  let originalSizeBeforeCompress = fileSize;
+  let compressionSavedPercent = 0;
+  const resolvedQuality = normalizeCompressionQuality(compressionQuality);
+
+  if (compressVideo) {
+    try {
+      const compRes = await compressVideoWithFfmpeg(tempFilePath, resolvedQuality);
+      if (compRes.usedCompressed && compRes.outputPath !== tempFilePath) {
+        compressedTempPath = compRes.outputPath;
+        uploadFilePath = compRes.outputPath;
+        fileSize = compRes.compressedSizeBytes;
+        originalSizeBeforeCompress = compRes.originalSizeBytes;
+        compressionSavedPercent = compRes.savedPercent;
+        didCompress = true;
+        contentType = 'video/mp4';
+        ext = 'mp4';
+        if (!extractedMeta.durationSec) {
+          extractedMeta = await extractVideoMetadataFromFile(uploadFilePath);
+        }
+      }
+    } catch (compErr: any) {
+      console.warn('Video compression failed; falling back to original file:', formatCompactError(compErr));
+    }
   }
 
   const safeName = customFilename
@@ -3144,19 +4524,37 @@ async function uploadVideoToR2OrLocal(params: {
   try {
     if (r2Config) {
       const s3 = createR2Client(r2Config);
-      const fileStream = fs.createReadStream(tempFilePath);
+      const fileStream = fs.createReadStream(uploadFilePath);
 
       try {
-        await s3.send(
-          new PutObjectCommand({
-            Bucket: r2Config.bucketName,
-            Key: videoKey,
-            Body: fileStream,
-            ContentLength: fileSize,
-            ContentType: contentType,
-            CacheControl: 'public, max-age=31536000',
-          })
-        );
+        if (fileSize >= 8 * 1024 * 1024) {
+          // Multi-part parallel R2 upload (4 concurrent 8MB streams) for faster uploads on larger videos
+          const parallelUpload = new Upload({
+            client: s3,
+            params: {
+              Bucket: r2Config.bucketName,
+              Key: videoKey,
+              Body: fileStream,
+              ContentType: contentType,
+              CacheControl: 'public, max-age=31536000',
+            },
+            queueSize: 4,
+            partSize: 8 * 1024 * 1024,
+            leavePartsOnError: false,
+          });
+          await parallelUpload.done();
+        } else {
+          await s3.send(
+            new PutObjectCommand({
+              Bucket: r2Config.bucketName,
+              Key: videoKey,
+              Body: fileStream,
+              ContentLength: fileSize,
+              ContentType: contentType,
+              CacheControl: 'public, max-age=31536000',
+            })
+          );
+        }
       } finally {
         try {
           fileStream.destroy();
@@ -3181,15 +4579,18 @@ async function uploadVideoToR2OrLocal(params: {
     } else {
       // Emulator mode
       const localDest = path.join(localVideosDir, filename);
-      fs.copyFileSync(tempFilePath, localDest);
+      fs.copyFileSync(uploadFilePath, localDest);
       verifiedSizeBytes = fs.statSync(localDest).size || fileSize;
       cloudflareVideoBackLink = `${appBaseUrl}/api/local-media/videos/${filename}`;
       storageSource = 'emulator';
     }
   } finally {
-    // Always remove temp file regardless of upload outcome
+    // Always remove temp files regardless of upload outcome
     try {
       if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+    } catch {}
+    try {
+      if (compressedTempPath && fs.existsSync(compressedTempPath)) fs.unlinkSync(compressedTempPath);
     } catch {}
   }
 
@@ -3209,13 +4610,28 @@ async function uploadVideoToR2OrLocal(params: {
     durationFormatted: extractedMeta.durationFormatted,
     contentType,
     storageSource,
+    ...(didCompress
+      ? {
+          compressed: true,
+          compressionQuality: resolvedQuality,
+          originalSizeBytes: originalSizeBeforeCompress,
+          savedPercent: compressionSavedPercent,
+        }
+      : { compressed: false }),
   };
 }
 
 // Standalone API: Upload any remote video URL directly to Cloudflare R2 and return the permanent back link
 app.post('/api/upload-video-to-r2', async (req: Request, res: Response) => {
   try {
-    const { videoUrl, customFilename, folderPrefix = 'videos', refererUrl } = req.body;
+    const {
+      videoUrl,
+      customFilename,
+      folderPrefix = 'videos',
+      refererUrl,
+      compressVideo = false,
+      compressionQuality = 'balanced',
+    } = req.body;
     if (!videoUrl) {
       return res.status(400).json({
         success: false,
@@ -3229,6 +4645,8 @@ app.post('/api/upload-video-to-r2', async (req: Request, res: Response) => {
       folderPrefix,
       refererUrl,
       req,
+      compressVideo: Boolean(compressVideo),
+      compressionQuality: normalizeCompressionQuality(compressionQuality),
     });
 
     res.json({
@@ -3244,39 +4662,52 @@ app.post('/api/upload-video-to-r2', async (req: Request, res: Response) => {
   }
 });
 
-// Process & scrape input website URL in background using axios and cheerio
-app.post('/api/process-url', async (req: Request, res: Response) => {
-  try {
-    let {
-      url,
-      extractMedia = true,
-      customHeaders = {},
-      wordsToRemove = '',
-      uploadThumbnailToR2 = false,
-      uploadVideoToR2 = false,
-      forceRefresh = false,
-    } = req.body;
-    if (!url || typeof url !== 'string') {
-      return res.status(400).json({
-        success: false,
-        error: 'Target URL is required in request body { "url": "https://..." }',
-      });
-    }
+// Core reusable URL scraper + Cloudflare R2 uploader + D1 links_registry updater
+async function processUrlCore(params: {
+  url: string;
+  extractMedia?: boolean;
+  customHeaders?: Record<string, string>;
+  wordsToRemove?: string;
+  uploadThumbnailToR2?: boolean;
+  uploadVideoToR2?: boolean;
+  compressVideo?: boolean;
+  compressionQuality?: VideoCompressionQuality;
+  forceRefresh?: boolean;
+  req?: Request;
+  r2ConfigOverride?: R2Config | null;
+  appBaseUrlOverride?: string;
+  extraServers?: string[];
+}): Promise<any> {
+  let {
+    url,
+    customHeaders = {},
+    wordsToRemove = '',
+    uploadThumbnailToR2 = false,
+    uploadVideoToR2 = false,
+    compressVideo = false,
+    compressionQuality = 'balanced',
+    forceRefresh = false,
+    req,
+    r2ConfigOverride,
+    appBaseUrlOverride,
+    extraServers = [],
+  } = params;
 
-    url = url.trim();
-    if (!/^https?:\/\//i.test(url)) {
-      url = `https://${url}`;
-    }
+  url = url.trim();
+  if (!/^https?:\/\//i.test(url)) {
+    url = `https://${url}`;
+  }
 
-    await hydrateRegistryFromD1IfNeeded();
+  await hydrateRegistryFromD1IfNeeded(true);
 
-    // CHECK CLOUDFLARE REGISTRY BY WEB URL:
-    // Reuse cached record ONLY when it already has complete Cloudflare assets needed for this request!
-    const existingWebRecord = findRegistryRecordByWebUrl(url);
+  // CHECK LIVE CLOUDFLARE D1 REGISTRY BY WEB URL:
+  // Reuse cached record ONLY when it already has complete Cloudflare assets needed for this request!
+  const existingWebRecord = findRegistryRecordByWebUrl(url);
     const hasCfVideo = Boolean(existingWebRecord?.cloudflareVideoUrl);
     const hasCfThumb = Boolean(existingWebRecord?.cloudflareThumbnailUrl);
     const isCompleteForRequest =
       Boolean(existingWebRecord) &&
+      !isPreviewVideoUrl(existingWebRecord?.videoUrl) &&
       (hasCfVideo ||
         (existingWebRecord?.status === 'uploaded' && hasCfThumb && !existingWebRecord?.videoUrl)) &&
       (!uploadVideoToR2 || hasCfVideo || (existingWebRecord?.status === 'uploaded' && !existingWebRecord?.videoUrl)) &&
@@ -3352,7 +4783,7 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
           : [],
       };
 
-      return res.json({
+      return {
         success: true,
         fromCache: true,
         cachedByWebUrl: true,
@@ -3383,54 +4814,64 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
         rawSnippet: `Cached record from Cloudflare: ${existingWebRecord.title}`,
         htmlLength: 0,
         registryRecord: existingWebRecord,
-      });
+      };
     }
 
     let parsedUrl: URL;
     try {
       parsedUrl = new URL(url);
     } catch {
-      return res.status(400).json({
-        success: false,
-        error: `Invalid URL format: "${url}"`,
-      });
+      const invalidErr: any = new Error(`Invalid URL format: "${url}"`);
+      invalidErr.statusCode = 400;
+      throw invalidErr;
     }
 
-    // Save/mark URL object BEFORE starting processing (0 duplicate copies if it already exists)
-    upsertRegistryRecordByWebUrl(url, {
-      status: existingWebRecord?.status === 'forwarded' ? 'forwarded' : 'processing',
-      metadata: {
-        ...(existingWebRecord?.metadata || {}),
-        processingStartedAt: new Date().toISOString(),
-      },
-    });
+    const linkId = existingWebRecord?.id || getLinkUniqueId(url);
+    inFlightProcessingIds.add(linkId);
 
-    const startTime = Date.now();
-
-    // Fetch using axios with retry, non-keepalive agents, browser headers, and redirect tracking
-    const response = await axiosGetWithRetry(
-      url,
-      {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,video/*,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Accept-Encoding': 'gzip, deflate, br',
-          Referer: `${parsedUrl.origin}/`,
-          ...customHeaders,
+    try {
+      // Immediately mention in Cloudflare D1 database that a server has started working on this URL
+      const processingRecord = upsertRegistryRecordByWebUrl(url, {
+        status: 'processing',
+        metadata: {
+          ...(existingWebRecord?.metadata || {}),
+          workerServerId: SERVER_INSTANCE_ID,
+          workerHost: appBaseUrlOverride || req?.get('host') || os.hostname(),
+          processingStartedAt: new Date().toISOString(),
         },
-        timeout: 25000,
-        maxRedirects: 5,
-        responseType: 'text',
-        validateStatus: () => true, // Don't throw on 4xx/5xx so we can report status
-      },
-      3
-    );
+      });
+      await syncRegistryToStorage(req, [processingRecord]);
 
-    const responseTimeMs = Date.now() - startTime;
-    const contentType = String(response.headers['content-type'] || '');
-    const finalUrl = (response.request as any)?.res?.responseUrl || response.config?.url || url;
+      const startTime = Date.now();
+
+      // Fetch using multi-server pool + rotating UA + anti-rate-limit retry
+      const response = await axiosGetWithRetry(
+        url,
+        {
+          headers: {
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,video/*,*/*;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            Referer: `${parsedUrl.origin}/`,
+            ...customHeaders,
+          },
+          timeout: 25000,
+          maxRedirects: 5,
+          responseType: 'text',
+          validateStatus: () => true, // Inspect status explicitly so we can fail & clean up D1 cleanly
+        },
+        3,
+        extraServers
+      );
+
+      if (response.status >= 400) {
+        const httpErr: any = new Error(`Target website returned HTTP ${response.status} ${response.statusText || ''}`.trim());
+        httpErr.statusCode = response.status === 404 ? 404 : 502;
+        throw httpErr;
+      }
+
+      const responseTimeMs = Date.now() - startTime;
+      const contentType = String(response.headers['content-type'] || '');
+      const finalUrl = (response.request as any)?.res?.responseUrl || response.config?.url || url;
 
     // Helper to resolve relative URLs
     const resolveUrl = (relativeOrAbsolute: string) => {
@@ -3673,7 +5114,7 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
         });
       }
 
-      // Duration extraction from meta tags & HTML elements
+      // Duration extraction from meta tags, player JSON, & HTML elements
       if (!detectedDuration) {
         const metaDur =
           $('meta[itemprop="duration"]').attr('content') ||
@@ -3682,6 +5123,17 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
           $('meta[name="duration"]').attr('content');
         if (metaDur) {
           detectedDuration = parseDuration(metaDur);
+        }
+      }
+
+      // Check embedded player JSON (e.g. xplayerSettings / videoModel / playerConfig) before generic CSS badges
+      if (!detectedDuration && typeof response.data === 'string') {
+        const playerDurMatch =
+          response.data.match(/"(?:xplayerSettings|videoModel|playerConfig|videoInfo)"\s*:\s*\{[^{}]{0,500}"duration"\s*:\s*(\d{1,6})/i) ||
+          response.data.match(/"duration"\s*:\s*(\d{2,6})\s*,\s*"(?:debug|sources|fallbackImageClass|title|videoId)"/i);
+        if (playerDurMatch && playerDurMatch[1]) {
+          const p = parseDuration(Number(playerDurMatch[1]));
+          if (p) detectedDuration = p;
         }
       }
 
@@ -3890,16 +5342,22 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
       let cloudflareThumbnailUrl: string | null = null;
       let thumbnailStorageSource: 'cloudflare_r2' | 'emulator' | null = null;
 
-      // Sort video candidates so direct MP4/WebM/MOV streams come before .m3u8 playlists
-      const sortedVideoCandidates = Array.from(detectedVideosMap.values()).sort((a, b) => {
-        const score = (u: string) => {
-          const lower = u.toLowerCase();
-          if (/\.(mp4|webm|mov|mkv)(\?|$)/.test(lower)) return 0;
-          if (!lower.includes('.m3u8')) return 1;
-          return 2;
-        };
-        return score(a.url) - score(b.url);
-      });
+      // Filter out thumbnail/hover preview clips (e.g. thumb-v*.xhcdn.com/...t.av1.mp4) and rank real full videos first
+      const sortedVideoCandidates = Array.from(detectedVideosMap.values())
+        .filter((c) => !isPreviewVideoUrl(c.url))
+        .sort((a, b) => {
+          const score = (u: string) => {
+            const lower = u.toLowerCase();
+            if (/\.(mp4|webm|mov|mkv)(\?|$)/.test(lower)) {
+              if (/(1080p|720p|480p)/i.test(lower)) return 0;
+              if (/(144p|240p)/i.test(lower)) return 2;
+              return 1;
+            }
+            if (!lower.includes('.m3u8')) return 3;
+            return 4;
+          };
+          return score(a.url) - score(b.url);
+        });
 
       const firstVideoUrl = sortedVideoCandidates[0]?.url || '';
 
@@ -3914,8 +5372,13 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
         durationFormatted: detectedDuration?.formatted || '',
       });
 
-      // Automatically upload thumbnail to Cloudflare R2 if requested
-      if (uploadThumbnailToR2 && primaryThumbnail) {
+      let cloudflareVideoUrl: string | null = null;
+      let videoStorageSource: 'cloudflare_r2' | 'emulator' | null = null;
+      let uploadedSourceVideoUrl = firstVideoUrl;
+
+      // Run thumbnail R2 upload and video R2 download/upload IN PARALLEL so thumbnail upload adds 0ms wait time
+      const thumbUploadPromise = (async () => {
+        if (!uploadThumbnailToR2 || !primaryThumbnail) return;
         try {
           const r2Upload = await uploadImageToR2OrLocal({
             imageUrl: primaryThumbnail,
@@ -3923,6 +5386,8 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
             folderPrefix: 'thumbnails',
             refererUrl: finalUrl,
             req,
+            r2ConfigOverride,
+            appBaseUrlOverride,
           });
           cloudflareThumbnailUrl = r2Upload.cloudflareBackLink;
           thumbnailStorageSource = r2Upload.storageSource;
@@ -3934,14 +5399,17 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
         } catch (thumbErr) {
           console.warn('Auto upload of thumbnail to Cloudflare R2 failed:', formatCompactError(thumbErr));
         }
-      }
+      })();
 
-      let cloudflareVideoUrl: string | null = null;
-      let videoStorageSource: 'cloudflare_r2' | 'emulator' | null = null;
-      let uploadedSourceVideoUrl = firstVideoUrl;
+      let videoCompressionMeta: {
+        compressed: boolean;
+        quality?: VideoCompressionQuality;
+        originalSizeBytes?: number;
+        savedPercent?: number;
+      } | null = null;
 
-      // Automatically upload video stream to Cloudflare R2 if requested (trying up to 3 candidates if #0 fails)
-      if (uploadVideoToR2 && sortedVideoCandidates.length > 0) {
+      const videoUploadPromise = (async () => {
+        if (!uploadVideoToR2 || sortedVideoCandidates.length === 0) return;
         const candidatesToTry = sortedVideoCandidates.slice(0, 3);
         for (const candidate of candidatesToTry) {
           try {
@@ -3951,11 +5419,24 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
               folderPrefix: 'videos',
               refererUrl: finalUrl,
               req,
+              r2ConfigOverride,
+              appBaseUrlOverride,
+              minExpectedDurationSec: detectedDuration?.seconds || undefined,
+              compressVideo: Boolean(compressVideo),
+              compressionQuality: normalizeCompressionQuality(compressionQuality),
             });
             cloudflareVideoUrl = r2VideoUpload.cloudflareVideoBackLink;
             videoStorageSource = r2VideoUpload.storageSource;
             uploadedSourceVideoUrl = candidate.url;
-            // Authoritative video file size & duration from downloaded video + Cloudflare R2 HeadObject verification
+            if (r2VideoUpload.compressed) {
+              videoCompressionMeta = {
+                compressed: true,
+                quality: r2VideoUpload.compressionQuality,
+                originalSizeBytes: r2VideoUpload.originalSizeBytes,
+                savedPercent: r2VideoUpload.savedPercent,
+              };
+            }
+            // Authoritative video file size & duration from downloaded/compressed video + Cloudflare R2 HeadObject verification
             detectedVideoSize = {
               sizeBytes: r2VideoUpload.sizeBytes,
               sizeMb: r2VideoUpload.sizeMb,
@@ -3983,7 +5464,9 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
             console.warn('Auto upload of video to Cloudflare R2 failed:', formatCompactError(videoErr));
           }
         }
-      }
+      })();
+
+      await Promise.all([thumbUploadPromise, videoUploadPromise]);
 
       if (!detectedVideoSize && firstVideoUrl) {
         detectedVideoSize = await detectRemoteFileSize(firstVideoUrl, finalUrl);
@@ -3992,39 +5475,33 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
         detectedVideoSize = htmlSizeHint;
       }
 
-      // Map detected videos with duration, size, and cleaned titles
-      const detectedVideosList = await Promise.all(
-        sortedVideoCandidates.map(async (vItem, i) => {
-          const rawVTitle = vItem.title || rawPrimary;
-          const vClean = cleanTitleWithFilter(rawVTitle, wordsToRemove);
-          const isUploadedCandidate = Boolean(cloudflareVideoUrl && vItem.url === uploadedSourceVideoUrl);
-          let itemSize = isUploadedCandidate || i === 0 ? detectedVideoSize : null;
-          if (!itemSize && vItem.url) {
-            itemSize = await detectRemoteFileSize(vItem.url, finalUrl);
-          }
+      // Map detected videos (reuse detectedVideoSize without firing extra slow HEAD/Range probes on unused backup mirrors)
+      const detectedVideosList = sortedVideoCandidates.map((vItem, i) => {
+        const rawVTitle = vItem.title || rawPrimary;
+        const vClean = cleanTitleWithFilter(rawVTitle, wordsToRemove);
+        const isUploadedCandidate = Boolean(cloudflareVideoUrl && vItem.url === uploadedSourceVideoUrl);
+        const itemSize = isUploadedCandidate || i === 0 ? detectedVideoSize : null;
+        const resolvedItemVideoUrl = isUploadedCandidate && cloudflareVideoUrl ? cloudflareVideoUrl : vItem.url;
 
-          const resolvedItemVideoUrl = isUploadedCandidate && cloudflareVideoUrl ? cloudflareVideoUrl : vItem.url;
-
-          return {
-            id: i + 1,
-            url: resolvedItemVideoUrl,
-            originalVideoUrl: vItem.url,
-            cloudflareVideoUrl: isUploadedCandidate && cloudflareVideoUrl ? cloudflareVideoUrl : undefined,
-            poster: cloudflareThumbnailUrl || vItem.poster || primaryThumbnail || undefined,
-            title: vClean.cleaned,
-            rawTitle: rawVTitle,
-            type: vItem.type,
-            filename: vItem.url.split('/').pop()?.split('?')[0] || `video_${i + 1}`,
-            durationSec: detectedDuration?.seconds || null,
-            durationFormatted: detectedDuration?.formatted || null,
-            sizeBytes: itemSize?.sizeBytes || null,
-            sizeMb: itemSize?.sizeMb || null,
-            sizeFormatted: itemSize?.sizeFormatted || null,
-            description: detectedDescription || undefined,
-            cloudflareThumbnailUrl: cloudflareThumbnailUrl || undefined,
-          };
-        })
-      );
+        return {
+          id: i + 1,
+          url: resolvedItemVideoUrl,
+          originalVideoUrl: vItem.url,
+          cloudflareVideoUrl: isUploadedCandidate && cloudflareVideoUrl ? cloudflareVideoUrl : undefined,
+          poster: cloudflareThumbnailUrl || vItem.poster || primaryThumbnail || undefined,
+          title: vClean.cleaned,
+          rawTitle: rawVTitle,
+          type: vItem.type,
+          filename: vItem.url.split('/').pop()?.split('?')[0] || `video_${i + 1}`,
+          durationSec: detectedDuration?.seconds || null,
+          durationFormatted: detectedDuration?.formatted || null,
+          sizeBytes: itemSize?.sizeBytes || null,
+          sizeMb: itemSize?.sizeMb || null,
+          sizeFormatted: itemSize?.sizeFormatted || null,
+          description: detectedDescription || undefined,
+          cloudflareThumbnailUrl: cloudflareThumbnailUrl || undefined,
+        };
+      });
 
       pageData = {
         title: cleanedPrimary.cleaned,
@@ -4033,6 +5510,7 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
         durationSec: detectedDuration?.seconds || null,
         durationFormatted: detectedDuration?.formatted || null,
         videoSize: detectedVideoSize || null,
+        videoCompression: videoCompressionMeta,
         removedWords: cleanedPrimary.removedTerms,
         favicon,
         ogImage: primaryThumbnail,
@@ -4080,6 +5558,13 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
       let videoStorageSource: 'cloudflare_r2' | 'emulator' | null = null;
       let directDuration: { seconds: number; formatted: string } | null = null;
 
+      let videoCompressionMeta: {
+        compressed: boolean;
+        quality?: VideoCompressionQuality;
+        originalSizeBytes?: number;
+        savedPercent?: number;
+      } | null = null;
+
       if (uploadVideoToR2 && (contentType.includes('video') || contentType.includes('mpegurl') || /\.(mp4|m3u8|webm|mov|mkv)$/i.test(url))) {
         try {
           const r2DirectVideo = await uploadVideoToR2OrLocal({
@@ -4088,9 +5573,21 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
             folderPrefix: 'videos',
             refererUrl: url,
             req,
+            r2ConfigOverride,
+            appBaseUrlOverride,
+            compressVideo: Boolean(compressVideo),
+            compressionQuality: normalizeCompressionQuality(compressionQuality),
           });
           cloudflareVideoUrl = r2DirectVideo.cloudflareVideoBackLink;
           videoStorageSource = r2DirectVideo.storageSource;
+          if (r2DirectVideo.compressed) {
+            videoCompressionMeta = {
+              compressed: true,
+              quality: r2DirectVideo.compressionQuality,
+              originalSizeBytes: r2DirectVideo.originalSizeBytes,
+              savedPercent: r2DirectVideo.savedPercent,
+            };
+          }
           directSize = {
             sizeBytes: r2DirectVideo.sizeBytes,
             sizeMb: r2DirectVideo.sizeMb,
@@ -4114,6 +5611,7 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
         durationSec: directDuration?.seconds || null,
         durationFormatted: directDuration?.formatted || null,
         videoSize: directSize,
+        videoCompression: videoCompressionMeta,
         removedWords: cleanedDirect.removedTerms,
         favicon: `${parsedUrl.origin}/favicon.ico`,
         siteName: parsedUrl.hostname,
@@ -4162,8 +5660,43 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
     const primaryVideoObj =
       mediaData.videos?.find((v: any) => v.cloudflareVideoUrl) || mediaData.videos?.[0];
     const bestThumb = pageData.cloudflareThumbnailUrl || primaryVideoObj?.poster || pageData.ogImage || '';
-    const isNowUploaded = Boolean(pageData.cloudflareVideoUrl || pageData.cloudflareThumbnailUrl);
+    const hasExtractedVideo = Boolean(primaryVideoObj?.originalVideoUrl || primaryVideoObj?.url || pageData.cloudflareVideoUrl);
+    const videoUploadMissingWhenRequired = Boolean(uploadVideoToR2 && !pageData.cloudflareVideoUrl);
+    const scrapeFailedOrIncomplete = !hasExtractedVideo || videoUploadMissingWhenRequired;
 
+    if (scrapeFailedOrIncomplete) {
+      // Remove failed / incomplete URL from Cloudflare D1 links_registry so crashed/broken runs don't leave bad rows
+      await removeRegistryRecordByWebUrl(url, req);
+      return {
+        success: true,
+        status: response.status,
+        statusText: response.statusText || 'OK',
+        serverUsed: (response as any)._serverUsed || 'direct',
+        targetUrl: url,
+        finalUrl,
+        registryUniqueId: null,
+        registryRecord: null,
+        isRegisteredInCloudflare: false,
+        isUploadedToCloudflare: false,
+        responseTimeMs,
+        contentType,
+        headers: {
+          server: response.headers['server'] || null,
+          'content-type': response.headers['content-type'] || null,
+          'content-length': response.headers['content-length'] || null,
+          'cache-control': response.headers['cache-control'] || null,
+          date: response.headers['date'] || null,
+        },
+        page: pageData,
+        media: mediaData,
+        content: contentData,
+        fullHtml,
+        rawSnippet: fullHtml.substring(0, 3000),
+        htmlLength: rawHtmlString.length,
+      };
+    }
+
+    const isNowUploaded = Boolean(pageData.cloudflareVideoUrl || pageData.cloudflareThumbnailUrl);
     const savedRegistryRecord = upsertRegistryRecordByWebUrl(url, {
       title: pageData.title || 'Extracted Video',
       rawTitle: pageData.rawTitle || pageData.title,
@@ -4180,15 +5713,26 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
       sizeMb: pageData.videoSize?.sizeMb || primaryVideoObj?.sizeMb || undefined,
       sizeFormatted: pageData.videoSize?.sizeFormatted || primaryVideoObj?.sizeFormatted || '',
       status: isNowUploaded ? 'uploaded' : 'extracted',
+      metadata: {
+        ...(existingWebRecord?.metadata || {}),
+        workerServerId: SERVER_INSTANCE_ID,
+        serverUsed: (response as any)._serverUsed || 'direct',
+        completedAt: new Date().toISOString(),
+        videosExtractedCount: mediaData.videos?.length || 0,
+        candidateThumbnailsCount: pageData.candidateThumbnails?.length || 0,
+        finalUrl,
+        ...(pageData.videoCompression ? { videoCompression: pageData.videoCompression } : {}),
+      },
     });
 
-    // Sync updated record directly to ott-database (/api/links_registry)
+    // Sync complete record directly to ott-database (/api/links_registry)
     await syncRegistryToStorage(req, [savedRegistryRecord]);
 
-    return res.json({
+    return {
       success: true,
       status: response.status,
       statusText: response.statusText || 'OK',
+      serverUsed: (response as any)._serverUsed || 'direct',
       targetUrl: url,
       finalUrl,
       registryUniqueId: savedRegistryRecord.id,
@@ -4210,10 +5754,56 @@ app.post('/api/process-url', async (req: Request, res: Response) => {
       fullHtml,
       rawSnippet: fullHtml.substring(0, 3000),
       htmlLength: rawHtmlString.length,
+    };
+  } catch (scrapeErr: any) {
+    // Failure -> remove the URL from Cloudflare D1 links_registry & local cache
+    await removeRegistryRecordByWebUrl(url, req);
+    throw scrapeErr;
+  } finally {
+    inFlightProcessingIds.delete(linkId);
+  }
+}
+
+// Process & scrape input website URL in background using axios and cheerio
+app.post('/api/process-url', async (req: Request, res: Response) => {
+  try {
+    const {
+      url,
+      extractMedia = true,
+      customHeaders = {},
+      wordsToRemove = '',
+      uploadThumbnailToR2 = false,
+      uploadVideoToR2 = false,
+      compressVideo = false,
+      compressionQuality = 'balanced',
+      forceRefresh = false,
+      extraServers = [],
+    } = req.body;
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Target URL is required in request body { "url": "https://..." }',
+      });
+    }
+
+    const payload = await processUrlCore({
+      url,
+      extractMedia,
+      customHeaders,
+      wordsToRemove,
+      uploadThumbnailToR2,
+      uploadVideoToR2,
+      compressVideo: Boolean(compressVideo),
+      compressionQuality: normalizeCompressionQuality(compressionQuality),
+      forceRefresh,
+      req,
+      extraServers: Array.isArray(extraServers) ? extraServers : [],
     });
+
+    return res.json(payload);
   } catch (err: any) {
     console.error('URL processing error:', formatCompactError(err));
-    return res.status(500).json({
+    return res.status(err?.statusCode || 500).json({
       success: false,
       error: formatCompactError(err) || 'Failed to process website URL',
       details: err.code || err.name,
@@ -4229,16 +5819,41 @@ app.get('/api/system-resources', (_req: Request, res: Response) => {
     const { speedMhz, model } = getCpuClockSpeed();
     const speedFormatted = speedMhz >= 1000 ? `${(speedMhz / 1000).toFixed(2)} GHz` : `${Math.round(speedMhz)} MHz`;
 
-    // CPU utilization delta
-    const currentSnapshot = getCpuSnapshot();
-    if (prevCpuSnapshot) {
-      const diffTotal = currentSnapshot.total - prevCpuSnapshot.total;
-      const diffIdle = currentSnapshot.idle - prevCpuSnapshot.idle;
-      if (diffTotal > 0) {
-        lastCalculatedCpuPercent = Math.max(0, Math.min(100, Math.round(((diffTotal - diffIdle) / diffTotal) * 100)));
-      }
+    // CPU utilization delta (unified live sampler)
+    sampleLiveCpuPercent();
+
+    // Live Network RX/TX bandwidth calculation from /proc/net/dev
+    const currentNet = getLinuxNetworkSnapshot();
+    if (prevNetSnapshot && currentNet.time > prevNetSnapshot.time) {
+      const elapsedSec = Math.max(0.2, (currentNet.time - prevNetSnapshot.time) / 1000);
+      const rxDelta = Math.max(0, currentNet.rxBytes - prevNetSnapshot.rxBytes);
+      const txDelta = Math.max(0, currentNet.txBytes - prevNetSnapshot.txBytes);
+      const downloadBps = rxDelta / elapsedSec;
+      const uploadBps = txDelta / elapsedSec;
+      lastNetworkRates = {
+        interfaces: currentNet.interfaces,
+        downloadBps,
+        uploadBps,
+        downloadMbps: Number(((downloadBps * 8) / 1_000_000).toFixed(2)),
+        uploadMbps: Number(((uploadBps * 8) / 1_000_000).toFixed(2)),
+      };
+    } else if (currentNet.interfaces.length > 0) {
+      lastNetworkRates.interfaces = currentNet.interfaces;
     }
-    prevCpuSnapshot = currentSnapshot;
+    prevNetSnapshot = currentNet;
+
+    const nicMbps = getNicLinkSpeedMbps();
+    const connectionSpeedMbps = nicMbps || lastSpeedTestResult?.downloadMbps || null;
+    const connectionSpeedSource: 'nic' | 'speedtest' | 'untested' = nicMbps
+      ? 'nic'
+      : lastSpeedTestResult
+      ? 'speedtest'
+      : 'untested';
+    const totalActiveMbps = Number((lastNetworkRates.downloadMbps + lastNetworkRates.uploadMbps).toFixed(2));
+    const netUsagePercent =
+      connectionSpeedMbps && connectionSpeedMbps > 0
+        ? Math.min(100, Math.round((Math.max(lastNetworkRates.downloadMbps, lastNetworkRates.uploadMbps) / connectionSpeedMbps) * 100))
+        : null;
 
     // RAM statistics
     const totalMem = os.totalmem();
@@ -4265,35 +5880,35 @@ app.get('/api/system-resources', (_req: Request, res: Response) => {
       diskUsagePercent = 20;
     }
 
-    // Dynamic Worker Recommendation calculation (range: 1 - 20)
-    // Cores capacity: 2 workers per vCPU for network/I-O streaming tasks
-    const coreCapacity = Math.max(1, Math.min(20, coreCount * 2));
-    
-    // RAM capacity: ~250MB buffer per active video scraping/upload worker
+    // Dynamic Worker Recommendation calculation (range: 1 - 50)
+    // Network/TLS scraping & streaming is I/O-bound (~95% socket wait), so each vCPU can drive ~10 concurrent workers toward 70-80% core usage
+    const coreCapacity = Math.max(1, Math.min(50, coreCount * 10));
+
+    // RAM capacity: ~100MB buffer/process overhead per disk-streamed worker
     const freeRamMb = Math.round(freeMem / (1024 * 1024));
-    const ramCapacity = Math.max(1, Math.min(20, Math.floor(freeRamMb / 250)));
+    const ramCapacity = Math.max(1, Math.min(50, Math.floor(freeRamMb / 100)));
 
     let recommendedWorkers = Math.min(coreCapacity, ramCapacity);
 
-    // CPU load throttle safeguard
-    if (lastCalculatedCpuPercent > 80) {
-      recommendedWorkers = Math.max(1, recommendedWorkers - 2);
-    } else if (lastCalculatedCpuPercent > 60) {
-      recommendedWorkers = Math.max(1, recommendedWorkers - 1);
+    // CPU load target safeguard (~70-80% sweet spot)
+    if (lastCalculatedCpuPercent > 85) {
+      recommendedWorkers = Math.max(1, Math.round(recommendedWorkers * 0.6));
+    } else if (lastCalculatedCpuPercent > 75) {
+      recommendedWorkers = Math.max(1, Math.round(recommendedWorkers * 0.85));
     }
-    recommendedWorkers = Math.max(1, Math.min(20, recommendedWorkers));
+    recommendedWorkers = Math.max(1, Math.min(50, recommendedWorkers));
 
     let cpuStatus: 'healthy' | 'moderate' | 'high' = 'healthy';
-    if (lastCalculatedCpuPercent > 80) cpuStatus = 'high';
-    else if (lastCalculatedCpuPercent > 50) cpuStatus = 'moderate';
+    if (lastCalculatedCpuPercent > 85) cpuStatus = 'high';
+    else if (lastCalculatedCpuPercent > 65) cpuStatus = 'moderate';
 
     let ramStatus: 'healthy' | 'moderate' | 'low' = 'healthy';
     if (memUsagePercent > 85) ramStatus = 'low';
     else if (memUsagePercent > 65) ramStatus = 'moderate';
 
-    let reason = `${coreCount} vCPU(s) @ ${speedFormatted} with ${formatBytes(freeMem)} free RAM: ${recommendedWorkers} workers optimal for maximum throughput without memory thrashing.`;
+    let reason = `${coreCount} vCPU(s) @ ${speedFormatted} with ${formatBytes(freeMem)} free RAM: ${recommendedWorkers} async I/O workers recommended to push throughput toward 70-80% core utilization.`;
     if (cpuStatus === 'high') {
-      reason = `VPS CPU load is currently high (${lastCalculatedCpuPercent}%). Recommended ${recommendedWorkers} workers to prevent throttling.`;
+      reason = `VPS CPU load is high (${lastCalculatedCpuPercent}%). Throttled recommendation to ${recommendedWorkers} workers to keep headroom.`;
     } else if (ramStatus === 'low') {
       reason = `VPS RAM is constrained (${memUsagePercent}% used). Recommended ${recommendedWorkers} workers to avoid out-of-memory errors.`;
     }
@@ -4329,10 +5944,22 @@ app.get('/api/system-resources', (_req: Request, res: Response) => {
       },
       vpsRecommendation: {
         recommendedWorkers,
-        maxSafeWorkers: Math.min(20, coreCount * 2),
+        maxSafeWorkers: Math.min(50, coreCount * 12),
         currentCpuStatus: cpuStatus,
         currentRamStatus: ramStatus,
         reason,
+      },
+      network: {
+        interfaces: lastNetworkRates.interfaces,
+        downloadMbps: lastNetworkRates.downloadMbps,
+        uploadMbps: lastNetworkRates.uploadMbps,
+        totalActiveMbps,
+        downloadFormatted: `${lastNetworkRates.downloadMbps.toFixed(1)} Mbps (${formatBytes(lastNetworkRates.downloadBps)}/s)`,
+        uploadFormatted: `${lastNetworkRates.uploadMbps.toFixed(1)} Mbps (${formatBytes(lastNetworkRates.uploadBps)}/s)`,
+        connectionSpeedMbps,
+        connectionSpeedSource,
+        usagePercent: netUsagePercent,
+        lastSpeedTest: lastSpeedTestResult,
       },
       system: {
         uptimeSeconds: os.uptime(),
@@ -4350,6 +5977,162 @@ app.get('/api/system-resources', (_req: Request, res: Response) => {
     return res.status(500).json({
       error: 'Failed to read VPS telemetry',
       details: err.message,
+    });
+  }
+});
+
+// POST /api/network-speed-test - Measure real server connection download/upload speed (Cloudflare Edge)
+app.post('/api/network-speed-test', async (_req: Request, res: Response) => {
+  try {
+    const uaHeaders = {
+      'User-Agent': USER_AGENT_POOL[0],
+      Connection: 'close',
+    };
+
+    // 1. Latency check
+    const pingStart = Date.now();
+    await axios.get('https://speed.cloudflare.com/__down?bytes=1000', {
+      headers: uaHeaders,
+      timeout: 3500,
+      signal: AbortSignal.timeout(3500),
+    });
+    const latencyMs = Math.max(1, Date.now() - pingStart);
+
+    // 2. Download throughput check (5 MB)
+    const dlStart = Date.now();
+    const dlRes = await axios.get('https://speed.cloudflare.com/__down?bytes=5000000', {
+      headers: uaHeaders,
+      responseType: 'arraybuffer',
+      timeout: 5000,
+      signal: AbortSignal.timeout(5000),
+    });
+    const dlSecs = Math.max(0.05, (Date.now() - dlStart) / 1000);
+    const dlBytes = (dlRes.data as ArrayBuffer)?.byteLength || 5000000;
+    const downloadMbps = Number((((dlBytes * 8) / 1_000_000) / dlSecs).toFixed(1));
+
+    // 3. Upload throughput check (512 KB, bounded <= 4s)
+    let uploadMbps = 0;
+    try {
+      const upBuf = Buffer.alloc(512 * 1024, 65);
+      const upStart = Date.now();
+      await axios.post('https://speed.cloudflare.com/__up', upBuf, {
+        headers: {
+          ...uaHeaders,
+          'Content-Type': 'application/octet-stream',
+        },
+        timeout: 4000,
+        signal: AbortSignal.timeout(4000),
+        maxBodyLength: Infinity,
+      });
+      const upSecs = Math.max(0.05, (Date.now() - upStart) / 1000);
+      uploadMbps = Number((((upBuf.length * 8) / 1_000_000) / upSecs).toFixed(1));
+    } catch {}
+
+    lastSpeedTestResult = {
+      downloadMbps,
+      uploadMbps,
+      latencyMs,
+      testedAt: new Date().toISOString(),
+    };
+
+    return res.json({
+      success: true,
+      ...lastSpeedTestResult,
+    });
+  } catch (err: any) {
+    return res.status(502).json({
+      success: false,
+      error: `Speed test failed: ${formatCompactError(err)}`,
+    });
+  }
+});
+
+// POST /api/proxies/fetch-free - Fetch & live-verify public free HTTP/HTTPS proxies (bounded <= 7.5s)
+app.post('/api/proxies/fetch-free', async (req: Request, res: Response) => {
+  try {
+    const rawLimit = Math.max(3, Math.min(20, Number(req.body?.limit) || 8));
+    const candidates = new Set<string>();
+
+    const parseIpPortLines = (raw: string, maxTake = 20) => {
+      String(raw || '')
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter((s) => /^\d{1,3}(?:\.\d{1,3}){3}:\d{2,5}$/.test(s))
+        .slice(0, maxTake)
+        .forEach((hp) => candidates.add(`http://${hp}`));
+    };
+
+    // Fetch public free proxy feeds in parallel with strict 3s aborts
+    const [psFeed, gnFeed, ghFeed] = await Promise.allSettled([
+      axios.get(
+        'https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=yes&anonymity=all',
+        { timeout: 3000, signal: AbortSignal.timeout(3000), responseType: 'text' }
+      ),
+      axios.get(
+        'https://proxylist.geonode.com/api/proxy-list?limit=20&page=1&sort_by=lastChecked&sort_type=desc&protocols=http',
+        { timeout: 3000, signal: AbortSignal.timeout(3000) }
+      ),
+      axios.get('https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt', {
+        timeout: 3000,
+        signal: AbortSignal.timeout(3000),
+        responseType: 'text',
+      }),
+    ]);
+
+    if (psFeed.status === 'fulfilled') {
+      parseIpPortLines(psFeed.value.data, 15);
+    }
+    if (gnFeed.status === 'fulfilled') {
+      const list = Array.isArray(gnFeed.value.data?.data) ? gnFeed.value.data.data : [];
+      for (const item of list) {
+        if (item?.ip && item?.port) {
+          candidates.add(`http://${item.ip}:${item.port}`);
+        }
+      }
+    }
+    if (ghFeed.status === 'fulfilled') {
+      parseIpPortLines(ghFeed.value.data, 15);
+    }
+
+    const candidateList = Array.from(candidates).slice(0, 25);
+    if (candidateList.length === 0) {
+      return res.json({
+        success: true,
+        testedCount: 0,
+        workingCount: 0,
+        proxies: [],
+        message: 'Public proxy feeds returned no candidates right now. Deploy the free Cloudflare Worker relay instead.',
+      });
+    }
+
+    // Live-test HTTPS CONNECT tunnel with a strict 2.2s socket check and hard 4s batch deadline
+    const verified: Array<{ proxy: string; latencyMs: number }> = [];
+    const checkAll = Promise.all(
+      candidateList.map(async (proxyUrl) => {
+        const result = await testHttpsConnectProxy(proxyUrl, 2200);
+        if (result) verified.push(result);
+      })
+    );
+    await Promise.race([checkAll, sleepMs(4000)]);
+
+    verified.sort((a, b) => a.latencyMs - b.latencyMs);
+    const fastest = verified.slice(0, rawLimit);
+
+    return res.json({
+      success: true,
+      testedCount: candidateList.length,
+      workingCount: fastest.length,
+      proxies: fastest.map((v) => v.proxy),
+      details: fastest,
+      message:
+        fastest.length > 0
+          ? `Found ${fastest.length} live working HTTPS proxy(s) out of ${candidateList.length} tested.`
+          : `Tested ${candidateList.length} public free proxies, 0 passed live HTTPS CONNECT check (public free proxies are mostly dead/blocked — Cloudflare Workers relays are 100% free & reliable).`,
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      error: formatCompactError(err),
     });
   }
 });
@@ -4393,7 +6176,9 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on port ${PORT} (Cloudflare Worker D1: ${CF_WORKER_BASE_URL})`);
-    hydrateRegistryFromD1IfNeeded().catch(() => {});
+    hydrateRegistryFromD1IfNeeded()
+      .then(() => loadAndResumeVpsBatchJob())
+      .catch(() => {});
   });
 }
 

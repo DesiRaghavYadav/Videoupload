@@ -16,9 +16,11 @@ import {
   Layers,
   ArrowRight,
   FolderTree,
+  Pencil,
 } from 'lucide-react';
 import { ProcessedVideoResponse } from '../types';
 import { JsonObjectViewer } from './JsonObjectViewer';
+import { JsonObjectEditorModal } from './admin/JsonObjectEditorModal';
 import { formatBytes, formatDuration } from '../utils/formatters';
 
 interface ResultDisplayProps {
@@ -29,6 +31,7 @@ interface ResultDisplayProps {
   onNavigateToBatchVideo?: () => void;
   onNavigateToReels?: () => void;
   onNavigateToCategories?: () => void;
+  onUpdateRecord?: (id: string, updated: any) => Promise<void>;
 }
 
 export const ResultDisplay: React.FC<ResultDisplayProps> = ({
@@ -39,6 +42,7 @@ export const ResultDisplay: React.FC<ResultDisplayProps> = ({
   onNavigateToBatchVideo,
   onNavigateToReels,
   onNavigateToCategories,
+  onUpdateRecord,
 }) => {
   // If batchResults has multiple items, allow switching between viewing the whole batch vs single video
   const isBatch = Boolean(batchResults && batchResults.length > 1);
@@ -46,6 +50,7 @@ export const ResultDisplay: React.FC<ResultDisplayProps> = ({
   const [copiedVideoUrl, setCopiedVideoUrl] = useState(false);
   const [copiedThumbUrl, setCopiedThumbUrl] = useState(false);
   const [viewMode, setViewMode] = useState<'batch' | 'single'>(isBatch ? 'batch' : 'single');
+  const [isEditingObject, setIsEditingObject] = useState(false);
 
   const copyToClipboard = (text: string, type: 'video' | 'thumb') => {
     navigator.clipboard.writeText(text);
@@ -500,7 +505,7 @@ export const ResultDisplay: React.FC<ResultDisplayProps> = ({
 
           {/* Return Object View for Current Video */}
           <div className="space-y-3">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-3 flex-wrap">
               <div className="space-y-0.5">
                 <h3 className="text-base font-semibold text-white">
                   Individual Metadata Return Object
@@ -509,11 +514,37 @@ export const ResultDisplay: React.FC<ResultDisplayProps> = ({
                   Exact filename, duration, size, dimensions, and Cloudflare R2 URLs formatted in structured JSON object.
                 </p>
               </div>
+              {onUpdateRecord && (
+                <button
+                  type="button"
+                  onClick={() => setIsEditingObject(true)}
+                  className="px-3.5 py-1.5 bg-orange-500/15 hover:bg-orange-500/25 text-orange-300 border border-orange-500/30 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors"
+                >
+                  <Pencil className="w-3.5 h-3.5" />
+                  <span>Edit Return Object</span>
+                </button>
+              )}
             </div>
 
             <JsonObjectViewer data={activeItem} title={`resultObject (${metadata.exactFilename || metadata.filename})`} />
           </div>
         </div>
+      )}
+
+      {isEditingObject && onUpdateRecord && (
+        <JsonObjectEditorModal
+          isOpen={true}
+          title={`Edit Record Object: ${metadata.exactFilename || metadata.filename}`}
+          subtitle={`PATCH /api/videos/${activeItem.id}`}
+          initialData={activeItem}
+          accentColor="orange"
+          saveLabel="Save Record Changes"
+          onClose={() => setIsEditingObject(false)}
+          onSave={async (updatedObj) => {
+            await onUpdateRecord(activeItem.id, updatedObj);
+            setActiveItem(updatedObj);
+          }}
+        />
       )}
     </div>
   );

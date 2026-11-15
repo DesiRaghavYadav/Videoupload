@@ -17,6 +17,8 @@ import {
   Film,
   Calendar,
   Lock,
+  Pencil,
+  FileJson,
 } from 'lucide-react';
 import {
   AppOptimizedBatchDatabase,
@@ -25,6 +27,7 @@ import {
   SaveDatabaseResponse,
 } from '../types';
 import { JsonObjectViewer } from './JsonObjectViewer';
+import { JsonObjectEditorModal } from './admin/JsonObjectEditorModal';
 import {
   saveDatabaseToR2,
   fetchSavedDatabases,
@@ -169,6 +172,10 @@ export const AppDatabaseManager: React.FC<AppDatabaseManagerProps> = ({
   const [saveResult, setSaveResult] = useState<SaveDatabaseResponse | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [copiedDbUrl, setCopiedDbUrl] = useState(false);
+  const [editingJsonTarget, setEditingJsonTarget] = useState<{
+    mode: 'draft' | 'saved';
+    data: any;
+  } | null>(null);
 
   // Sync with recentUploads if user hasn't customized
   useEffect(() => {
@@ -669,12 +676,24 @@ export const AppDatabaseManager: React.FC<AppDatabaseManagerProps> = ({
           </div>
         </div>
 
-        {/* Right Column: JSON Object Viewer */}
+        {/* Right Column: JSON Object Viewer & Editor */}
         <div className="space-y-6">
-          <JsonObjectViewer
-            data={dbData}
-            title={`App-Optimized Schema: ${dbData.batchId || 'database'}.json`}
-          />
+          <div className="space-y-2">
+            <div className="flex items-center justify-end">
+              <button
+                type="button"
+                onClick={() => setEditingJsonTarget({ mode: 'draft', data: dbData })}
+                className="px-3 py-1.5 bg-orange-500/15 hover:bg-orange-500/25 text-orange-300 border border-orange-500/30 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors"
+              >
+                <Pencil className="w-3.5 h-3.5" />
+                <span>Edit Current JSON Object</span>
+              </button>
+            </div>
+            <JsonObjectViewer
+              data={dbData}
+              title={`App-Optimized Schema: ${dbData.batchId || 'database'}.json`}
+            />
+          </div>
 
           {/* Saved Cloudflare Databases List */}
           {savedBatches.length > 0 && (
@@ -693,7 +712,7 @@ export const AppDatabaseManager: React.FC<AppDatabaseManagerProps> = ({
                     key={b.batchId}
                     className="py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
                   >
-                    <div>
+                    <div className="min-w-0">
                       <div className="font-semibold text-white font-mono flex items-center gap-2">
                         <span>{b.batchId}</span>
                         <span className="text-[10px] text-slate-400 font-sans font-normal">
@@ -705,12 +724,45 @@ export const AppDatabaseManager: React.FC<AppDatabaseManagerProps> = ({
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2 shrink-0">
+                    <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDbData({
+                            batchId: b.batchId,
+                            title: b.title || '',
+                            description: b.description || '',
+                            imageUrl: b.imageUrl || '',
+                            category: b.category || 'Action & Drama',
+                            isPremium: Boolean(b.isPremium),
+                            releaseDate: Number(b.releaseDate) || Date.now(),
+                            totalVideos: Array.isArray(b.videos) ? b.videos.length : Number(b.totalVideos) || 0,
+                            videos: Array.isArray(b.videos) ? b.videos : [],
+                          });
+                          setUserEdited(true);
+                          setSaveResult(null);
+                          window.scrollTo({ top: 0, behavior: 'smooth' });
+                        }}
+                        className="px-2.5 py-1 text-[11px] font-medium text-orange-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 transition-colors flex items-center gap-1"
+                        title="Load manifest into form editor"
+                      >
+                        <Pencil className="w-3 h-3" />
+                        <span>Edit Form</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditingJsonTarget({ mode: 'saved', data: b })}
+                        className="px-2.5 py-1 text-[11px] font-medium text-emerald-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 transition-colors flex items-center gap-1"
+                        title="Edit saved JSON object directly & save to R2"
+                      >
+                        <FileJson className="w-3 h-3" />
+                        <span>Edit JSON</span>
+                      </button>
                       <a
                         href={b.r2DatabaseUrl}
                         target="_blank"
                         rel="noreferrer"
-                        className="px-2.5 py-1 text-[11px] font-medium text-orange-400 hover:text-white bg-slate-800 rounded-lg border border-slate-700 transition-colors flex items-center gap-1"
+                        className="px-2.5 py-1 text-[11px] font-medium text-slate-300 hover:text-white bg-slate-800 rounded-lg border border-slate-700 transition-colors flex items-center gap-1"
                       >
                         <span>Open JSON</span>
                         <ExternalLink className="w-3 h-3" />
@@ -730,6 +782,55 @@ export const AppDatabaseManager: React.FC<AppDatabaseManagerProps> = ({
           )}
         </div>
       </div>
+
+      {/* JSON Object Editor Modal for Draft & Saved R2 Databases */}
+      {editingJsonTarget && (
+        <JsonObjectEditorModal
+          isOpen={true}
+          title={
+            editingJsonTarget.mode === 'draft'
+              ? `Edit Manifest JSON: ${dbData.batchId || 'database'}`
+              : `Edit Persisted R2 Database: ${editingJsonTarget.data.batchId}`
+          }
+          subtitle={
+            editingJsonTarget.mode === 'draft'
+              ? 'Updates current form schema & optionally persists to Cloudflare R2'
+              : `POST /api/database/save · batchId: ${editingJsonTarget.data.batchId}`
+          }
+          initialData={editingJsonTarget.data}
+          accentColor="orange"
+          saveLabel={editingJsonTarget.mode === 'draft' ? 'Apply JSON Changes' : 'Save Updated JSON to R2'}
+          deleteLabel={editingJsonTarget.mode === 'saved' ? 'Delete Manifest' : undefined}
+          onClose={() => setEditingJsonTarget(null)}
+          onSave={async (updatedObj) => {
+            if (editingJsonTarget.mode === 'draft') {
+              setDbData({
+                batchId: updatedObj.batchId || dbData.batchId,
+                title: updatedObj.title || '',
+                description: updatedObj.description || '',
+                imageUrl: updatedObj.imageUrl || '',
+                category: updatedObj.category || 'Action & Drama',
+                isPremium: Boolean(updatedObj.isPremium),
+                releaseDate: Number(updatedObj.releaseDate) || Date.now(),
+                totalVideos: Array.isArray(updatedObj.videos) ? updatedObj.videos.length : Number(updatedObj.totalVideos) || 0,
+                videos: Array.isArray(updatedObj.videos) ? updatedObj.videos : [],
+              });
+              setUserEdited(true);
+            } else {
+              const result = await saveDatabaseToR2(updatedObj);
+              setSaveResult(result);
+              await loadSavedBatches();
+            }
+          }}
+          onDelete={
+            editingJsonTarget.mode === 'saved'
+              ? async () => {
+                  await handleDeleteBatch(editingJsonTarget.data.batchId);
+                }
+              : undefined
+          }
+        />
+      )}
     </div>
   );
 };

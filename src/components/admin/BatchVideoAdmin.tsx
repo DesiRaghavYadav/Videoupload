@@ -4,8 +4,10 @@ import {
   BatchVideoEpisode,
   uploadToCloudflare,
   fetchFromCloudflare,
+  deleteFromCloudflare,
   CF_WORKER_BASE_URL,
 } from '../../services/cloudflareWorkerApi';
+import { JsonObjectEditorModal } from './JsonObjectEditorModal';
 import { ProcessedVideoResponse } from '../../types';
 import { formatDurationHuman, formatSizeMb } from '../../utils/formatters';
 import {
@@ -26,6 +28,7 @@ import {
   CheckCircle2,
   ListVideo,
   FileJson,
+  Pencil,
 } from 'lucide-react';
 
 interface BatchVideoAdminProps {
@@ -780,17 +783,46 @@ export function BatchVideoAdmin({ recentR2Uploads = [] }: BatchVideoAdminProps) 
                       </div>
                     </div>
 
-                    <div className="pt-3 border-t border-slate-800/80 flex items-center justify-between text-xs text-slate-400">
+                    <div className="pt-3 border-t border-slate-800/80 flex items-center justify-between gap-2 text-xs text-slate-400">
                       <span className="font-medium text-slate-300">
                         {epCount} {epCount === 1 ? 'Episode' : 'Episodes'}
                       </span>
-                      <button
-                        onClick={() => setSelectedBatchDetails(batch)}
-                        className="text-orange-400 hover:text-orange-300 font-medium flex items-center gap-1 text-[11px]"
-                      >
-                        <Eye className="w-3.5 h-3.5" />
-                        Inspect Details
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setUserHasEdited(true);
+                            setSubmitResult(null);
+                            setFormData({
+                              batchId: batch.batchId || batch.id || '',
+                              title: batch.title || batch.name || '',
+                              description: batch.description || '',
+                              imageUrl: batch.imageUrl || '',
+                              category: batch.category || 'Web Series',
+                              isPremium: Boolean(batch.isPremium),
+                              releaseDate: Number(batch.releaseDate) || Date.now(),
+                              totalVideos: Array.isArray(batch.videos) ? batch.videos.length : Number(batch.totalVideos) || 0,
+                              videos: Array.isArray(batch.videos) ? batch.videos : [],
+                            });
+                            setActiveSubTab('create');
+                            window.scrollTo({ top: 0, behavior: 'smooth' });
+                          }}
+                          className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-orange-300 border border-slate-700 font-medium flex items-center gap-1 text-[11px] transition-colors"
+                          title="Load batch & episodes into form editor"
+                        >
+                          <Pencil className="w-3 h-3" />
+                          <span>Edit</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSelectedBatchDetails(batch)}
+                          className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-slate-700 font-medium flex items-center gap-1 text-[11px] transition-colors"
+                          title="Inspect & edit raw batch JSON object"
+                        >
+                          <FileJson className="w-3 h-3" />
+                          <span>Edit JSON</span>
+                        </button>
+                      </div>
                     </div>
                   </div>
                 );
@@ -800,28 +832,29 @@ export function BatchVideoAdmin({ recentR2Uploads = [] }: BatchVideoAdminProps) 
         </div>
       )}
 
-      {/* Detail Modal */}
+      {/* Editable Batch JSON Object Modal */}
       {selectedBatchDetails && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-2xl w-full max-h-[85vh] flex flex-col shadow-2xl">
-            <div className="p-4 border-b border-slate-800 flex items-center justify-between">
-              <h3 className="font-bold text-white text-sm">
-                Batch Record: {selectedBatchDetails.title}
-              </h3>
-              <button
-                onClick={() => setSelectedBatchDetails(null)}
-                className="text-slate-400 hover:text-white text-xs px-2 py-1 bg-slate-800 rounded"
-              >
-                Close
-              </button>
-            </div>
-            <div className="p-4 overflow-y-auto space-y-4 text-xs">
-              <pre className="p-3 bg-slate-950 rounded-xl font-mono text-emerald-400 text-xs overflow-x-auto">
-                {JSON.stringify(selectedBatchDetails, null, 2)}
-              </pre>
-            </div>
-          </div>
-        </div>
+        <JsonObjectEditorModal
+          isOpen={true}
+          title={`Edit Batch Object: ${selectedBatchDetails.title || selectedBatchDetails.batchId}`}
+          subtitle={`POST /api/batchvideo · batchId: ${selectedBatchDetails.batchId || selectedBatchDetails.id}`}
+          initialData={selectedBatchDetails}
+          accentColor="orange"
+          saveLabel="Save Batch to D1"
+          deleteLabel="Delete Batch"
+          onClose={() => setSelectedBatchDetails(null)}
+          onSave={async (updatedObj) => {
+            await uploadToCloudflare('batchvideo', updatedObj);
+            await loadExistingBatches();
+          }}
+          onDelete={async () => {
+            const targetId = selectedBatchDetails.batchId || selectedBatchDetails.id;
+            if (targetId) {
+              await deleteFromCloudflare('batchvideo', targetId);
+              await loadExistingBatches();
+            }
+          }}
+        />
       )}
     </div>
   );

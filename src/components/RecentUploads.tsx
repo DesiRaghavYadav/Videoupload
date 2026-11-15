@@ -1,19 +1,24 @@
-import React from 'react';
-import { Film, Camera, Copy, ExternalLink, Trash2, Calendar, ArrowUpRight } from 'lucide-react';
+import React, { useState } from 'react';
+import { Film, ExternalLink, Trash2, Pencil } from 'lucide-react';
 import { ProcessedVideoResponse } from '../types';
 import { formatDateTime } from '../utils/formatters';
+import { JsonObjectEditorModal } from './admin/JsonObjectEditorModal';
 
 interface RecentUploadsProps {
   records: ProcessedVideoResponse[];
   onSelectRecord: (record: ProcessedVideoResponse) => void;
   onDeleteRecord: (id: string) => void;
+  onUpdateRecord?: (id: string, updated: any) => Promise<void>;
 }
 
 export const RecentUploads: React.FC<RecentUploadsProps> = ({
   records,
   onSelectRecord,
   onDeleteRecord,
+  onUpdateRecord,
 }) => {
+  const [editingRecord, setEditingRecord] = useState<ProcessedVideoResponse | null>(null);
+
   if (records.length === 0) {
     return (
       <div className="p-12 text-center bg-slate-900/40 border border-slate-800 rounded-2xl">
@@ -32,7 +37,7 @@ export const RecentUploads: React.FC<RecentUploadsProps> = ({
         <h3 className="text-base font-semibold text-white">
           Processed Vault Records ({records.length})
         </h3>
-        <span className="text-xs text-slate-400">Click any card to inspect full metadata object</span>
+        <span className="text-xs text-slate-400">Click any card to inspect or edit full metadata object</span>
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -80,6 +85,17 @@ export const RecentUploads: React.FC<RecentUploadsProps> = ({
               </span>
 
               <div className="flex items-center gap-2" onClick={(e) => e.stopPropagation()}>
+                {onUpdateRecord && (
+                  <button
+                    type="button"
+                    onClick={() => setEditingRecord(rec)}
+                    className="p-1 text-slate-400 hover:text-orange-400 transition-colors flex items-center gap-1 text-[11px]"
+                    title="Edit record metadata object"
+                  >
+                    <Pencil className="w-3.5 h-3.5" />
+                    <span>Edit</span>
+                  </button>
+                )}
                 <a
                   href={rec.videoUrl}
                   target="_blank"
@@ -90,6 +106,7 @@ export const RecentUploads: React.FC<RecentUploadsProps> = ({
                   <ExternalLink className="w-3.5 h-3.5" />
                 </a>
                 <button
+                  type="button"
                   onClick={() => onDeleteRecord(rec.id)}
                   className="p-1 hover:text-rose-400 transition-colors"
                   title="Remove record"
@@ -101,6 +118,25 @@ export const RecentUploads: React.FC<RecentUploadsProps> = ({
           </div>
         ))}
       </div>
+
+      {editingRecord && onUpdateRecord && (
+        <JsonObjectEditorModal
+          isOpen={true}
+          title={`Edit Vault Record: ${editingRecord.metadata?.filename || editingRecord.id}`}
+          subtitle={`PATCH /api/videos/${editingRecord.id}`}
+          initialData={editingRecord}
+          accentColor="orange"
+          saveLabel="Save Record Changes"
+          deleteLabel="Delete Record"
+          onClose={() => setEditingRecord(null)}
+          onSave={async (updatedObj) => {
+            await onUpdateRecord(editingRecord.id, updatedObj);
+          }}
+          onDelete={async () => {
+            onDeleteRecord(editingRecord.id);
+          }}
+        />
+      )}
     </div>
   );
 };

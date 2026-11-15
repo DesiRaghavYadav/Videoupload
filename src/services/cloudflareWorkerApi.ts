@@ -410,3 +410,119 @@ export async function removeVideoFromCategory(
 
   return await uploadToCloudflare('video_categories', category);
 }
+
+/**
+ * Update metadata of a video category without losing its attached videos
+ */
+export async function updateCategory(
+  category: Partial<VideoCategory> & { id: string }
+): Promise<any> {
+  const payload: VideoCategory = {
+    id: category.id,
+    name: String(category.name || category.id).trim(),
+    isPortrait: Boolean(category.isPortrait),
+    type: String(category.type || 'video'),
+    videos: Array.isArray(category.videos) ? category.videos : [],
+    videosJson:
+      typeof category.videosJson === 'string' && !Array.isArray(category.videos)
+        ? category.videosJson
+        : JSON.stringify(Array.isArray(category.videos) ? category.videos : []),
+  };
+  return await uploadToCloudflare('video_categories', payload);
+}
+
+/**
+ * Update a single video inside an existing category and persist to Cloudflare D1
+ */
+export async function updateVideoInCategory(
+  categoryId: string,
+  videoId: number | string,
+  updates: Partial<VideoItem>
+): Promise<any> {
+  const categories = await getCategories();
+  const category = categories.find((c) => c.id === categoryId);
+  if (!category) throw new Error(`Category "${categoryId}" not found`);
+
+  let matched = false;
+  category.videos = category.videos.map((v) => {
+    if (String(v.id) === String(videoId)) {
+      matched = true;
+      return {
+        ...v,
+        ...updates,
+        id: updates.id !== undefined ? updates.id : v.id,
+      };
+    }
+    return v;
+  });
+
+  if (!matched) {
+    throw new Error(`Video ID "${videoId}" not found in category "${category.name}"`);
+  }
+
+  category.videosJson = JSON.stringify(category.videos);
+  return await uploadToCloudflare('video_categories', category);
+}
+
+/**
+ * Upsert / update any collection object on Cloudflare Worker REST API
+ */
+export async function updateInCloudflare<T = any>(
+  endpoint: string,
+  payload: any
+): Promise<T> {
+  return await uploadToCloudflare<T>(endpoint, payload);
+}
+
+/**
+ * Delete an item from a Cloudflare Worker REST API collection
+ * DELETE /api/<endpoint>/<id>
+ */
+export async function deleteFromCloudflare<T = any>(
+  endpoint: string,
+  id: string | number
+): Promise<T> {
+  const cleanEndpoint = endpoint.replace(/^\/+|\/+$/g, '').replace(/^api\//, '');
+  const encodedId = encodeURIComponent(String(id));
+  const url = `${CF_WORKER_BASE_URL}/api/${cleanEndpoint}/${encodedId}`;
+
+  const response = await fetch(url, {
+    method: 'DELETE',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Cloudflare DELETE failed (${response.status}): ${errorText}`);
+  }
+
+  return (await response.json()) as T;
+}
+
+export interface D1CollectionDescriptor {
+  id: string;
+  label: string;
+  description: string;
+  idField: string;
+  tab?: string;
+}
+
+export const ALL_D1_COLLECTIONS: D1CollectionDescriptor[] = [
+  { id: 'video_categories', label: 'Video Categories', description: 'Home Rails & Video Feeds', idField: 'id', tab: 'categories' },
+  { id: 'categories', label: 'Comic Categories', description: 'Categories & Comic Feeds', idField: 'id' },
+  { id: 'batchvideo', label: 'Batch Videos & Series', description: 'Multi-Episode OTT Batches', idField: 'batchId', tab: 'batchvideo' },
+  { id: 'reels', label: 'Short Reels', description: 'Vertical Video Clips', idField: 'id', tab: 'reels' },
+  { id: 'comics', label: 'Comics & Manga', description: 'Episodic Chapters & Pages', idField: 'id', tab: 'comics' },
+  { id: 'stories', label: 'Audio Stories', description: 'Narratives & Podcasts', idField: 'id', tab: 'stories' },
+  { id: 'channels', label: 'Live TV Channels', description: 'Streaming TV Feeds', idField: 'id', tab: 'channels' },
+  { id: 'links_registry', label: 'Extracted Links Registry', description: 'Tracked URLs & R2 Backlinks', idField: 'id', tab: 'webprocessor' },
+  { id: 'audio_batches', label: 'Audio Batches', description: 'Grouped Audio Collections', idField: '_id' },
+  { id: 'notifications', label: 'Notifications', description: 'App Push & Alert Payloads', idField: '_id' },
+  { id: 'fcm_history', label: 'FCM History', description: 'Sent Firebase Messaging Logs', idField: '_id' },
+  { id: 'ad_config', label: 'Ad Config', description: 'Monetization & Ad Unit Settings', idField: '_id' },
+  { id: 'version', label: 'App Version Config', description: 'Force Update & Release Config', idField: '_id' },
+  { id: 'userdata', label: 'User Data', description: 'Registered App User Profiles', idField: '_id' },
+];
+

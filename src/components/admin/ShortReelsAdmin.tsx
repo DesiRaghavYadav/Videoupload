@@ -3,8 +3,10 @@ import {
   ShortReelPayload,
   uploadToCloudflare,
   fetchFromCloudflare,
+  deleteFromCloudflare,
   CF_WORKER_BASE_URL,
 } from '../../services/cloudflareWorkerApi';
+import { JsonObjectEditorModal } from './JsonObjectEditorModal';
 import { ProcessedVideoResponse } from '../../types';
 import {
   PlaySquare,
@@ -20,6 +22,9 @@ import {
   ExternalLink,
   Play,
   Flame,
+  Pencil,
+  FileJson,
+  Trash2,
 } from 'lucide-react';
 
 interface ShortReelsAdminProps {
@@ -54,8 +59,9 @@ export function ShortReelsAdmin({ recentR2Uploads = [] }: ShortReelsAdminProps) 
   const [isLoadingReels, setIsLoadingReels] = useState(false);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
-  // Playing reel modal
+  // Playing reel modal & JSON object editor modal
   const [activeVideoModal, setActiveVideoModal] = useState<string | null>(null);
+  const [editingReelObj, setEditingReelObj] = useState<any | null>(null);
 
   const loadExistingReels = async () => {
     setIsLoadingReels(true);
@@ -467,16 +473,49 @@ export function ShortReelsAdmin({ recentR2Uploads = [] }: ShortReelsAdminProps) 
                     </div>
                   </div>
 
-                  <div className="p-2 border-t border-slate-800 flex items-center justify-between text-[10px] text-slate-500 font-mono">
+                  <div className="p-2 border-t border-slate-800 flex items-center justify-between gap-1 text-[10px] text-slate-500 font-mono">
                     <span>ID #{reel.id || idx + 1}</span>
-                    <a
-                      href={reel.videoUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-slate-400 hover:text-white"
-                    >
-                      <ExternalLink className="w-3 h-3" />
-                    </a>
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSubmitResult(null);
+                          setFormData({
+                            id: Number(reel.id) || Date.now(),
+                            title: reel.title || '',
+                            description: reel.description || '',
+                            imageUrl: reel.imageUrl || '',
+                            videoUrl: reel.videoUrl || '',
+                            likesCount: reel.likesCount || '0',
+                            isLiked: reel.isLiked ? 1 : 0,
+                            createdAt: Number(reel.createdAt) || Date.now(),
+                          });
+                          setActiveSubTab('create');
+                          window.scrollTo({ top: 0, behavior: 'smooth' });
+                        }}
+                        className="p-1 text-slate-400 hover:text-rose-300 transition-colors"
+                        title="Edit Reel in Form"
+                      >
+                        <Pencil className="w-3 h-3" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setEditingReelObj(reel)}
+                        className="p-1 text-slate-400 hover:text-emerald-300 transition-colors"
+                        title="Edit Reel JSON Object"
+                      >
+                        <FileJson className="w-3 h-3" />
+                      </button>
+                      <a
+                        href={reel.videoUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="p-1 text-slate-400 hover:text-white transition-colors"
+                        title="Open Video URL"
+                      >
+                        <ExternalLink className="w-3 h-3" />
+                      </a>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -508,6 +547,30 @@ export function ShortReelsAdmin({ recentR2Uploads = [] }: ShortReelsAdminProps) 
             </div>
           </div>
         </div>
+      )}
+
+      {/* Edit Reel Object Modal */}
+      {editingReelObj && (
+        <JsonObjectEditorModal
+          isOpen={true}
+          title={`Edit Reel: ${editingReelObj.title || editingReelObj.id}`}
+          subtitle={`POST /api/reels · ID: ${editingReelObj.id}`}
+          initialData={editingReelObj}
+          accentColor="rose"
+          saveLabel="Save Reel to D1"
+          deleteLabel="Delete Reel"
+          onClose={() => setEditingReelObj(null)}
+          onSave={async (updatedObj) => {
+            await uploadToCloudflare('reels', updatedObj);
+            await loadExistingReels();
+          }}
+          onDelete={async () => {
+            if (editingReelObj.id !== undefined) {
+              await deleteFromCloudflare('reels', editingReelObj.id);
+              await loadExistingReels();
+            }
+          }}
+        />
       )}
     </div>
   );
