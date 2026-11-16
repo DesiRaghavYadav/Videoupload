@@ -140,7 +140,9 @@ export const SchemaDocs: React.FC = () => {
       "category": "Action & Adventure",
       "isPremium": false,
       "rating": 4.8,
-      "likesCount": "24k"
+      "likesCount": "24k",
+      "durationSec": 1320,
+      "sizeKb": 45120
     }
   ]
 }`;

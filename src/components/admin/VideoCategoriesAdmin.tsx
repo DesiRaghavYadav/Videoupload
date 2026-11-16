@@ -11,6 +11,8 @@ import {
   updateVideoInCategory,
   deleteFromCloudflare,
   uploadToCloudflare,
+  resolveVideoDurationSec,
+  resolveVideoSizeKb,
   CF_WORKER_BASE_URL,
 } from '../../services/cloudflareWorkerApi';
 import { JsonObjectEditorModal } from './JsonObjectEditorModal';
@@ -54,6 +56,10 @@ interface VideoCategoriesAdminProps {
     isPremium?: boolean;
     rating?: number;
     likesCount?: string;
+    durationSec?: number;
+    sizeKb?: number;
+    sizeBytes?: number;
+    sizeFormatted?: string;
     categoryId?: string;
   } | null;
   prefilledBatchVideos?: Array<{
@@ -64,6 +70,10 @@ interface VideoCategoriesAdminProps {
     isPremium?: boolean;
     rating?: number;
     likesCount?: string;
+    durationSec?: number;
+    sizeKb?: number;
+    sizeBytes?: number;
+    sizeFormatted?: string;
   }> | null;
 }
 
@@ -100,6 +110,8 @@ export function VideoCategoriesAdmin({
     isPremium: boolean;
     rating: number;
     likesCount: string;
+    durationSec: number;
+    sizeKb: number;
     additionalCategoryIds: string[];
   }>({
     title: '',
@@ -109,6 +121,8 @@ export function VideoCategoriesAdmin({
     isPremium: false,
     rating: 4.8,
     likesCount: '12k',
+    durationSec: 0,
+    sizeKb: 0,
     additionalCategoryIds: [],
   });
 
@@ -123,6 +137,8 @@ export function VideoCategoriesAdmin({
       isPremium: boolean;
       rating: number;
       likesCount: string;
+      durationSec: number;
+      sizeKb: number;
     }>
   >([]);
 
@@ -182,6 +198,14 @@ export function VideoCategoriesAdmin({
         isPremium: prefilledVideo.isPremium !== undefined ? prefilledVideo.isPremium : prev.isPremium,
         rating: prefilledVideo.rating || prev.rating,
         likesCount: prefilledVideo.likesCount || prev.likesCount,
+        durationSec:
+          prefilledVideo.durationSec !== undefined ? resolveVideoDurationSec(prefilledVideo) : prev.durationSec,
+        sizeKb:
+          prefilledVideo.sizeKb !== undefined ||
+          prefilledVideo.sizeBytes !== undefined ||
+          prefilledVideo.sizeFormatted !== undefined
+            ? resolveVideoSizeKb(prefilledVideo)
+            : prev.sizeKb,
       }));
       if (prefilledVideo.categoryId) {
         setSelectedCategoryId(prefilledVideo.categoryId);
@@ -204,6 +228,8 @@ export function VideoCategoriesAdmin({
           isPremium: Boolean(v.isPremium),
           rating: v.rating || 4.8,
           likesCount: v.likesCount || '12k',
+          durationSec: resolveVideoDurationSec(v),
+          sizeKb: resolveVideoSizeKb(v),
         }))
       );
       setActiveTab('add-video');
@@ -233,6 +259,13 @@ export function VideoCategoriesAdmin({
       description: `Ingested from Cloudflare R2 Vault: ${record.metadata?.exactFilename || record.metadata?.filename}`,
       imageUrl: record.thumbnailUrl,
       reelsUrl: record.videoUrl,
+      durationSec: resolveVideoDurationSec({
+        durationSec: record.durationSec ?? record.metadata?.durationSec ?? record.metadata?.duration,
+      }),
+      sizeKb: resolveVideoSizeKb({
+        fileSize: record.metadata?.fileSize,
+        sizeMb: record.sizeMb ?? record.metadata?.sizeMb,
+      }),
     }));
   };
 
@@ -258,6 +291,13 @@ export function VideoCategoriesAdmin({
         isPremium: false,
         rating: 4.8,
         likesCount: `${(Math.random() * 15 + 5).toFixed(1)}k`,
+        durationSec: resolveVideoDurationSec({
+          durationSec: rec.durationSec ?? rec.metadata?.durationSec ?? rec.metadata?.duration,
+        }),
+        sizeKb: resolveVideoSizeKb({
+          fileSize: rec.metadata?.fileSize,
+          sizeMb: rec.sizeMb ?? rec.metadata?.sizeMb,
+        }),
       };
     });
 
@@ -278,6 +318,8 @@ export function VideoCategoriesAdmin({
         isPremium: false,
         rating: 4.5,
         likesCount: '2.5k',
+        durationSec: 0,
+        sizeKb: 0,
       },
     ]);
   };
@@ -389,6 +431,8 @@ export function VideoCategoriesAdmin({
           isPremium: false,
           rating: 4.8,
           likesCount: '12k',
+          durationSec: 0,
+          sizeKb: 0,
           additionalCategoryIds: [],
         });
       }
@@ -1062,6 +1106,49 @@ export function VideoCategoriesAdmin({
                     </div>
                   </div>
 
+                  {/* Time in Seconds & Size in KB */}
+                  <div className="space-y-1.5">
+                    <label className="text-slate-300 font-semibold flex items-center justify-between">
+                      <span>Duration in Seconds (durationSec)</span>
+                      <span className="text-slate-500 font-normal font-mono text-[10px]">seconds</span>
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={singleVideo.durationSec}
+                      onChange={(e) =>
+                        setSingleVideo({
+                          ...singleVideo,
+                          durationSec: Math.max(0, Math.round(Number(e.target.value) || 0)),
+                        })
+                      }
+                      placeholder="e.g. 1320"
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 focus:border-yellow-500 rounded-xl text-slate-100 font-mono text-xs outline-none"
+                    />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-slate-300 font-semibold flex items-center justify-between">
+                      <span>File Size in KB (sizeKb)</span>
+                      <span className="text-slate-500 font-normal font-mono text-[10px]">kilobytes</span>
+                    </label>
+                    <input
+                      type="number"
+                      min="0"
+                      step="1"
+                      value={singleVideo.sizeKb}
+                      onChange={(e) =>
+                        setSingleVideo({
+                          ...singleVideo,
+                          sizeKb: Math.max(0, Math.round(Number(e.target.value) || 0)),
+                        })
+                      }
+                      placeholder="e.g. 45120"
+                      className="w-full px-3 py-2 bg-slate-950 border border-slate-800 focus:border-yellow-500 rounded-xl text-slate-100 font-mono text-xs outline-none"
+                    />
+                  </div>
+
                   <div className="md:col-span-2 pt-2">
                     <label className="flex items-center gap-3 p-3 rounded-xl bg-slate-950 border border-slate-800 cursor-pointer hover:border-slate-700 transition-colors">
                       <input
@@ -1255,7 +1342,7 @@ export function VideoCategoriesAdmin({
                           />
                         </div>
 
-                        <div className="flex items-center gap-3 pt-4">
+                        <div className="flex flex-wrap items-center gap-3 pt-4">
                           <label className="flex items-center gap-1.5 cursor-pointer text-slate-300">
                             <input
                               type="checkbox"
@@ -1288,6 +1375,36 @@ export function VideoCategoriesAdmin({
                               value={video.likesCount}
                               onChange={(e) => handleBatchRowChange(idx, 'likesCount', e.target.value)}
                               className="w-14 px-1.5 py-0.5 bg-slate-900 border border-slate-800 rounded text-center text-xs"
+                            />
+                          </div>
+
+                          <div className="flex items-center gap-1 text-[11px] text-slate-400">
+                            <span>Sec:</span>
+                            <input
+                              type="number"
+                              min="0"
+                              step="1"
+                              value={video.durationSec}
+                              onChange={(e) =>
+                                handleBatchRowChange(idx, 'durationSec', Math.max(0, Math.round(Number(e.target.value) || 0)))
+                              }
+                              title="Duration in seconds (durationSec)"
+                              className="w-16 px-1.5 py-0.5 bg-slate-900 border border-slate-800 rounded text-center font-mono text-xs text-cyan-300"
+                            />
+                          </div>
+
+                          <div className="flex items-center gap-1 text-[11px] text-slate-400">
+                            <span>KB:</span>
+                            <input
+                              type="number"
+                              min="0"
+                              step="1"
+                              value={video.sizeKb}
+                              onChange={(e) =>
+                                handleBatchRowChange(idx, 'sizeKb', Math.max(0, Math.round(Number(e.target.value) || 0)))
+                              }
+                              title="Size in kilobytes (sizeKb)"
+                              className="w-20 px-1.5 py-0.5 bg-slate-900 border border-slate-800 rounded text-center font-mono text-xs text-emerald-300"
                             />
                           </div>
                         </div>
@@ -1528,6 +1645,20 @@ export function VideoCategoriesAdmin({
                                   {v.description}
                                 </p>
                               )}
+                              {(v.durationSec !== undefined || v.sizeKb !== undefined) && (
+                                <div className="flex items-center gap-2 mt-1.5 text-[10px] font-mono text-slate-400">
+                                  {v.durationSec !== undefined && (
+                                    <span className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-cyan-300">
+                                      {v.durationSec}s
+                                    </span>
+                                  )}
+                                  {v.sizeKb !== undefined && (
+                                    <span className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-emerald-300">
+                                      {Number(v.sizeKb).toLocaleString()} KB
+                                    </span>
+                                  )}
+                                </div>
+                              )}
                             </div>
 
                             <div className="pt-2 border-t border-slate-900 flex items-center justify-between text-[10px] text-slate-500">
@@ -1622,7 +1753,11 @@ export function VideoCategoriesAdmin({
           isOpen={true}
           title={`Edit Video: ${editingVideoTarget.video.title}`}
           subtitle={`Category: ${editingVideoTarget.categoryName} (${editingVideoTarget.categoryId}) · Video ID: ${editingVideoTarget.video.id}`}
-          initialData={editingVideoTarget.video}
+          initialData={{
+            durationSec: editingVideoTarget.video.durationSec ?? 0,
+            sizeKb: editingVideoTarget.video.sizeKb ?? 0,
+            ...editingVideoTarget.video,
+          }}
           accentColor="yellow"
           saveLabel="Update Video in Category"
           deleteLabel="Remove from Category"

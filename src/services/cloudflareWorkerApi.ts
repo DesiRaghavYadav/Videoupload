@@ -93,7 +93,58 @@ export interface VideoItem {
   isPremium: boolean;
   rating: number;
   likesCount: string;
+  durationSec?: number;
+  sizeKb?: number;
   [key: string]: any;
+}
+
+export function resolveVideoDurationSec(video: any): number {
+  if (!video || typeof video !== 'object') return 0;
+  const direct = video.durationSec ?? video.durationSeconds;
+  if (direct !== undefined && direct !== null && !isNaN(Number(direct)) && Number(direct) >= 0) {
+    return Math.round(Number(direct));
+  }
+  if (typeof video.duration === 'number' && !isNaN(video.duration) && video.duration >= 0) {
+    return Math.round(video.duration);
+  }
+  if (typeof video.duration === 'string' && video.duration.includes(':')) {
+    const parts = video.duration.trim().split(':').map((p: string) => Number(p));
+    if (parts.every((n: number) => !isNaN(n))) {
+      if (parts.length === 3) return Math.round(parts[0] * 3600 + parts[1] * 60 + parts[2]);
+      if (parts.length === 2) return Math.round(parts[0] * 60 + parts[1]);
+    }
+  }
+  return 0;
+}
+
+export function resolveVideoSizeKb(video: any): number {
+  if (!video || typeof video !== 'object') return 0;
+  const directKb = video.sizeKb ?? video.sizeKB ?? video.size_kb;
+  if (directKb !== undefined && directKb !== null && !isNaN(Number(directKb)) && Number(directKb) >= 0) {
+    return Math.round(Number(directKb));
+  }
+  const bytes = video.sizeBytes ?? video.fileSize ?? video.metadata?.fileSize;
+  if (bytes !== undefined && bytes !== null && !isNaN(Number(bytes)) && Number(bytes) > 0) {
+    return Math.max(1, Math.round(Number(bytes) / 1024));
+  }
+  const mb = video.sizeMb;
+  if (mb !== undefined && mb !== null && !isNaN(Number(mb)) && Number(mb) > 0) {
+    return Math.max(1, Math.round(Number(mb) * 1024));
+  }
+  if (typeof video.sizeFormatted === 'string' && video.sizeFormatted.trim()) {
+    const match = video.sizeFormatted.trim().match(/^([\d.]+)\s*(gb|mb|kb|b)/i);
+    if (match) {
+      const val = parseFloat(match[1]);
+      const unit = match[2].toLowerCase();
+      if (!isNaN(val) && val > 0) {
+        if (unit === 'gb') return Math.round(val * 1024 * 1024);
+        if (unit === 'mb') return Math.round(val * 1024);
+        if (unit === 'kb') return Math.round(val);
+        if (unit === 'b') return Math.max(1, Math.round(val / 1024));
+      }
+    }
+  }
+  return 0;
 }
 
 export interface VideoCategory {
@@ -290,6 +341,8 @@ export async function addVideoToCategory(
     isPremium: Boolean(newVideo.isPremium),
     rating: Number(newVideo.rating) || 4.5,
     likesCount: newVideo.likesCount || '1.5k',
+    durationSec: resolveVideoDurationSec(newVideo),
+    sizeKb: resolveVideoSizeKb(newVideo),
   };
 
   category.videos = [...category.videos, videoItem];
@@ -371,6 +424,8 @@ export async function addBatchVideosToCategory(
       isPremium: Boolean(item.isPremium),
       rating: Number(item.rating) || 4.5,
       likesCount: item.likesCount || '2.4k',
+      durationSec: resolveVideoDurationSec(item),
+      sizeKb: resolveVideoSizeKb(item),
     });
   });
 
@@ -417,16 +472,24 @@ export async function removeVideoFromCategory(
 export async function updateCategory(
   category: Partial<VideoCategory> & { id: string }
 ): Promise<any> {
+  const normalizedVideos: VideoItem[] = Array.isArray(category.videos)
+    ? category.videos.map((v) => ({
+        ...v,
+        durationSec: resolveVideoDurationSec(v),
+        sizeKb: resolveVideoSizeKb(v),
+      }))
+    : [];
+
   const payload: VideoCategory = {
     id: category.id,
     name: String(category.name || category.id).trim(),
     isPortrait: Boolean(category.isPortrait),
     type: String(category.type || 'video'),
-    videos: Array.isArray(category.videos) ? category.videos : [],
+    videos: normalizedVideos,
     videosJson:
       typeof category.videosJson === 'string' && !Array.isArray(category.videos)
         ? category.videosJson
-        : JSON.stringify(Array.isArray(category.videos) ? category.videos : []),
+        : JSON.stringify(normalizedVideos),
   };
   return await uploadToCloudflare('video_categories', payload);
 }
@@ -447,10 +510,15 @@ export async function updateVideoInCategory(
   category.videos = category.videos.map((v) => {
     if (String(v.id) === String(videoId)) {
       matched = true;
-      return {
+      const merged = {
         ...v,
         ...updates,
         id: updates.id !== undefined ? updates.id : v.id,
+      };
+      return {
+        ...merged,
+        durationSec: resolveVideoDurationSec(merged),
+        sizeKb: resolveVideoSizeKb(merged),
       };
     }
     return v;

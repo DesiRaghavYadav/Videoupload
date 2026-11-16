@@ -41,6 +41,10 @@ import {
   ShieldCheck,
   Zap,
   Pencil,
+  Plus,
+  Square,
+  ArrowUpRight,
+  Settings2,
 } from 'lucide-react';
 import { AppTabType } from './Header';
 import { getR2Headers } from '../utils/r2Service';
@@ -83,6 +87,8 @@ export interface ProcessedWebResult {
   registryUniqueId?: string;
   isRegisteredInCloudflare?: boolean;
   isUploadedToCloudflare?: boolean;
+  videoUploadError?: string | null;
+  thumbUploadError?: string | null;
   status: number;
   statusText: string;
   targetUrl: string;
@@ -107,6 +113,8 @@ export interface ProcessedWebResult {
     thumbnailStorageSource?: 'cloudflare_r2' | 'emulator' | null;
     cloudflareVideoUrl?: string | null;
     videoStorageSource?: 'cloudflare_r2' | 'emulator' | null;
+    videoUploadError?: string | null;
+    thumbUploadError?: string | null;
     ogVideo: string;
     siteName: string;
     canonical?: string;
@@ -189,6 +197,8 @@ export interface BatchQueueItem {
   durationFormatted?: string;
   durationSec?: number | null;
   sizeFormatted?: string;
+  sizeBytes?: number | null;
+  sizeKb?: number | null;
   description?: string;
   isRegisteredInCloudflare?: boolean;
   destination?: string;
@@ -196,6 +206,42 @@ export interface BatchQueueItem {
   registryUniqueId?: string;
   attempts?: number;
   serverUsed?: string;
+  queueId?: string;
+}
+
+export type BatchQueueStatus = 'queued' | 'running' | 'paused' | 'stopped' | 'completed';
+
+export interface BatchQueueOptions {
+  batchSkipMode: BatchSkipMode;
+  wordsToRemove: string;
+  uploadThumbnailToR2: boolean;
+  uploadVideoToR2: boolean;
+  compressVideo: boolean;
+  compressionQuality: VideoCompressionQuality;
+  autoRetryIncomplete: boolean;
+  maxAutoRetryPasses: number;
+  serverPool: string[];
+}
+
+export interface BatchQueueGroup {
+  queueId: string;
+  queueNumber: number;
+  name: string;
+  status: BatchQueueStatus;
+  options: BatchQueueOptions;
+  total: number;
+  completed: number;
+  skipped: number;
+  errors: number;
+  incompleteCount: number;
+  activeWorkers: number;
+  currentPass: number;
+  statusMessage?: string;
+  createdAt?: string;
+  startedAt?: string;
+  endTime?: string;
+  lastUpdatedAt?: string;
+  tasks: BatchQueueItem[];
 }
 
 // Case-insensitive title word removal and bracket/separator normalization
@@ -323,6 +369,7 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
   const [activeDurationFormatted, setActiveDurationFormatted] = useState('');
   const [activeDurationSec, setActiveDurationSec] = useState<number | null>(null);
   const [activeVideoSize, setActiveVideoSize] = useState('');
+  const [activeVideoSizeBytes, setActiveVideoSizeBytes] = useState<number | null>(null);
   const [activeCompressionInfo, setActiveCompressionInfo] = useState<{
     compressed: boolean;
     quality?: VideoCompressionQuality;
@@ -331,10 +378,18 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
   } | null>(null);
   const [showRawComparison, setShowRawComparison] = useState(false);
 
-  // Multi-Link Batch Queue state & VPS Multi-Worker Concurrency (1 - 20)
+  // Multi-Link Multi-Queue State & VPS Multi-Worker Concurrency (1 - 50)
   const [batchRawText, setBatchRawText] = useState('');
+  const [draftQueueName, setDraftQueueName] = useState('');
   const [batchQueue, setBatchQueue] = useState<BatchQueueItem[]>([]);
-  const [concurrency, setConcurrency] = useState<number>(externalConcurrency ?? 3); // 1 - 20 workers
+  const [queues, setQueues] = useState<BatchQueueGroup[]>([]);
+  const [selectedQueueId, setSelectedQueueId] = useState<string | null>(null);
+  const [batchUploadVideoToR2, setBatchUploadVideoToR2] = useState<boolean>(true);
+  const [batchUploadThumbnailToR2, setBatchUploadThumbnailToR2] = useState<boolean>(true);
+  const [showQueueOptionsEditor, setShowQueueOptionsEditor] = useState<boolean>(false);
+  const [isUpdatingQueueOpts, setIsUpdatingQueueOpts] = useState<boolean>(false);
+  const [queueEditDraft, setQueueEditDraft] = useState<BatchQueueOptions | null>(null);
+  const [concurrency, setConcurrency] = useState<number>(externalConcurrency ?? 3); // 1 - 50 workers
 
   // Dynamic concurrency refs for live scaling during active runs
   const concurrencyRef = useRef<number>(externalConcurrency ?? 3);
@@ -407,6 +462,13 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
     activeCompressions?: number;
     currentCpuPercent?: number;
   } | null>(null);
+  const [vpsScopeInfo, setVpsScopeInfo] = useState<{
+    scopeId: string;
+    scopeSlug: string;
+    scopeLabel: string;
+    d1DocId: string;
+    source: string;
+  } | null>(null);
   const [singleRegistryRecord, setSingleRegistryRecord] = useState<any | null>(null);
   const [editingRegistryRecord, setEditingRegistryRecord] = useState<any | null>(null);
   const pauseRef = useRef(false);
@@ -415,41 +477,98 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
   onBatchProgressUpdateRef.current = onBatchProgressUpdate;
   const lastBroadcastRef = useRef<string>('');
 
-  const applyServerBatchJob = (job: any, switchToBatchIfRunning = false) => {
-    if (!job || !Array.isArray(job.tasks)) return;
-    setBatchQueue(job.tasks);
+  const selectedQueue = useMemo(() => {
+    if (queues.length === 0) return null;
+    return queues.find((q) => q.queueId === selectedQueueId) || queues[0] || null;
+  }, [queues, selectedQueueId]);
+
+  const displayedBatchTasks = useMemo(() => {
+    if (selectedQueue) return selectedQueue.tasks || [];
+    return batchQueue;
+  }, [selectedQueue, batchQueue]);
+
+  // Sync live queue editor draft whenever selected queue switches (unless user is actively editing)
+  useEffect(() => {
+    if (selectedQueue && !showQueueOptionsEditor) {
+      setQueueEditDraft({ ...selectedQueue.options });
+    }
+  }, [selectedQueue?.queueId, showQueueOptionsEditor]);
+
+  const applyServerBatchJob = (job: any, switchToBatchIfRunning = false, preferredSelectQueueId?: string) => {
+    if (!job) {
+      setQueues([]);
+      setBatchQueue([]);
+      setIsBatchRunning(false);
+      setIsBatchPaused(false);
+      setActiveWorkers(0);
+      setServerJobPass(null);
+      return;
+    }
+
+    const incomingQueues: BatchQueueGroup[] = Array.isArray(job.queues)
+      ? job.queues
+      : Array.isArray(job.tasks) && job.tasks.length > 0
+      ? [
+          {
+            queueId: job.jobId || 'q_1',
+            queueNumber: 1,
+            name: 'Queue #1',
+            status: job.isPaused ? 'paused' : job.isRunning ? 'running' : 'completed',
+            options: {
+              batchSkipMode: job.batchSkipMode || 'smart_cache',
+              wordsToRemove: job.wordsToRemove || '',
+              uploadThumbnailToR2: job.uploadThumbnailToR2 ?? true,
+              uploadVideoToR2: job.uploadVideoToR2 ?? true,
+              compressVideo: Boolean(job.compressVideo),
+              compressionQuality: job.compressionQuality || 'balanced',
+              autoRetryIncomplete: job.autoRetryIncomplete ?? true,
+              maxAutoRetryPasses: Number(job.maxAutoRetryPasses ?? 3),
+              serverPool: Array.isArray(job.serverPool) ? job.serverPool : [],
+            },
+            total: job.tasks.length,
+            completed: Number(job.completed || 0),
+            skipped: Number(job.skipped || 0),
+            errors: Number(job.errors || 0),
+            incompleteCount: Number(job.incompleteCount || 0),
+            activeWorkers: Number(job.activeWorkers || 0),
+            currentPass: Number(job.currentPass || 1),
+            statusMessage: job.statusMessage || '',
+            tasks: job.tasks,
+          },
+        ]
+      : [];
+
+    setQueues(incomingQueues);
+    const activeQ =
+      (preferredSelectQueueId && incomingQueues.find((q) => q.queueId === preferredSelectQueueId)) ||
+      (selectedQueueId && incomingQueues.find((q) => q.queueId === selectedQueueId)) ||
+      incomingQueues.find((q) => q.queueId === job.activeQueueId) ||
+      incomingQueues[0] ||
+      null;
+
+    if (preferredSelectQueueId) {
+      setSelectedQueueId(preferredSelectQueueId);
+    } else if (activeQ && (!selectedQueueId || !incomingQueues.some((q) => q.queueId === selectedQueueId))) {
+      setSelectedQueueId(activeQ.queueId);
+    }
+
+    setBatchQueue(activeQ?.tasks || (Array.isArray(job.tasks) ? job.tasks : []));
     setIsBatchRunning(Boolean(job.isRunning));
     setIsBatchPaused(Boolean(job.isPaused));
     setActiveWorkers(Number(job.activeWorkers || 0));
     setServerJobPass({
-      current: Number(job.currentPass || 1),
-      max: 1 + Number(job.maxAutoRetryPasses || 0),
-      message: job.statusMessage || '',
+      current: Number(activeQ?.currentPass || job.currentPass || 1),
+      max: 1 + Number(activeQ?.options?.maxAutoRetryPasses ?? job.maxAutoRetryPasses ?? 0),
+      message: job.statusMessage || activeQ?.statusMessage || '',
       incompleteCount: Number(job.incompleteCount || 0),
       pausedForLoadCount: Number(job.pausedForLoadCount || 0),
       activeCompressions: Number(job.activeCompressions || 0),
       currentCpuPercent: typeof job.currentCpuPercent === 'number' ? job.currentCpuPercent : undefined,
     });
+
     if (typeof job.concurrency === 'number' && job.concurrency >= 1 && job.concurrency <= 50) {
       setConcurrency(job.concurrency);
       concurrencyRef.current = job.concurrency;
-    }
-    if (typeof job.autoRetryIncomplete === 'boolean') {
-      setAutoRetryIncomplete(job.autoRetryIncomplete);
-    }
-    if (typeof job.maxAutoRetryPasses === 'number') {
-      setMaxAutoRetryPasses(job.maxAutoRetryPasses);
-    }
-    if (typeof job.compressVideo === 'boolean') {
-      setCompressVideo(job.compressVideo);
-    }
-    if (
-      job.compressionQuality === 'high' ||
-      job.compressionQuality === 'balanced' ||
-      job.compressionQuality === 'compact' ||
-      job.compressionQuality === 'low'
-    ) {
-      setCompressionQuality(job.compressionQuality);
     }
     if (Array.isArray(job.serverPool) && job.serverPool.length > 0 && !serverPoolText.trim()) {
       setServerPoolText(job.serverPool.join('\n'));
@@ -468,11 +587,11 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
         if (!res.ok) return;
         const data = await res.json();
         if (cancelled) return;
-        if (data?.job && Array.isArray(data.job.tasks) && data.job.tasks.length > 0) {
+        if (data?.vpsScope) {
+          setVpsScopeInfo(data.vpsScope);
+        }
+        if (data?.job && ((Array.isArray(data.job.queues) && data.job.queues.length > 0) || (Array.isArray(data.job.tasks) && data.job.tasks.length > 0))) {
           applyServerBatchJob(data.job, initial);
-          if (initial && !batchRawText.trim()) {
-            setBatchRawText(data.job.tasks.map((t: any) => t.url).filter(Boolean).join('\n'));
-          }
         } else if (initial && Array.isArray(data?.defaultServerPool) && data.defaultServerPool.length > 0) {
           setServerPoolText(data.defaultServerPool.join('\n'));
         }
@@ -490,10 +609,11 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
     };
   }, [isBatchRunning]);
 
-  // Broadcast background batch status so other tabs in App.tsx show live progress
+  // Broadcast combined multi-queue background batch status so Header & VpsResourceBar stay accurate
   useEffect(() => {
     if (!onBatchProgressUpdateRef.current) return;
-    const completedCount = batchQueue.filter(
+    const allTasks = queues.length > 0 ? queues.flatMap((q) => q.tasks || []) : batchQueue;
+    const completedCount = allTasks.filter(
       (q) => q.status === 'completed' || q.status === 'skipped_in_cloudflare'
     ).length;
     const payload = {
@@ -501,7 +621,7 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
       isPaused: isBatchPaused,
       concurrency,
       completedCount,
-      totalCount: batchQueue.length,
+      totalCount: allTasks.length,
       activeWorkers,
     };
     const serialized = JSON.stringify(payload);
@@ -509,7 +629,7 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
       lastBroadcastRef.current = serialized;
       onBatchProgressUpdateRef.current(payload);
     }
-  }, [isBatchRunning, isBatchPaused, batchQueue, concurrency, activeWorkers]);
+  }, [isBatchRunning, isBatchPaused, queues, batchQueue, concurrency, activeWorkers]);
 
   // HTML Inspector search & filter
   const [htmlSearchTerm, setHtmlSearchTerm] = useState('');
@@ -697,6 +817,9 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
       if (data.sizeFormatted) {
         setActiveVideoSize(data.sizeFormatted);
       }
+      if (data.sizeBytes) {
+        setActiveVideoSizeBytes(Number(data.sizeBytes));
+      }
       if (data.compressed) {
         setActiveCompressionInfo({
           compressed: true,
@@ -814,6 +937,7 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
         setActiveDurationFormatted(bestDurationFormatted);
         setActiveDurationSec(bestDurationSec);
         setActiveVideoSize(bestSize);
+        setActiveVideoSizeBytes(cachedRecord.sizeBytes ?? (cachedRecord.sizeMb ? Math.round(Number(cachedRecord.sizeMb) * 1024 * 1024) : null));
 
         setResult({
           success: true,
@@ -943,18 +1067,31 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
       const bestDurationFormatted = data.page?.durationFormatted || data.media?.videos?.[0]?.durationFormatted || '';
       const bestDurationSec = data.page?.durationSec || data.media?.videos?.[0]?.durationSec || null;
       const bestSize = data.page?.videoSize?.sizeFormatted || data.media?.videos?.[0]?.sizeFormatted || '';
+      const bestSizeBytes = data.page?.videoSize?.sizeBytes ?? data.media?.videos?.[0]?.sizeBytes ?? null;
+
+      const resolvedCfVideo = data.page?.cloudflareVideoUrl || data.media?.videos?.[0]?.cloudflareVideoUrl || null;
+      const uploadErr = data.page?.videoUploadError || data.videoUploadError || null;
 
       setRawBaseTitle(bestRawTitle);
       setActiveTitle(bestTitle);
       setActiveThumbnail(bestThumb);
       setActiveCloudflareThumbnail(data.page?.cloudflareThumbnailUrl || null);
       setActiveStreamUrl(bestStream);
-      setActiveCloudflareVideo(data.page?.cloudflareVideoUrl || data.media?.videos?.[0]?.cloudflareVideoUrl || null);
+      setActiveCloudflareVideo(resolvedCfVideo);
       setActiveDescription(bestDesc);
       setActiveDurationFormatted(bestDurationFormatted);
       setActiveDurationSec(bestDurationSec);
       setActiveVideoSize(bestSize);
+      setActiveVideoSizeBytes(bestSizeBytes);
       setActiveCompressionInfo(data.page?.videoCompression || null);
+
+      if (autoUploadVideoToR2 && bestStream && !resolvedCfVideo) {
+        setErrorMessage(
+          uploadErr
+            ? `Video link extracted, but upload to Cloudflare R2 failed: ${uploadErr}`
+            : 'Video link extracted, but automatic upload to Cloudflare R2 did not complete. Click "Upload Video to Cloudflare" below to retry.'
+        );
+      }
 
       if (data.media?.videos?.length > 0) {
         setActiveSubTab('media');
@@ -1188,6 +1325,7 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
 
       // If server didn't auto-upload video, trigger fallback upload now and capture verified size/duration
       let fallbackUploaded = false;
+      let videoUploadFailureMsg: string | null = data.page?.videoUploadError || data.videoUploadError || null;
       if (!cloudflareVideoUrl && originalVideoUrl && !data.fromCache) {
         setBatchQueue((prev) =>
           prev.map((q, idx) =>
@@ -1220,6 +1358,7 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
             cloudflareVideoUrl = upVidData.cloudflareVideoBackLink;
             videoStreamUrl = upVidData.cloudflareVideoBackLink;
             resolvedVideoStorageSource = upVidData.storageSource || 'cloudflare_r2';
+            videoUploadFailureMsg = null;
             if (upVidData.sizeFormatted) resolvedSizeFormatted = upVidData.sizeFormatted;
             if (upVidData.sizeBytes) resolvedSizeBytes = upVidData.sizeBytes;
             if (upVidData.sizeMb) resolvedSizeMb = upVidData.sizeMb;
@@ -1228,8 +1367,11 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
               resolvedDurationFormatted = upVidData.durationFormatted || formatSecondsToDuration(upVidData.durationSec);
             }
             fallbackUploaded = true;
+          } else {
+            videoUploadFailureMsg = upVidData?.error || `HTTP ${upVidRes.status}`;
           }
-        } catch (cfVidErr) {
+        } catch (cfVidErr: any) {
+          videoUploadFailureMsg = cfVidErr?.message || 'Video upload request failed';
           console.warn('Cloudflare video upload error on item', i, cfVidErr);
         }
       }
@@ -1258,20 +1400,24 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
         }).catch(() => {});
       }
 
-      // STEP 2: Mark Completed with verified Cloudflare status
+      // STEP 2: Mark Completed or Failed with verified Cloudflare status
       const isFromWebUrlCache = Boolean(data.fromCache || data.cachedByWebUrl);
+      const uploadFailed = Boolean(originalVideoUrl && !cloudflareVideoUrl && !isFromWebUrlCache);
       setBatchQueue((prev) =>
         prev.map((q, idx) =>
           idx === i
             ? {
                 ...q,
                 workerId,
-                status: 'completed',
+                status: uploadFailed ? 'error' : 'completed',
+                error: uploadFailed
+                  ? `Video link found, but upload failed: ${videoUploadFailureMsg || 'Cloudflare R2 upload incomplete'}`
+                  : undefined,
                 statusMessage: isFromWebUrlCache
                   ? `[Worker ${workerId}] Reused from Cloudflare Vault (Web URL Match · 0 Duplicate Copies)`
                   : cloudflareVideoUrl
                   ? `[Worker ${workerId}] Completed: Video & Thumbnail on Cloudflare R2`
-                  : `[Worker ${workerId}] Scraped (Website Stream Only · Video Not Uploaded to R2)`,
+                  : `[Worker ${workerId}] Video link extracted, but upload failed: ${videoUploadFailureMsg || 'Upload incomplete'}`,
                 title,
                 rawTitle,
                 videoStreamUrl,
@@ -1284,8 +1430,10 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
                 durationFormatted: resolvedDurationFormatted,
                 durationSec: resolvedDurationSec,
                 sizeFormatted: resolvedSizeFormatted,
+                sizeBytes: resolvedSizeBytes,
+                sizeKb: resolvedSizeBytes ? Math.round(resolvedSizeBytes / 1024) : null,
                 description: data.page?.description || primaryVideo?.description || '',
-                isRegisteredInCloudflare: true,
+                isRegisteredInCloudflare: !uploadFailed,
                 registryUniqueId: data.registryUniqueId || data.registryRecord?.id,
               }
             : q
@@ -1308,15 +1456,17 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
     }
   };
 
-  // Persistent Server Background Multi-Worker Batch Queue (safe to close browser!)
-  const handleStartSequentialBatch = async () => {
+  // Persistent Multi-Queue Background Runner (add Queue #1, #2, #3, #4 anytime!)
+  const handleAddOrStartQueue = async (switchImmediately = false) => {
     const urlsToProcess =
       detectedLinksInBatch.length > 0
         ? detectedLinksInBatch
-        : batchQueue.map((q) => q.url).filter(Boolean);
+        : queues.length === 0
+        ? batchQueue.map((q) => q.url).filter(Boolean)
+        : [];
 
     if (urlsToProcess.length === 0) {
-      setErrorMessage('Please enter or paste at least one video link to process.');
+      setErrorMessage('Please paste at least one video link in the box above to add a queue.');
       return;
     }
 
@@ -1327,7 +1477,7 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
       .filter((s) => /^https?:\/\//i.test(s));
 
     try {
-      const res = await fetch('/api/vps-batch/start', {
+      const res = await fetch('/api/vps-batch/queues', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1335,28 +1485,133 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
         },
         body: JSON.stringify({
           urls: urlsToProcess,
+          name: draftQueueName.trim() || undefined,
           wordsToRemove: wordsToRemove.trim(),
           concurrency,
           batchSkipMode,
-          uploadThumbnailToR2: true,
-          uploadVideoToR2: true,
+          uploadThumbnailToR2: batchUploadThumbnailToR2,
+          uploadVideoToR2: batchUploadVideoToR2,
           compressVideo,
           compressionQuality,
           autoRetryIncomplete,
           maxAutoRetryPasses,
           serverPool,
+          switchImmediately,
         }),
       });
       const data = await res.json();
       if (!res.ok || !data.success) {
-        throw new Error(data.error || 'Failed to start background server queue');
+        throw new Error(data.error || 'Failed to add queue to background pipeline');
+      }
+      if (data.vpsScope) {
+        setVpsScopeInfo(data.vpsScope);
       }
       if (data.job) {
-        applyServerBatchJob(data.job);
+        const addedId = data.addedQueue?.queueId;
+        applyServerBatchJob(data.job, false, addedId);
+        // Clear draft text & custom name so user can immediately paste Queue #2, #3, #4!
+        setBatchRawText('');
+        setDraftQueueName('');
       }
     } catch (err: any) {
-      setErrorMessage(err.message || 'Failed to start server background queue');
+      setErrorMessage(err.message || 'Failed to add queue to server pipeline');
     }
+  };
+
+  const handlePauseQueue = async (queueId: string) => {
+    try {
+      const res = await fetch(`/api/vps-batch/queues/${encodeURIComponent(queueId)}/pause`, { method: 'POST' });
+      const data = await res.json();
+      if (data.job) applyServerBatchJob(data.job);
+    } catch {}
+  };
+
+  const handleStopQueue = async (queueId: string) => {
+    try {
+      const res = await fetch(`/api/vps-batch/queues/${encodeURIComponent(queueId)}/stop`, { method: 'POST' });
+      const data = await res.json();
+      if (data.job) applyServerBatchJob(data.job);
+    } catch {}
+  };
+
+  const handleResumeQueue = async (queueId: string) => {
+    try {
+      const res = await fetch(`/api/vps-batch/queues/${encodeURIComponent(queueId)}/resume`, {
+        method: 'POST',
+        headers: { ...getR2Headers() },
+      });
+      const data = await res.json();
+      if (data.job) applyServerBatchJob(data.job);
+    } catch {}
+  };
+
+  const handleSwitchToQueue = async (queueId: string, stopOthers = true) => {
+    try {
+      const res = await fetch(`/api/vps-batch/queues/${encodeURIComponent(queueId)}/switch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getR2Headers() },
+        body: JSON.stringify({ stopOthers }),
+      });
+      const data = await res.json();
+      if (data.job) applyServerBatchJob(data.job, false, queueId);
+    } catch {}
+  };
+
+  const handleUpdateQueueOptions = async (queueId: string, opts: BatchQueueOptions) => {
+    setIsUpdatingQueueOpts(true);
+    try {
+      const res = await fetch(`/api/vps-batch/queues/${encodeURIComponent(queueId)}/options`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...getR2Headers() },
+        body: JSON.stringify(opts),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Failed to update queue options');
+      }
+      if (data.job) applyServerBatchJob(data.job, false, queueId);
+      setShowQueueOptionsEditor(false);
+    } catch (err: any) {
+      setErrorMessage(err?.message || 'Failed to save queue options');
+    } finally {
+      setIsUpdatingQueueOpts(false);
+    }
+  };
+
+  const handleRetryQueueIncomplete = async (queueId: string) => {
+    setErrorMessage(null);
+    try {
+      const res = await fetch(`/api/vps-batch/queues/${encodeURIComponent(queueId)}/retry-incomplete`, {
+        method: 'POST',
+        headers: { ...getR2Headers() },
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Failed to restart incomplete links in queue');
+      }
+      if (data.job) applyServerBatchJob(data.job, false, queueId);
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Could not restart incomplete websites');
+    }
+  };
+
+  const handleDeleteQueue = async (queueId: string) => {
+    try {
+      const res = await fetch(`/api/vps-batch/queues/${encodeURIComponent(queueId)}`, {
+        method: 'DELETE',
+      });
+      const data = await res.json();
+      if (data.job) {
+        applyServerBatchJob(data.job);
+      } else {
+        setQueues([]);
+        setBatchQueue([]);
+        setIsBatchRunning(false);
+        setIsBatchPaused(false);
+        setActiveWorkers(0);
+        setServerJobPass(null);
+      }
+    } catch {}
   };
 
   const handlePauseBatch = async () => {
@@ -1441,6 +1696,8 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
   };
 
   const handleClearBatchQueue = async () => {
+    setQueues([]);
+    setSelectedQueueId(null);
     setBatchQueue([]);
     setIsBatchRunning(false);
     setIsBatchPaused(false);
@@ -1517,10 +1774,20 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
     return cleanTitleWithFilter(rawBaseTitle, wordsToRemove);
   }, [rawBaseTitle, wordsToRemove]);
 
-  // Completed items in batch queue
+  // Completed items in currently viewed queue
   const completedBatchItems = useMemo(() => {
-    return batchQueue.filter((item) => item.status === 'completed');
-  }, [batchQueue]);
+    return displayedBatchTasks.filter((item) => item.status === 'completed');
+  }, [displayedBatchTasks]);
+
+  const totalTasksAcrossAllQueues = useMemo(() => {
+    if (queues.length > 0) return queues.reduce((sum, q) => sum + (q.tasks?.length || q.total || 0), 0);
+    return batchQueue.length;
+  }, [queues, batchQueue]);
+
+  const nextQueueNum = useMemo(() => {
+    if (queues.length === 0) return 1;
+    return queues.reduce((m, q) => Math.max(m, q.queueNumber || 1), 0) + 1;
+  }, [queues]);
 
   return (
     <div className="space-y-6">
@@ -1539,6 +1806,19 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
             <p className="text-xs text-slate-400 max-w-3xl leading-relaxed">
               Process a single website or paste text with multiple links. Crawls video streams, strips unwanted title words (case-insensitive), uploads thumbnails directly to Cloudflare R2, and returns permanent back links.
             </p>
+            {vpsScopeInfo && (
+              <div className="flex items-center gap-2 flex-wrap pt-0.5 text-[11px] font-mono">
+                <span
+                  className="px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/25"
+                  title={`Queue storage key: ${vpsScopeInfo.d1DocId} (isolated per VPS) · Registry table: links_registry (shared across all VPS)`}
+                >
+                  Isolated VPS Queue: {vpsScopeInfo.scopeLabel}
+                </span>
+                <span className="px-2 py-0.5 rounded-md bg-cyan-500/10 text-cyan-300 border border-cyan-500/25">
+                  Shared D1 Link Registry: Pre-Check Dedup ON
+                </span>
+              </div>
+            )}
           </div>
 
           {/* Mode Switch: Single URL vs Multi-Link Batch Queue */}
@@ -1566,9 +1846,9 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
             >
               <ListOrdered className="w-3.5 h-3.5" />
               <span>Multi-Link Queue</span>
-              {batchQueue.length > 0 && (
+              {totalTasksAcrossAllQueues > 0 && (
                 <span className="px-1.5 py-0.2 rounded-full bg-slate-900 text-[10px]">
-                  {batchQueue.length}
+                  {queues.length > 1 ? `${queues.length}Q · ${totalTasksAcrossAllQueues}` : totalTasksAcrossAllQueues}
                 </span>
               )}
             </button>
@@ -1769,19 +2049,30 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
         )}
 
         {/* ============================================================== */}
-        {/* MODE 2: MULTI-LINK TEXT PROCESSING & SEQUENTIAL QUEUE         */}
+        {/* MODE 2: MULTI-LINK MULTI-QUEUE WORKER PIPELINE                 */}
         {/* ============================================================== */}
         {inputMode === 'batch' && (
           <div className="space-y-4 pt-2">
             <div className="space-y-2">
-              <div className="flex items-center justify-between text-xs">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
                 <label className="text-slate-300 font-semibold flex items-center gap-1.5">
                   <ListOrdered className="w-4 h-4 text-cyan-400" />
-                  <span>Paste Text Containing Multiple Video Links or List of URLs</span>
+                  <span>
+                    {queues.length > 0
+                      ? `Draft Queue #${nextQueueNum} (Add even while Queue #${queues[0]?.queueNumber || 1} is running)`
+                      : 'Paste Text Containing Multiple Video Links or List of URLs'}
+                  </span>
                 </label>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <input
+                    type="text"
+                    value={draftQueueName}
+                    onChange={(e) => setDraftQueueName(e.target.value)}
+                    placeholder={`Name (optional, e.g. Queue #${nextQueueNum})`}
+                    className="px-2.5 py-1 bg-slate-950 border border-slate-800 focus:border-cyan-500 rounded-lg text-[11px] text-slate-200 outline-none w-48"
+                  />
                   <span className="px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 font-mono text-[11px] font-bold border border-cyan-500/20">
-                    {detectedLinksInBatch.length} links detected in text
+                    {detectedLinksInBatch.length} links detected
                   </span>
                   {batchRawText && (
                     <button
@@ -1798,14 +2089,14 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
               <textarea
                 value={batchRawText}
                 onChange={(e) => setBatchRawText(e.target.value)}
-                placeholder="Paste raw text, articles, or multiple URLs (one per line, comma separated, or full text)...&#10;e.g.:&#10;https://example.com/video-1&#10;https://example.com/video-2&#10;https://example.com/video-3"
+                placeholder="Paste URLs for Queue #1, #2, #3... (starts automatically as soon as workers become free)&#10;e.g.:&#10;https://example.com/video-1&#10;https://example.com/video-2&#10;https://example.com/video-3"
                 rows={4}
                 className="w-full p-3 bg-slate-950 border border-slate-800 focus:border-cyan-500 rounded-xl text-slate-200 font-mono text-xs outline-none transition-colors leading-relaxed"
               />
             </div>
 
-            {/* Filter Words for Batch */}
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+            {/* Filter Words + Per-Queue Action Buttons */}
+            <div className="flex flex-col lg:flex-row items-stretch lg:items-center gap-2.5">
               <div className="relative flex-1">
                 <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
                   <Filter className="w-3.5 h-3.5 text-amber-400" />
@@ -1814,51 +2105,70 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
                   type="text"
                   value={wordsToRemove}
                   onChange={(e) => setWordsToRemove(e.target.value)}
-                  placeholder="Words to filter from all titles (e.g. 1080p, [HD], Free, Hindi)..."
+                  placeholder="Words to filter from titles for this queue (e.g. 1080p, [HD], Free, Hindi)..."
                   className="w-full pl-9 pr-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-white outline-none focus:border-amber-500"
                 />
               </div>
 
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={handleLoadLinksIntoQueue}
-                  disabled={detectedLinksInBatch.length === 0}
-                  className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-xl text-xs transition-colors disabled:opacity-50"
-                >
-                  Load {detectedLinksInBatch.length} Links to Queue
-                </button>
-
-                {!isBatchRunning ? (
+              <div className="flex flex-wrap items-center gap-2">
+                {queues.length === 0 ? (
                   <button
                     type="button"
-                    onClick={handleStartSequentialBatch}
+                    onClick={() => handleAddOrStartQueue(false)}
                     disabled={detectedLinksInBatch.length === 0 && batchQueue.length === 0}
                     className="px-5 py-2 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-xs transition-all shadow-lg shadow-emerald-500/20 disabled:opacity-50 flex items-center gap-1.5"
                   >
                     <Play className="w-3.5 h-3.5 fill-current" />
                     <span>
-                      Start Pipeline ({concurrency === 1 ? '1x Sequential' : `${concurrency}x Parallel Workers`})
+                      Start Queue #1 ({concurrency === 1 ? '1x Worker' : `${concurrency}x Workers`})
                     </span>
                   </button>
                 ) : (
-                  <div className="flex items-center gap-2">
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => handleAddOrStartQueue(false)}
+                      disabled={detectedLinksInBatch.length === 0}
+                      className="px-4 py-2 bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-slate-950 font-bold rounded-xl text-xs transition-all shadow-lg shadow-emerald-500/20 disabled:opacity-50 flex items-center gap-1.5"
+                      title="Appends as next queue and starts immediately as workers become free"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>
+                        Add as Queue #{nextQueueNum} ({detectedLinksInBatch.length})
+                      </span>
+                    </button>
+
+                    <button
+                      type="button"
+                      onClick={() => handleAddOrStartQueue(true)}
+                      disabled={detectedLinksInBatch.length === 0}
+                      className="px-3.5 py-2 bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border border-cyan-500/40 font-bold rounded-xl text-xs transition-all disabled:opacity-50 flex items-center gap-1.5"
+                      title="Stops active queue and switches workers immediately to this new queue"
+                    >
+                      <ArrowUpRight className="w-3.5 h-3.5" />
+                      <span>Add &amp; Switch Now</span>
+                    </button>
+                  </>
+                )}
+
+                {isBatchRunning && (
+                  <div className="flex items-center gap-1.5">
                     {isBatchPaused ? (
                       <button
                         type="button"
                         onClick={handleResumeBatch}
-                        className="px-4 py-2 bg-emerald-500 text-slate-950 font-bold rounded-xl text-xs"
+                        className="px-3.5 py-2 bg-emerald-500 text-slate-950 font-bold rounded-xl text-xs"
                       >
-                        Resume Queue
+                        Resume All
                       </button>
                     ) : (
                       <button
                         type="button"
                         onClick={handlePauseBatch}
-                        className="px-4 py-2 bg-amber-500 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-1"
+                        className="px-3.5 py-2 bg-amber-500 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-1"
                       >
                         <Pause className="w-3.5 h-3.5" />
-                        <span>Pause</span>
+                        <span>Pause All</span>
                       </button>
                     )}
 
@@ -1867,11 +2177,39 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
                       onClick={handleCancelBatch}
                       className="px-3 py-2 bg-rose-500/20 text-rose-300 border border-rose-500/30 rounded-xl text-xs font-semibold"
                     >
-                      Cancel
+                      Stop All
                     </button>
                   </div>
                 )}
               </div>
+            </div>
+
+            {/* Per-Queue Upload / Action Checkboxes ("what to do, what not" for this queue) */}
+            <div className="flex flex-wrap items-center gap-3 px-3 py-2 bg-slate-950/80 border border-slate-800 rounded-xl text-xs">
+              <span className="text-[11px] font-bold text-slate-400">
+                Options for {queues.length > 0 ? `Queue #${nextQueueNum}` : 'Queue #1'}:
+              </span>
+              <label className="flex items-center gap-1.5 cursor-pointer text-slate-200 select-none">
+                <input
+                  type="checkbox"
+                  checked={batchUploadVideoToR2}
+                  onChange={(e) => setBatchUploadVideoToR2(e.target.checked)}
+                  className="accent-cyan-500 w-3.5 h-3.5 rounded"
+                />
+                <Film className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Download &amp; Upload Video to R2</span>
+              </label>
+
+              <label className="flex items-center gap-1.5 cursor-pointer text-slate-200 select-none">
+                <input
+                  type="checkbox"
+                  checked={batchUploadThumbnailToR2}
+                  onChange={(e) => setBatchUploadThumbnailToR2(e.target.checked)}
+                  className="accent-emerald-500 w-3.5 h-3.5 rounded"
+                />
+                <Cloud className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Upload Thumbnail to R2</span>
+              </label>
             </div>
 
             {/* VPS Multi-Worker Concurrency Bar (1 - 50 Parallel Workers) */}
@@ -2358,10 +2696,253 @@ export default {
       )}
 
       {/* ============================================================== */}
-      {/* BATCH QUEUE PROGRESS & LIVE SEQUENTIAL CARDS                   */}
+      {/* MULTI-QUEUE MANAGER, QUEUE SWITCHER & LIVE WORKER CARDS        */}
       {/* ============================================================== */}
-      {batchQueue.length > 0 && inputMode === 'batch' && (
+      {(queues.length > 0 || batchQueue.length > 0) && inputMode === 'batch' && (
         <div className="p-5 bg-slate-900/90 border border-slate-800 rounded-2xl shadow-xl space-y-5 animate-fadeIn">
+          {/* Global Pipeline Summary & Multi-Queue Switcher Strip */}
+          {queues.length > 0 && (
+            <div className="space-y-3 pb-4 border-b border-slate-800">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="p-1.5 rounded-lg bg-cyan-500/15 text-cyan-400 border border-cyan-500/30">
+                    <Layers className="w-4 h-4" />
+                  </span>
+                  <h3 className="font-bold text-white text-sm">
+                    Active Queues ({queues.length}) · Auto-Rollover &amp; Instant Retry Pool
+                  </h3>
+                  {vpsScopeInfo && (
+                    <span
+                      className="px-2 py-0.5 rounded-md bg-emerald-500/10 text-emerald-300 border border-emerald-500/25 font-mono text-[10px]"
+                      title={`Queue State Key: ${vpsScopeInfo.d1DocId} (isolated to this VPS) · Shared D1 Link Registry active`}
+                    >
+                      VPS Queue: {vpsScopeInfo.scopeLabel} · Shared D1 Dedup ON
+                    </span>
+                  )}
+                  {Boolean(serverJobPass?.activeCompressions || serverJobPass?.pausedForLoadCount) && (
+                    <span className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 font-mono text-[10px] font-bold">
+                      FFmpeg: {serverJobPass?.activeCompressions || 0} active
+                      {serverJobPass?.pausedForLoadCount ? ` · ${serverJobPass.pausedForLoadCount} paused (CPU ${serverJobPass.currentCpuPercent ?? 0}%)` : ''}
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2 flex-wrap">
+                  {queues.some((q) => q.incompleteCount > 0 && q.status !== 'stopped') && (
+                    <button
+                      type="button"
+                      onClick={handleRetryIncompleteBatch}
+                      className="px-3 py-1.5 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/40 rounded-lg text-[11px] font-semibold flex items-center gap-1"
+                    >
+                      <RotateCcw className="w-3 h-3" />
+                      <span>Restart All Failed</span>
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={handleClearBatchQueue}
+                    className="px-2.5 py-1.5 text-slate-400 hover:text-rose-300 bg-slate-950 border border-slate-800 hover:border-rose-500/30 rounded-lg text-[11px] font-semibold flex items-center gap-1"
+                    title="Clear all saved queues"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                    <span>Clear All</span>
+                  </button>
+                </div>
+              </div>
+
+              {serverJobPass?.message && (
+                <p className="text-xs text-slate-400">{serverJobPass.message}</p>
+              )}
+
+              {/* Queue Cards Grid (Queue #1, Queue #2, Queue #3...) */}
+              <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-2.5">
+                {queues.map((q) => {
+                  const isSelected = selectedQueue?.queueId === q.queueId;
+                  const doneCount = q.completed + q.skipped;
+                  const pct = q.total > 0 ? Math.round((doneCount / q.total) * 100) : 0;
+                  const skipLabel =
+                    q.options.batchSkipMode === 'strict_skip'
+                      ? 'Strict Skip'
+                      : q.options.batchSkipMode === 'dont_skip'
+                      ? 'Force All'
+                      : 'Smart Cache';
+
+                  return (
+                    <div
+                      key={q.queueId}
+                      onClick={() => {
+                        setSelectedQueueId(q.queueId);
+                        setShowQueueOptionsEditor(false);
+                      }}
+                      className={`p-3 rounded-xl border cursor-pointer transition-all space-y-2 ${
+                        isSelected
+                          ? 'bg-cyan-500/10 border-cyan-500/60 ring-1 ring-cyan-500/30'
+                          : 'bg-slate-950/80 border-slate-800 hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="font-bold text-white text-xs truncate">{q.name}</span>
+                          {q.activeWorkers > 0 && (
+                            <span className="px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-mono text-[10px] font-bold animate-pulse">
+                              {q.activeWorkers}w
+                            </span>
+                          )}
+                        </div>
+                        <span
+                          className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                            q.status === 'running'
+                              ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                              : q.status === 'queued'
+                              ? 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
+                              : q.status === 'paused'
+                              ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                              : q.status === 'stopped'
+                              ? 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+                              : 'bg-slate-800 text-slate-300 border-slate-700'
+                          }`}
+                        >
+                          {q.status === 'running'
+                            ? 'Running'
+                            : q.status === 'queued'
+                            ? 'Next / Queued'
+                            : q.status === 'paused'
+                            ? 'Paused'
+                            : q.status === 'stopped'
+                            ? 'Stopped'
+                            : 'Completed'}
+                        </span>
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[10px] font-mono text-slate-400">
+                          <span>
+                            {doneCount}/{q.total} done{q.errors > 0 ? ` · ${q.errors} failed` : ''}
+                          </span>
+                          <span>{pct}%</span>
+                        </div>
+                        <div className="w-full h-1.5 bg-slate-900 rounded-full overflow-hidden">
+                          <div
+                            className={`h-1.5 transition-all ${
+                              q.status === 'stopped'
+                                ? 'bg-rose-500/70'
+                                : q.status === 'paused'
+                                ? 'bg-amber-400'
+                                : 'bg-gradient-to-r from-cyan-500 to-emerald-400'
+                            }`}
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                      </div>
+
+                      {/* Compact per-queue options summary */}
+                      <div className="flex flex-wrap items-center gap-1 text-[9px] font-mono">
+                        <span className="px-1.5 py-0.5 rounded bg-slate-900 border border-slate-800 text-slate-300">
+                          {skipLabel}
+                        </span>
+                        <span
+                          className={`px-1.5 py-0.5 rounded border ${
+                            q.options.uploadVideoToR2
+                              ? 'bg-cyan-500/10 border-cyan-500/20 text-cyan-300'
+                              : 'bg-slate-900 border-slate-800 text-slate-500'
+                          }`}
+                        >
+                          {q.options.uploadVideoToR2 ? 'R2 Vid' : 'Skip Vid R2'}
+                        </span>
+                        <span
+                          className={`px-1.5 py-0.5 rounded border ${
+                            q.options.uploadThumbnailToR2
+                              ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300'
+                              : 'bg-slate-900 border-slate-800 text-slate-500'
+                          }`}
+                        >
+                          {q.options.uploadThumbnailToR2 ? 'R2 Thumb' : 'Skip Thumb'}
+                        </span>
+                        <span
+                          className={`px-1.5 py-0.5 rounded border ${
+                            q.options.compressVideo
+                              ? 'bg-indigo-500/15 border-indigo-500/30 text-indigo-300'
+                              : 'bg-slate-900 border-slate-800 text-slate-500'
+                          }`}
+                        >
+                          {q.options.compressVideo ? `Comp: ${q.options.compressionQuality}` : 'No Compress'}
+                        </span>
+                      </div>
+
+                      {/* Quick Queue Controls */}
+                      <div
+                        className="flex flex-wrap items-center gap-1.5 pt-1 border-t border-slate-800/80"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {queues.length > 1 && (q.status === 'queued' || q.status === 'paused' || q.status === 'stopped') && (
+                          <button
+                            type="button"
+                            onClick={() => handleSwitchToQueue(q.queueId, true)}
+                            className="px-2 py-1 rounded bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border border-cyan-500/30 text-[10px] font-bold flex items-center gap-1"
+                            title="Stop current active queue and switch all workers to this queue"
+                          >
+                            <ArrowUpRight className="w-3 h-3" />
+                            <span>Switch Here</span>
+                          </button>
+                        )}
+                        {q.status === 'running' || q.status === 'queued' ? (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => handlePauseQueue(q.queueId)}
+                              className="px-2 py-1 rounded bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 text-[10px] font-semibold flex items-center gap-1"
+                            >
+                              <Pause className="w-2.5 h-2.5" />
+                              <span>Pause</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleStopQueue(q.queueId)}
+                              className="px-2 py-1 rounded bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 text-[10px] font-semibold flex items-center gap-1"
+                            >
+                              <Square className="w-2.5 h-2.5" />
+                              <span>Stop</span>
+                            </button>
+                          </>
+                        ) : q.status === 'paused' || q.status === 'stopped' ? (
+                          <button
+                            type="button"
+                            onClick={() => handleResumeQueue(q.queueId)}
+                            className="px-2 py-1 rounded bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold flex items-center gap-1"
+                          >
+                            <Play className="w-2.5 h-2.5" />
+                            <span>Resume</span>
+                          </button>
+                        ) : null}
+
+                        {q.incompleteCount > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => handleRetryQueueIncomplete(q.queueId)}
+                            className="px-2 py-1 rounded bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[10px] font-semibold flex items-center gap-1"
+                          >
+                            <RotateCcw className="w-2.5 h-2.5" />
+                            <span>Retry Failed</span>
+                          </button>
+                        )}
+
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteQueue(q.queueId)}
+                          className="ml-auto p-1 text-slate-500 hover:text-rose-400 rounded"
+                          title={`Remove ${q.name}`}
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Selected Queue Header & Actions */}
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
             <div className="space-y-1">
               <div className="flex items-center gap-2 flex-wrap">
@@ -2369,39 +2950,55 @@ export default {
                   <Cloud className="w-4 h-4" />
                 </span>
                 <h3 className="font-bold text-white text-sm">
-                  Server Background Queue (Safe to Close Browser)
+                  {selectedQueue ? `${selectedQueue.name} · Tasks & Settings` : 'Server Background Queue (Safe to Close Browser)'}
                 </h3>
-                {serverJobPass && (
+                {selectedQueue && (
                   <span className="px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono text-[10px] font-bold">
-                    Pass {serverJobPass.current} / {serverJobPass.max}
-                  </span>
-                )}
-                {Boolean(serverJobPass?.activeCompressions || serverJobPass?.pausedForLoadCount) && (
-                  <span className="px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 font-mono text-[10px] font-bold">
-                    FFmpeg: {serverJobPass?.activeCompressions || 0} active
-                    {serverJobPass?.pausedForLoadCount ? ` · ${serverJobPass.pausedForLoadCount} paused (CPU ${serverJobPass.currentCpuPercent ?? 0}%)` : ''}
+                    Pass {selectedQueue.currentPass} / {1 + selectedQueue.options.maxAutoRetryPasses}
                   </span>
                 )}
               </div>
               <p className="text-xs text-slate-400">
-                {serverJobPass?.message ||
-                  'Persisted on server & ott-database D1. Runs in background even after closing browser and restarts failed/incomplete items automatically.'}
+                {selectedQueue?.statusMessage ||
+                  serverJobPass?.message ||
+                  'Persisted on server & ott-database D1. Runs in background even after closing browser.'}
               </p>
             </div>
 
-            {/* Batch Export Actions */}
+            {/* Selected Queue Actions */}
             <div className="flex flex-wrap items-center gap-2">
-              {!isBatchRunning &&
-                batchQueue.some(
-                  (q) => q.status === 'error' || (q.status === 'completed' && !q.cloudflareVideoUrl) || q.status === 'pending'
+              {selectedQueue && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setQueueEditDraft({ ...selectedQueue.options });
+                    setShowQueueOptionsEditor((v) => !v);
+                  }}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 border transition-colors ${
+                    showQueueOptionsEditor
+                      ? 'bg-indigo-500/20 text-indigo-200 border-indigo-500/50'
+                      : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700'
+                  }`}
+                >
+                  <Settings2 className="w-3.5 h-3.5" />
+                  <span>{showQueueOptionsEditor ? 'Close Queue Options' : 'Edit Queue Options'}</span>
+                </button>
+              )}
+
+              {selectedQueue &&
+                displayedBatchTasks.some(
+                  (q) =>
+                    q.status === 'error' ||
+                    (q.status === 'completed' && selectedQueue.options.uploadVideoToR2 && !q.cloudflareVideoUrl) ||
+                    q.status === 'pending'
                 ) && (
                   <button
                     type="button"
-                    onClick={handleRetryIncompleteBatch}
+                    onClick={() => handleRetryQueueIncomplete(selectedQueue.queueId)}
                     className="px-3.5 py-1.5 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border border-amber-500/40 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-sm"
                   >
                     <RotateCcw className="w-3.5 h-3.5" />
-                    <span>Restart Failed &amp; Incomplete</span>
+                    <span>Restart Failed in {selectedQueue.name}</span>
                   </button>
                 )}
 
@@ -2420,6 +3017,10 @@ export default {
                           isPremium: false,
                           rating: 4.8,
                           likesCount: '12k',
+                          durationSec: item.durationSec ?? 0,
+                          sizeKb: item.sizeKb ?? undefined,
+                          sizeBytes: item.sizeBytes ?? undefined,
+                          sizeFormatted: item.sizeFormatted || undefined,
                         }))
                       )
                     }
@@ -2441,14 +3042,14 @@ export default {
                     className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-cyan-300 rounded-xl text-xs font-semibold flex items-center gap-1 transition-colors"
                   >
                     {copiedKey === 'all_cf_videos' ? <Check className="w-3 h-3 text-cyan-400" /> : <Copy className="w-3 h-3" />}
-                    <span>{copiedKey === 'all_cf_videos' ? 'Copied' : 'Copy All CF Videos'}</span>
+                    <span>{copiedKey === 'all_cf_videos' ? 'Copied' : 'Copy All Videos'}</span>
                   </button>
 
                   <button
                     type="button"
                     onClick={() => {
                       const allLinks = completedBatchItems
-                        .map((c) => c.cloudflareThumbnailUrl)
+                        .map((c) => c.cloudflareThumbnailUrl || c.originalThumbnailUrl)
                         .filter(Boolean)
                         .join('\n');
                       copyToClipboard(allLinks, 'all_cf_thumbs');
@@ -2456,45 +3057,168 @@ export default {
                     className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold flex items-center gap-1 transition-colors"
                   >
                     {copiedKey === 'all_cf_thumbs' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-                    <span>{copiedKey === 'all_cf_thumbs' ? 'Copied' : 'Copy All CF Thumbnails'}</span>
+                    <span>{copiedKey === 'all_cf_thumbs' ? 'Copied' : 'Copy All Thumbs'}</span>
                   </button>
                 </>
               )}
-
-              <button
-                type="button"
-                onClick={handleClearBatchQueue}
-                className="p-1.5 text-slate-500 hover:text-rose-400 rounded-lg hover:bg-slate-800 transition-colors"
-                title="Clear saved server queue"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
             </div>
           </div>
 
-          {/* Progress Bar Strip */}
-          <div className="space-y-1.5">
-            <div className="flex items-center justify-between text-xs font-mono">
-              <span className="text-slate-400">
-                Progress: {completedBatchItems.length} / {batchQueue.length} Completed
-              </span>
-              <span className="text-cyan-400 font-bold">
-                {Math.round((completedBatchItems.length / batchQueue.length) * 100)}%
-              </span>
-            </div>
-            <div className="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-800">
-              <div
-                className="bg-gradient-to-r from-cyan-500 via-teal-400 to-emerald-400 h-2 transition-all duration-300"
-                style={{
-                  width: `${(completedBatchItems.length / batchQueue.length) * 100}%`,
-                }}
-              />
-            </div>
-          </div>
+          {/* Per-Queue Live Option Editor */}
+          {selectedQueue && showQueueOptionsEditor && queueEditDraft && (
+            <div className="p-4 bg-slate-950 border border-indigo-500/40 rounded-xl space-y-3 text-xs animate-fadeIn">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-bold text-indigo-300 flex items-center gap-1.5">
+                  <Settings2 className="w-4 h-4" />
+                  <span>Customize Options for {selectedQueue.name} (Takes effect immediately on next task)</span>
+                </span>
+              </div>
 
-          {/* Sequential Queue Items List */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <div className="space-y-1">
+                  <label className="text-[11px] font-semibold text-slate-400">Skip Strategy</label>
+                  <select
+                    value={queueEditDraft.batchSkipMode}
+                    onChange={(e) =>
+                      setQueueEditDraft({ ...queueEditDraft, batchSkipMode: e.target.value as BatchSkipMode })
+                    }
+                    className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs text-white outline-none"
+                  >
+                    <option value="smart_cache">Skip &amp; Get from Cloudflare</option>
+                    <option value="strict_skip">Skip from Both (Strict Bypass)</option>
+                    <option value="dont_skip">Don&apos;t Skip (Force Live Again)</option>
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-[11px] font-semibold text-slate-400">Filter Words in Titles</label>
+                  <input
+                    type="text"
+                    value={queueEditDraft.wordsToRemove}
+                    onChange={(e) => setQueueEditDraft({ ...queueEditDraft, wordsToRemove: e.target.value })}
+                    placeholder="1080p, [HD], Free..."
+                    className="w-full px-2.5 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs text-white outline-none"
+                  />
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-[11px] font-semibold text-slate-400">Compression Quality</label>
+                  <div className="flex items-center gap-2">
+                    <label className="flex items-center gap-1.5 cursor-pointer text-slate-200">
+                      <input
+                        type="checkbox"
+                        checked={queueEditDraft.compressVideo}
+                        onChange={(e) =>
+                          setQueueEditDraft({ ...queueEditDraft, compressVideo: e.target.checked })
+                        }
+                        className="accent-indigo-500"
+                      />
+                      <span>Compress</span>
+                    </label>
+                    <select
+                      value={queueEditDraft.compressionQuality}
+                      disabled={!queueEditDraft.compressVideo}
+                      onChange={(e) =>
+                        setQueueEditDraft({
+                          ...queueEditDraft,
+                          compressionQuality: e.target.value as VideoCompressionQuality,
+                        })
+                      }
+                      className="flex-1 px-2 py-1.5 bg-slate-900 border border-slate-700 rounded-lg text-xs text-white disabled:opacity-45"
+                    >
+                      {COMPRESSION_QUALITY_OPTIONS.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                <div className="flex flex-wrap items-center gap-4">
+                  <label className="flex items-center gap-1.5 cursor-pointer text-slate-200">
+                    <input
+                      type="checkbox"
+                      checked={queueEditDraft.uploadVideoToR2}
+                      onChange={(e) =>
+                        setQueueEditDraft({ ...queueEditDraft, uploadVideoToR2: e.target.checked })
+                      }
+                      className="accent-cyan-500"
+                    />
+                    <span>Upload Video to R2</span>
+                  </label>
+                  <label className="flex items-center gap-1.5 cursor-pointer text-slate-200">
+                    <input
+                      type="checkbox"
+                      checked={queueEditDraft.uploadThumbnailToR2}
+                      onChange={(e) =>
+                        setQueueEditDraft({ ...queueEditDraft, uploadThumbnailToR2: e.target.checked })
+                      }
+                      className="accent-emerald-500"
+                    />
+                    <span>Upload Thumbnail to R2</span>
+                  </label>
+                  <label className="flex items-center gap-1.5 cursor-pointer text-slate-200">
+                    <input
+                      type="checkbox"
+                      checked={queueEditDraft.autoRetryIncomplete}
+                      onChange={(e) =>
+                        setQueueEditDraft({ ...queueEditDraft, autoRetryIncomplete: e.target.checked })
+                      }
+                      className="accent-emerald-500"
+                    />
+                    <span>Auto-Retry Failed</span>
+                  </label>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setShowQueueOptionsEditor(false)}
+                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isUpdatingQueueOpts}
+                    onClick={() => handleUpdateQueueOptions(selectedQueue.queueId, queueEditDraft)}
+                    className="px-4 py-1.5 bg-indigo-500 hover:bg-indigo-400 text-white font-bold rounded-lg text-xs disabled:opacity-50"
+                  >
+                    {isUpdatingQueueOpts ? 'Saving...' : 'Save Queue Options'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Progress Bar Strip for Selected Queue */}
+          {displayedBatchTasks.length > 0 && (
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between text-xs font-mono">
+                <span className="text-slate-400">
+                  {selectedQueue ? `${selectedQueue.name} Progress:` : 'Progress:'} {completedBatchItems.length} / {displayedBatchTasks.length} Completed
+                </span>
+                <span className="text-cyan-400 font-bold">
+                  {Math.round((completedBatchItems.length / displayedBatchTasks.length) * 100)}%
+                </span>
+              </div>
+              <div className="w-full bg-slate-950 rounded-full h-2 overflow-hidden border border-slate-800">
+                <div
+                  className="bg-gradient-to-r from-cyan-500 via-teal-400 to-emerald-400 h-2 transition-all duration-300"
+                  style={{
+                    width: `${(completedBatchItems.length / displayedBatchTasks.length) * 100}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Selected Queue Items List */}
           <div className="space-y-3">
-            {batchQueue.map((item, idx) => {
+            {displayedBatchTasks.map((item, idx) => {
               const isCurrent = activeBatchIndex === idx;
               const isDone = item.status === 'completed';
               const isErr = item.status === 'error';
@@ -2604,6 +3328,17 @@ export default {
 
                         <p className="font-mono text-slate-500 text-[11px] truncate">{item.url}</p>
 
+                        {isErr && (item.error || item.statusMessage) && (
+                          <div className="mt-1 px-2.5 py-1.5 rounded-lg bg-rose-500/15 border border-rose-500/30 text-[11px] text-rose-300 space-y-0.5">
+                            <p className="font-semibold break-words">{item.error || item.statusMessage}</p>
+                            {item.originalVideoUrl && (
+                              <p className="font-mono text-[10px] text-rose-200/80 truncate" title={item.originalVideoUrl}>
+                                Extracted Video Link: {item.originalVideoUrl}
+                              </p>
+                            )}
+                          </div>
+                        )}
+
                         {/* Permanent Cloudflare Back Links (Both Video and Thumbnail) */}
                         <div className="pt-1 space-y-1">
                           {item.cloudflareVideoUrl && (
@@ -2697,6 +3432,10 @@ export default {
                               description: item.description,
                               rating: 4.8,
                               likesCount: '15k',
+                              durationSec: item.durationSec ?? 0,
+                              sizeKb: item.sizeKb ?? undefined,
+                              sizeBytes: item.sizeBytes ?? undefined,
+                              sizeFormatted: item.sizeFormatted || undefined,
                             })
                           }
                           className="p-1.5 bg-yellow-500/10 hover:bg-yellow-500/20 text-yellow-400 border border-yellow-500/20 rounded-lg"
@@ -2834,6 +3573,9 @@ export default {
                       description: activeDescription,
                       rating: 4.8,
                       likesCount: '15k',
+                      durationSec: activeDurationSec ?? 0,
+                      sizeBytes: activeVideoSizeBytes ?? undefined,
+                      sizeFormatted: activeVideoSize || undefined,
                     });
                   }}
                   className="px-3.5 py-1.5 bg-yellow-500/10 hover:bg-yellow-500/20 text-yellow-400 border border-yellow-500/30 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-sm"
@@ -3350,6 +4092,7 @@ export default {
                               if (vid.durationFormatted) setActiveDurationFormatted(vid.durationFormatted);
                               if (vid.durationSec) setActiveDurationSec(vid.durationSec);
                               if (vid.sizeFormatted) setActiveVideoSize(vid.sizeFormatted);
+                              if (vid.sizeBytes) setActiveVideoSizeBytes(vid.sizeBytes);
                             }}
                             className="px-2.5 py-1.5 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 rounded-lg transition-colors flex items-center gap-1 font-semibold"
                             title="Set as active video in the publish bar"

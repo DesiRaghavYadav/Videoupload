@@ -386,7 +386,40 @@ export default function App() {
                   setCurrentBatchResults([]);
                 }}
                 onNavigateToBatchVideo={() => setActiveTab('batchvideo')}
-                onNavigateToCategories={() => setActiveTab('categories')}
+                onNavigateToCategories={() => {
+                  const list = currentBatchResults.length > 0 ? currentBatchResults : currentResult ? [currentResult] : [];
+                  if (list.length > 1) {
+                    setForwardedBatchVideos(
+                      list.map((rec, idx) => ({
+                        title: (rec.metadata?.exactFilename || rec.metadata?.filename || `Video ${idx + 1}`)
+                          .replace(/\.[^/.]+$/, '')
+                          .replace(/[_-]+/g, ' ')
+                          .trim(),
+                        description: `Ingested from Cloudflare R2: ${rec.metadata?.exactFilename || rec.metadata?.filename}`,
+                        imageUrl: rec.thumbnailUrl,
+                        reelsUrl: rec.videoUrl,
+                        durationSec: rec.durationSec ?? rec.metadata?.durationSec ?? rec.metadata?.duration ?? 0,
+                        sizeBytes: rec.metadata?.fileSize,
+                      }))
+                    );
+                    setForwardedMediaData(null);
+                  } else if (list.length === 1) {
+                    const rec = list[0];
+                    setForwardedMediaData({
+                      title: (rec.metadata?.exactFilename || rec.metadata?.filename || 'Uploaded Video')
+                        .replace(/\.[^/.]+$/, '')
+                        .replace(/[_-]+/g, ' ')
+                        .trim(),
+                      description: `Ingested from Cloudflare R2 Vault: ${rec.metadata?.exactFilename || rec.metadata?.filename}`,
+                      imageUrl: rec.thumbnailUrl,
+                      reelsUrl: rec.videoUrl,
+                      durationSec: rec.durationSec ?? rec.metadata?.durationSec ?? rec.metadata?.duration ?? 0,
+                      sizeBytes: rec.metadata?.fileSize,
+                    });
+                    setForwardedBatchVideos(null);
+                  }
+                  setActiveTab('categories');
+                }}
                 onNavigateToDatabase={() => setActiveTab('database')}
                 onNavigateToReels={() => setActiveTab('reels')}
                 onUpdateRecord={handleUpdateRecord}
