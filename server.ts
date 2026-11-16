@@ -14,6 +14,7 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
+import ffmpegStatic from 'ffmpeg-static';
 
 const execFileAsync = promisify(execFile);
 import {
@@ -242,6 +243,9 @@ function createHttpConnectHttpsAgent(proxyUrl: URL, timeoutMs = 10000): https.Ag
       tlsSocket.setTimeout(timeoutMs, () => {
         tlsSocket.destroy();
         finish(new Error(`Proxy TLS timeout (${proxyHost}:${proxyPort})`));
+      });
+      tlsSocket.once('secureConnect', () => {
+        tlsSocket.setTimeout(0);
       });
       tlsSocket.once('error', (err) => finish(err));
       finish(null, tlsSocket);
@@ -4925,14 +4929,64 @@ function parseMp4DurationFallback(filePath: string): { seconds: number; formatte
   return null;
 }
 
-// Helper: Extract exact video duration from downloaded video file via ffprobe (with MP4 binary fallback)
+let cachedFfmpegExecutable: string | null = null;
+function resolveFfmpegExecutable(): string {
+  if (cachedFfmpegExecutable) return cachedFfmpegExecutable;
+
+  const candidates = [
+    process.env.FFMPEG_PATH,
+    process.env.FFMPEG_BIN,
+    '/usr/bin/ffmpeg',
+    '/usr/local/bin/ffmpeg',
+    typeof ffmpegStatic === 'string' ? ffmpegStatic : '',
+  ].filter((c): c is string => Boolean(c && c.trim()));
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        try {
+          fs.accessSync(candidate, fs.constants.X_OK);
+        } catch {
+          try {
+            fs.chmodSync(candidate, 0o755);
+          } catch {}
+        }
+        cachedFfmpegExecutable = candidate;
+        return candidate;
+      }
+    } catch {}
+  }
+
+  cachedFfmpegExecutable = 'ffmpeg';
+  return 'ffmpeg';
+}
+
+function resolveFfprobeExecutable(): string {
+  const candidates = [
+    process.env.FFPROBE_PATH,
+    process.env.FFPROBE_BIN,
+    '/usr/bin/ffprobe',
+    '/usr/local/bin/ffprobe',
+  ].filter((c): c is string => Boolean(c && c.trim()));
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        return candidate;
+      }
+    } catch {}
+  }
+  return 'ffprobe';
+}
+
+// Helper: Extract exact video duration from downloaded video file via ffprobe, ffmpeg -i, or MP4 binary fallback
 async function extractVideoMetadataFromFile(filePath: string): Promise<{
   durationSec: number | null;
   durationFormatted: string | null;
 }> {
   try {
     const { stdout } = await execFileAsync(
-      'ffprobe',
+      resolveFfprobeExecutable(),
       ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', filePath],
       { timeout: 15000 }
     );
@@ -4957,7 +5011,28 @@ async function extractVideoMetadataFromFile(filePath: string): Promise<{
       };
     }
   } catch {
-    // Fallback to pure Node MP4 atom parser if ffprobe fails or isn't installed
+    // Fallback below (ffmpeg -i probe, then pure-Node MP4 mvhd parser)
+  }
+
+  // Fallback 1: Probe container duration using bundled ffmpeg-static stderr ("Duration: HH:MM:SS.xx")
+  try {
+    await execFileAsync(resolveFfmpegExecutable(), ['-hide_banner', '-i', filePath], {
+      timeout: 15000,
+      maxBuffer: 4 * 1024 * 1024,
+    });
+  } catch (probeErr: any) {
+    const stderr = String(probeErr?.stderr || probeErr?.message || '');
+    const durMatch = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/i);
+    if (durMatch) {
+      const totalSec = Number(durMatch[1]) * 3600 + Number(durMatch[2]) * 60 + Number(durMatch[3]);
+      if (isFinite(totalSec) && totalSec > 0) {
+        const durationSec = Math.max(1, Math.round(totalSec));
+        return {
+          durationSec,
+          durationFormatted: formatDurationSeconds(durationSec),
+        };
+      }
+    }
   }
 
   const mp4Fallback = parseMp4DurationFallback(filePath);
@@ -4971,36 +5046,113 @@ async function extractVideoMetadataFromFile(filePath: string): Promise<{
   return { durationSec: null, durationFormatted: null };
 }
 
-// Pure-Node HLS (.m3u8) downloader fallback when ffmpeg binary is unavailable or fails in production
+function parseHlsByteRange(
+  rawSpec: string,
+  prevOffset: number
+): { length: number; offset: number; nextOffset: number } | null {
+  const m = String(rawSpec || '')
+    .trim()
+    .replace(/^"|"$/g, '')
+    .match(/^(\d+)(?:@(\d+))?$/);
+  if (!m) return null;
+  const length = Number(m[1]);
+  const offset = m[2] !== undefined ? Number(m[2]) : prevOffset;
+  if (!isFinite(length) || length <= 0 || !isFinite(offset) || offset < 0) return null;
+  return { length, offset, nextOffset: offset + length };
+}
+
+// Pure-Node HLS (.m3u8) downloader fallback resilient for large, slow, encrypted, and byte-range streams
 async function downloadHlsViaNodeFallback(
   m3u8Url: string,
   destPath: string,
   refererUrl?: string,
-  cookieHeader?: string
+  cookieHeader?: string,
+  proxyUrl?: string | null
 ): Promise<{ format: 'mp4' | 'ts' }> {
-  const userAgent =
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-  const reqHeaders: Record<string, string> = {
-    'User-Agent': userAgent,
+  const baseHeaders: Record<string, string> = {
     Accept: '*/*',
     Connection: 'close',
     ...(refererUrl ? { Referer: refererUrl } : {}),
     ...(cookieHeader ? { Cookie: cookieHeader } : {}),
   };
 
+  let parsedProxyUrl: URL | null = null;
+  if (proxyUrl) {
+    try {
+      parsedProxyUrl = new URL(proxyUrl.replace(/^proxy:/i, ''));
+    } catch {
+      parsedProxyUrl = null;
+    }
+  }
+
+  const hlsAxiosGet = async <T = any>(
+    targetUrl: string,
+    opts: { responseType: 'text' | 'arraybuffer'; timeoutMs: number; extraHeaders?: Record<string, string> }
+  ): Promise<{ data: T; responseUrl: string }> => {
+    const maxAttempts = 4;
+    let lastErr: any = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const rotatedUa = USER_AGENT_POOL[(serverPoolRoundRobinIdx + attempt) % USER_AGENT_POOL.length];
+      const cfg: Record<string, any> = {
+        ...createNonKeepAliveAgents(),
+        headers: {
+          'User-Agent': rotatedUa,
+          ...baseHeaders,
+          ...(opts.extraHeaders || {}),
+        },
+        responseType: opts.responseType,
+        timeout: opts.timeoutMs,
+        maxRedirects: 5,
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+        decompress: opts.responseType === 'text',
+      };
+
+      if (parsedProxyUrl) {
+        if (targetUrl.toLowerCase().startsWith('https://')) {
+          cfg.proxy = false;
+          cfg.httpsAgent = createHttpConnectHttpsAgent(parsedProxyUrl, 20000);
+        } else {
+          cfg.proxy = {
+            protocol: parsedProxyUrl.protocol.replace(':', ''),
+            host: parsedProxyUrl.hostname,
+            port: Number(parsedProxyUrl.port) || 80,
+          };
+        }
+      }
+
+      try {
+        const res = await axios.get<T>(targetUrl, cfg);
+        const responseUrl = (res.request as any)?.res?.responseUrl || targetUrl;
+        return { data: res.data, responseUrl };
+      } catch (err: any) {
+        lastErr = err;
+        if (attempt < maxAttempts && isRetryableNetworkError(err)) {
+          const retryAfterMs = parseRetryAfterMs(err?.response?.headers);
+          const backoff =
+            retryAfterMs > 0
+              ? retryAfterMs
+              : 700 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 350);
+          await sleepMs(backoff);
+          continue;
+        }
+        throw err;
+      }
+    }
+    throw lastErr || new Error(`Failed HLS request: ${targetUrl}`);
+  };
+
   let mediaPlaylistUrl = m3u8Url;
-  let playlistRes = await axios.get(mediaPlaylistUrl, {
-    ...createNonKeepAliveAgents(),
-    headers: reqHeaders,
+  let playlistRes = await hlsAxiosGet<string>(mediaPlaylistUrl, {
     responseType: 'text',
-    timeout: 30000,
-    maxRedirects: 5,
+    timeoutMs: 60000,
   });
-  mediaPlaylistUrl = (playlistRes.request as any)?.res?.responseUrl || mediaPlaylistUrl;
+  mediaPlaylistUrl = playlistRes.responseUrl;
   let playlistText = String(playlistRes.data || '');
 
-  // If Master Playlist, choose highest-bandwidth variant
-  if (/#EXT-X-STREAM-INF/i.test(playlistText)) {
+  // Unwrap Master Playlists (up to 3 levels) selecting highest-bandwidth variant
+  for (let depth = 0; depth < 3 && /#EXT-X-STREAM-INF/i.test(playlistText); depth++) {
     const lines = playlistText.split(/\r?\n/).map((l) => l.trim());
     let bestUrl = '';
     let bestBandwidth = -1;
@@ -5021,32 +5173,51 @@ async function downloadHlsViaNodeFallback(
         }
       }
     }
-    if (bestUrl) {
-      mediaPlaylistUrl = bestUrl;
-      playlistRes = await axios.get(mediaPlaylistUrl, {
-        ...createNonKeepAliveAgents(),
-        headers: reqHeaders,
-        responseType: 'text',
-        timeout: 30000,
-        maxRedirects: 5,
-      });
-      mediaPlaylistUrl = (playlistRes.request as any)?.res?.responseUrl || mediaPlaylistUrl;
-      playlistText = String(playlistRes.data || '');
-    }
+    if (!bestUrl) break;
+    mediaPlaylistUrl = bestUrl;
+    playlistRes = await hlsAxiosGet<string>(mediaPlaylistUrl, {
+      responseType: 'text',
+      timeoutMs: 60000,
+    });
+    mediaPlaylistUrl = playlistRes.responseUrl;
+    playlistText = String(playlistRes.data || '');
   }
 
   const lines = playlistText.split(/\r?\n/).map((l) => l.trim());
-  let initMapUrl: string | null = null;
+  let mediaSequenceBase = 0;
+  let initMapSpec: { url: string; rangeHeader?: string } | null = null;
   let aesKeyBuf: Buffer | null = null;
   let explicitIvBuf: Buffer | null = null;
-  const segmentUrls: string[] = [];
+  let pendingByteRange: { length: number; offset: number } | null = null;
+  let runningByteOffset = 0;
+  const keyCache = new Map<string, Buffer>();
+
+  interface HlsSegmentTask {
+    url: string;
+    seqNum: number;
+    keyBuf: Buffer | null;
+    explicitIv: Buffer | null;
+    rangeHeader?: string;
+  }
+  const segmentTasks: HlsSegmentTask[] = [];
 
   for (const line of lines) {
     if (!line) continue;
-    if (line.startsWith('#EXT-X-MAP:')) {
+    if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+      const seqVal = Number(line.slice('#EXT-X-MEDIA-SEQUENCE:'.length).trim());
+      if (!isNaN(seqVal) && seqVal >= 0) {
+        mediaSequenceBase = Math.floor(seqVal);
+      }
+    } else if (line.startsWith('#EXT-X-MAP:')) {
       const uriMatch = line.match(/URI="([^"]+)"/i);
       if (uriMatch?.[1]) {
-        initMapUrl = new URL(uriMatch[1], mediaPlaylistUrl).href;
+        const mapUrl = new URL(uriMatch[1], mediaPlaylistUrl).href;
+        const brMatch = line.match(/BYTERANGE="([^"]+)"/i);
+        const br = brMatch?.[1] ? parseHlsByteRange(brMatch[1], 0) : null;
+        initMapSpec = {
+          url: mapUrl,
+          rangeHeader: br ? `bytes=${br.offset}-${br.offset + br.length - 1}` : undefined,
+        };
       }
     } else if (line.startsWith('#EXT-X-KEY:')) {
       const methodMatch = line.match(/METHOD=([^,]+)/i);
@@ -5058,13 +5229,16 @@ async function downloadHlsViaNodeFallback(
         const uriMatch = line.match(/URI="([^"]+)"/i);
         if (uriMatch?.[1]) {
           const keyUrl = new URL(uriMatch[1], mediaPlaylistUrl).href;
-          const keyRes = await axios.get(keyUrl, {
-            ...createNonKeepAliveAgents(),
-            headers: reqHeaders,
-            responseType: 'arraybuffer',
-            timeout: 15000,
-          });
-          aesKeyBuf = Buffer.from(keyRes.data);
+          let cachedKey = keyCache.get(keyUrl);
+          if (!cachedKey) {
+            const keyRes = await hlsAxiosGet<ArrayBuffer>(keyUrl, {
+              responseType: 'arraybuffer',
+              timeoutMs: 60000,
+            });
+            cachedKey = Buffer.from(keyRes.data);
+            keyCache.set(keyUrl, cachedKey);
+          }
+          aesKeyBuf = cachedKey;
           const ivMatch = line.match(/IV=0x([0-9a-fA-F]+)/i);
           if (ivMatch?.[1]) {
             explicitIvBuf = Buffer.from(ivMatch[1].padStart(32, '0').slice(-32), 'hex');
@@ -5075,70 +5249,113 @@ async function downloadHlsViaNodeFallback(
       } else if (method) {
         throw new Error(`Unsupported HLS encryption method: ${method}`);
       }
+    } else if (line.startsWith('#EXT-X-BYTERANGE:')) {
+      const br = parseHlsByteRange(line.slice('#EXT-X-BYTERANGE:'.length), runningByteOffset);
+      if (br) {
+        pendingByteRange = { length: br.length, offset: br.offset };
+        runningByteOffset = br.nextOffset;
+      }
     } else if (!line.startsWith('#')) {
-      segmentUrls.push(new URL(line, mediaPlaylistUrl).href);
+      const segUrl = new URL(line, mediaPlaylistUrl).href;
+      const rangeHeader = pendingByteRange
+        ? `bytes=${pendingByteRange.offset}-${pendingByteRange.offset + pendingByteRange.length - 1}`
+        : undefined;
+      pendingByteRange = null;
+      segmentTasks.push({
+        url: segUrl,
+        seqNum: mediaSequenceBase + segmentTasks.length,
+        keyBuf: aesKeyBuf,
+        explicitIv: explicitIvBuf,
+        rangeHeader,
+      });
     }
   }
 
-  if (segmentUrls.length === 0) {
+  if (segmentTasks.length === 0) {
     throw new Error('HLS playlist contains no media segments');
   }
 
-  const fetchSegBuf = async (segUrl: string, seqIndex: number): Promise<Buffer> => {
-    const segRes = await axios.get(segUrl, {
-      ...createNonKeepAliveAgents(),
-      headers: reqHeaders,
+  const fetchSegBuf = async (task: HlsSegmentTask): Promise<Buffer> => {
+    const segRes = await hlsAxiosGet<ArrayBuffer>(task.url, {
       responseType: 'arraybuffer',
-      timeout: 45000,
-      maxRedirects: 5,
+      timeoutMs: 90000,
+      extraHeaders: task.rangeHeader ? { Range: task.rangeHeader } : undefined,
     });
     const rawBuf = Buffer.from(segRes.data);
-    if (!aesKeyBuf) return rawBuf;
-    let iv = explicitIvBuf;
+    if (!task.keyBuf) return rawBuf;
+    let iv = task.explicitIv;
     if (!iv) {
       iv = Buffer.alloc(16, 0);
-      iv.writeUInt32BE(seqIndex >>> 0, 12);
+      iv.writeUInt32BE(task.seqNum >>> 0, 12);
     }
-    const decipher = crypto.createDecipheriv('aes-128-cbc', aesKeyBuf, iv);
+    const decipher = crypto.createDecipheriv('aes-128-cbc', task.keyBuf, iv);
     return Buffer.concat([decipher.update(rawBuf), decipher.final()]);
   };
 
   const outStream = fs.createWriteStream(destPath);
-  try {
-    if (initMapUrl) {
-      const initRes = await axios.get(initMapUrl, {
-        ...createNonKeepAliveAgents(),
-        headers: reqHeaders,
-        responseType: 'arraybuffer',
-        timeout: 30000,
+  let streamError: Error | null = null;
+  outStream.once('error', (err) => {
+    streamError = err;
+  });
+
+  const writeChunk = async (chunk: Buffer) => {
+    if (streamError) throw streamError;
+    if (!outStream.write(chunk)) {
+      await new Promise<void>((resolve, reject) => {
+        const onDrain = () => {
+          outStream.off('error', onErr);
+          resolve();
+        };
+        const onErr = (err: Error) => {
+          outStream.off('drain', onDrain);
+          reject(err);
+        };
+        outStream.once('drain', onDrain);
+        outStream.once('error', onErr);
       });
-      outStream.write(Buffer.from(initRes.data));
+    }
+  };
+
+  let succeeded = false;
+  try {
+    if (initMapSpec) {
+      const initRes = await hlsAxiosGet<ArrayBuffer>(initMapSpec.url, {
+        responseType: 'arraybuffer',
+        timeoutMs: 60000,
+        extraHeaders: initMapSpec.rangeHeader ? { Range: initMapSpec.rangeHeader } : undefined,
+      });
+      await writeChunk(Buffer.from(initRes.data));
     }
 
-    const CONCURRENCY = 4;
-    for (let i = 0; i < segmentUrls.length; i += CONCURRENCY) {
-      const batch = segmentUrls.slice(i, i + CONCURRENCY);
-      const buffers = await Promise.all(batch.map((u, idx) => fetchSegBuf(u, i + idx)));
+    const CONCURRENCY = segmentTasks.length > 400 ? 3 : 4;
+    for (let i = 0; i < segmentTasks.length; i += CONCURRENCY) {
+      const batch = segmentTasks.slice(i, i + CONCURRENCY);
+      const buffers = await Promise.all(batch.map((task) => fetchSegBuf(task)));
       for (const b of buffers) {
-        if (!outStream.write(b)) {
-          await new Promise<void>((resolve) => outStream.once('drain', resolve));
-        }
+        await writeChunk(b);
       }
     }
+    succeeded = true;
   } finally {
     await new Promise<void>((resolve) => outStream.end(() => resolve()));
+    if (!succeeded) {
+      try {
+        if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+      } catch {}
+    }
   }
 
-  const hasMp4Init = Boolean(initMapUrl) || /\.m4s(\?|$)/i.test(segmentUrls[0] || '');
+  const hasMp4Init = Boolean(initMapSpec) || /\.(m4s|mp4)(\?|$)/i.test(segmentTasks[0]?.url || '');
   return { format: hasMp4Init ? 'mp4' : 'ts' };
 }
 
-// Helper: Download HLS (.m3u8) stream to local MP4/TS file via ffmpeg (with pure-Node fallback)
+// Helper: Download HLS (.m3u8) stream to local MP4/TS file via bundled ffmpeg (with resilient pure-Node fallback)
 async function downloadHlsStreamToMp4(
   m3u8Url: string,
   destPath: string,
   refererUrl?: string,
-  cookieHeader?: string
+  cookieHeader?: string,
+  proxyUrl?: string | null
 ): Promise<{ format: 'mp4' | 'ts' }> {
   const userAgent =
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
@@ -5149,14 +5366,45 @@ async function downloadHlsStreamToMp4(
       ...(cookieHeader ? [`Cookie: ${cookieHeader}`] : []),
     ].join('\r\n') + '\r\n';
 
+  const ffmpegBin = resolveFfmpegExecutable();
+  const cleanProxy = proxyUrl ? proxyUrl.replace(/^proxy:/i, '').trim() : '';
+  const spawnEnv =
+    cleanProxy && /^https?:\/\//i.test(cleanProxy)
+      ? {
+          ...process.env,
+          http_proxy: cleanProxy,
+          https_proxy: cleanProxy,
+          HTTP_PROXY: cleanProxy,
+          HTTPS_PROXY: cleanProxy,
+        }
+      : process.env;
+
+  const execOpts = {
+    timeout: 1800000, // 30-min cap for large HD/4K HLS videos on shared VPS bandwidth
+    maxBuffer: 20 * 1024 * 1024,
+    env: spawnEnv,
+  };
+
   let ffmpegErr: any = null;
   try {
     await execFileAsync(
-      'ffmpeg',
+      ffmpegBin,
       [
         '-y',
         '-loglevel',
         'error',
+        '-reconnect',
+        '1',
+        '-reconnect_streamed',
+        '1',
+        '-reconnect_on_network_error',
+        '1',
+        '-reconnect_on_http_error',
+        '429,5xx',
+        '-reconnect_delay_max',
+        '5',
+        '-rw_timeout',
+        '60000000',
         '-headers',
         headerLines,
         '-i',
@@ -5169,16 +5417,23 @@ async function downloadHlsStreamToMp4(
         '+faststart',
         destPath,
       ],
-      { timeout: 300000 }
+      execOpts
     );
-    return { format: 'mp4' };
+    if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) {
+      return { format: 'mp4' };
+    }
+    throw new Error('FFmpeg produced an empty HLS output file');
   } catch (err1: any) {
     ffmpegErr = err1;
-    // Skip second ffmpeg spawn if ffmpeg binary isn't installed in container
-    if (err1?.code !== 'ENOENT') {
+    try {
+      if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+    } catch {}
+
+    // Skip second ffmpeg spawn if binary is missing or crashed (e.g. static build under gVisor)
+    if (err1?.code !== 'ENOENT' && err1?.signal !== 'SIGSEGV' && err1?.signal !== 'SIGABRT') {
       try {
         await execFileAsync(
-          'ffmpeg',
+          ffmpegBin,
           [
             '-y',
             '-loglevel',
@@ -5193,18 +5448,24 @@ async function downloadHlsStreamToMp4(
             '+faststart',
             destPath,
           ],
-          { timeout: 300000 }
+          execOpts
         );
-        return { format: 'mp4' };
+        if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) {
+          return { format: 'mp4' };
+        }
+        throw new Error('FFmpeg second attempt produced an empty HLS output file');
       } catch (err2: any) {
         ffmpegErr = err2;
+        try {
+          if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+        } catch {}
       }
     }
   }
 
-  // Fallback to pure Node HLS segment downloader when ffmpeg is missing or failed
+  // Fallback to pure Node HLS segment downloader when ffmpeg fails or isn't executable
   try {
-    return await downloadHlsViaNodeFallback(m3u8Url, destPath, refererUrl, cookieHeader);
+    return await downloadHlsViaNodeFallback(m3u8Url, destPath, refererUrl, cookieHeader, proxyUrl);
   } catch (nodeErr: any) {
     throw new Error(
       `HLS download failed (ffmpeg: ${formatCompactError(ffmpegErr)}; node-hls: ${formatCompactError(nodeErr)})`
@@ -5308,7 +5569,7 @@ async function compressVideoWithFfmpeg(
 
   try {
     await execFileAsync(
-      'ffmpeg',
+      resolveFfmpegExecutable(),
       [
         '-y',
         '-loglevel',
@@ -5341,7 +5602,7 @@ async function compressVideoWithFfmpeg(
         '2',
         outputPath,
       ],
-      { timeout: 600000 }
+      { timeout: 1800000, maxBuffer: 20 * 1024 * 1024 }
     );
   } finally {
     activeFfmpegCompressions = Math.max(0, activeFfmpegCompressions - 1);
@@ -5493,15 +5754,17 @@ async function uploadVideoToR2OrLocal(params: {
 
     try {
       if (looksLikeHls) {
-        const hlsOut = await downloadHlsStreamToMp4(videoUrl, tempFilePath, useReferer || primaryReferer, cookieHeader);
+        const hlsOut = await downloadHlsStreamToMp4(videoUrl, tempFilePath, attempt === 3 ? undefined : useReferer || undefined, cookieHeader, useProxy);
         downloadedHlsFormat = hlsOut.format;
         contentType = hlsOut.format === 'ts' ? 'video/mp2t' : 'video/mp4';
       } else {
         const axiosCfg: Record<string, any> = {
           ...createNonKeepAliveAgents(),
           responseType: 'stream',
-          timeout: 300000, // 5-min timeout to tolerate bandwidth sharing across concurrent workers
+          timeout: 600000, // 10-min socket inactivity timeout for large multi-GB video streams
           maxRedirects: 5,
+          maxContentLength: Infinity,
+          maxBodyLength: Infinity,
           decompress: false,
           headers: {
             'User-Agent': rotatedUa,
@@ -5518,7 +5781,7 @@ async function uploadVideoToR2OrLocal(params: {
           const pUrl = new URL(useProxy.replace(/^proxy:/i, ''));
           if (videoUrl.toLowerCase().startsWith('https://')) {
             axiosCfg.proxy = false;
-            axiosCfg.httpsAgent = createHttpConnectHttpsAgent(pUrl, 15000);
+            axiosCfg.httpsAgent = createHttpConnectHttpsAgent(pUrl, 20000);
           } else {
             axiosCfg.proxy = {
               protocol: pUrl.protocol.replace(':', ''),
@@ -5543,7 +5806,7 @@ async function uploadVideoToR2OrLocal(params: {
           if (videoStreamRes.data && typeof videoStreamRes.data.destroy === 'function') {
             videoStreamRes.data.destroy();
           }
-          const hlsOut = await downloadHlsStreamToMp4(videoUrl, tempFilePath, useReferer || primaryReferer, cookieHeader);
+          const hlsOut = await downloadHlsStreamToMp4(videoUrl, tempFilePath, useReferer || primaryReferer, cookieHeader, useProxy);
           downloadedHlsFormat = hlsOut.format;
           contentType = hlsOut.format === 'ts' ? 'video/mp2t' : 'video/mp4';
         } else {
@@ -5574,7 +5837,7 @@ async function uploadVideoToR2OrLocal(params: {
               try {
                 if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
               } catch {}
-              const hlsOut = await downloadHlsStreamToMp4(videoUrl, tempFilePath, useReferer || primaryReferer, cookieHeader);
+              const hlsOut = await downloadHlsStreamToMp4(videoUrl, tempFilePath, useReferer || primaryReferer, cookieHeader, useProxy);
               downloadedHlsFormat = hlsOut.format;
               contentType = hlsOut.format === 'ts' ? 'video/mp2t' : 'video/mp4';
             } else if (/^(<!doctype|<html|<head|<body|\{")/i.test(headStr)) {
@@ -5606,12 +5869,14 @@ async function uploadVideoToR2OrLocal(params: {
         if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
       } catch {}
 
+      const errMsgStr = String(downloadErr?.message || '');
       if (
         attempt < totalDownloadAttempts &&
         (isRetryableNetworkError(downloadErr) ||
           downloadErr?.response?.status === 403 ||
           downloadErr?.response?.status === 401 ||
-          String(downloadErr?.message || '').includes('Truncated video download'))
+          /HTTP\s*(401|403|408|425|429|5\d\d)/i.test(errMsgStr) ||
+          errMsgStr.includes('Truncated video download'))
       ) {
         const backoff = 550 * Math.pow(2, Math.min(3, attempt - 1)) + Math.floor(Math.random() * 300);
         await sleepMs(backoff);
@@ -5702,7 +5967,7 @@ async function uploadVideoToR2OrLocal(params: {
         const fileStream = fs.createReadStream(uploadFilePath);
         try {
           if (fileSize >= 8 * 1024 * 1024) {
-            // Multi-part parallel R2 upload (4 concurrent 8MB streams) for faster uploads on larger videos
+            // Multi-part parallel R2 upload (4 concurrent 8MB/16MB streams) for reliable uploads on large videos
             const parallelUpload = new Upload({
               client: s3,
               params: {
@@ -5713,7 +5978,7 @@ async function uploadVideoToR2OrLocal(params: {
                 CacheControl: 'public, max-age=31536000',
               },
               queueSize: 4,
-              partSize: 8 * 1024 * 1024,
+              partSize: fileSize >= 1024 * 1024 * 1024 ? 16 * 1024 * 1024 : 8 * 1024 * 1024,
               leavePartsOnError: false,
             });
             await parallelUpload.done();
@@ -7105,23 +7370,52 @@ app.get('/api/system-resources', (_req: Request, res: Response) => {
     const memUsagePercent = totalMem > 0 ? Math.round((usedMem / totalMem) * 100) : 0;
     const processMem = process.memoryUsage();
 
-    // Disk space via fs.statfsSync('/')
+    // Disk space on active uploads/storage partition via fs.statfsSync
+    const diskTargetPath = fs.existsSync(localUploadsDir)
+      ? localUploadsDir
+      : fs.existsSync(process.cwd())
+      ? process.cwd()
+      : '/';
     let diskTotal = 0;
     let diskFree = 0;
     let diskUsed = 0;
     let diskUsagePercent = 0;
     try {
-      const stat = fs.statfsSync('/');
+      const stat = fs.statfsSync(diskTargetPath);
       diskTotal = stat.blocks * stat.bsize;
       diskFree = stat.bavail * stat.bsize;
-      diskUsed = Math.max(0, diskTotal - diskFree);
-      diskUsagePercent = diskTotal > 0 ? Math.round((diskUsed / diskTotal) * 100) : 0;
+      diskUsed =
+        typeof stat.bfree === 'number'
+          ? Math.max(0, (stat.blocks - stat.bfree) * stat.bsize)
+          : Math.max(0, diskTotal - diskFree);
+      const usableDenominator = diskUsed + diskFree;
+      diskUsagePercent =
+        usableDenominator > 0
+          ? Math.min(100, Math.round((diskUsed / usableDenominator) * 100))
+          : diskTotal > 0
+          ? Math.min(100, Math.round((diskUsed / diskTotal) * 100))
+          : 0;
     } catch {
       diskTotal = 50 * 1024 * 1024 * 1024;
       diskFree = 40 * 1024 * 1024 * 1024;
       diskUsed = 10 * 1024 * 1024 * 1024;
       diskUsagePercent = 20;
     }
+
+    // Measure temporary working files currently in uploads/ (active downloads/ffmpeg temp files)
+    let tempUploadsBytes = 0;
+    let tempFileCount = 0;
+    try {
+      const entries = fs.readdirSync(localUploadsDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isFile()) {
+          try {
+            tempUploadsBytes += fs.statSync(path.join(localUploadsDir, entry.name)).size;
+            tempFileCount++;
+          } catch {}
+        }
+      }
+    } catch {}
 
     // Dynamic Worker Recommendation calculation (range: 1 - 50)
     // Network/TLS scraping & streaming is I/O-bound (~95% socket wait), so each vCPU can drive ~10 concurrent workers toward 70-80% core usage
@@ -7183,7 +7477,11 @@ app.get('/api/system-resources', (_req: Request, res: Response) => {
         totalFormatted: formatBytes(diskTotal),
         usedFormatted: formatBytes(diskUsed),
         freeFormatted: formatBytes(diskFree),
-        mountPoint: '/',
+        availableFormatted: formatBytes(diskFree),
+        tempUploadsBytes,
+        tempUploadsFormatted: formatBytes(tempUploadsBytes),
+        tempFileCount,
+        mountPoint: diskTargetPath,
       },
       vpsRecommendation: {
         recommendedWorkers,
@@ -7417,12 +7715,15 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on port ${PORT} (Cloudflare Worker D1: ${CF_WORKER_BASE_URL})`);
     hydrateRegistryFromD1IfNeeded()
       .then(() => loadAndResumeVpsBatchJob())
       .catch(() => {});
   });
+  httpServer.requestTimeout = 0;
+  httpServer.headersTimeout = 120000;
+  httpServer.keepAliveTimeout = 65000;
 }
 
 startServer().catch((err) => {

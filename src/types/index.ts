@@ -195,6 +195,10 @@ export interface SystemResourcesResponse {
     totalFormatted: string;
     usedFormatted: string;
     freeFormatted: string;
+    availableFormatted?: string;
+    tempUploadsBytes?: number;
+    tempUploadsFormatted?: string;
+    tempFileCount?: number;
     mountPoint: string;
   };
   vpsRecommendation: {

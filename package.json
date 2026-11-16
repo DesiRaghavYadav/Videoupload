@@ -22,6 +22,7 @@
     "cheerio": "^1.2.0",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
+    "ffmpeg-static": "^5.3.0",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
     "multer": "^2.5.0",

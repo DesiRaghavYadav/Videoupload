@@ -174,30 +174,36 @@ export const VpsResourceBar: React.FC<VpsResourceBarProps> = ({
               </div>
             </div>
 
-            {/* 3. DISK SPACE */}
-            <div className="bg-slate-950/70 border border-slate-800/80 rounded-xl px-3 py-2 flex items-center justify-between gap-2 hover:border-slate-700/80 transition-colors">
-              <div className="flex items-center gap-2.5 min-w-0">
+            {/* 3. DISK SPACE (AVAILABLE / USED / TOTAL) */}
+            <div
+              className="bg-slate-950/70 border border-slate-800/80 rounded-xl px-3 py-2 flex items-center justify-between gap-2 hover:border-slate-700/80 transition-colors"
+              title={
+                telemetry
+                  ? `Available: ${telemetry.disk.freeFormatted} · Used: ${telemetry.disk.usedFormatted} (${telemetry.disk.usedPercent}%) · Total: ${telemetry.disk.totalFormatted}`
+                  : 'Disk storage telemetry'
+              }
+            >
+              <div className="flex items-center gap-2 min-w-0">
                 <div className="p-1.5 rounded-lg bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 shrink-0">
                   <HardDrive className="w-3.5 h-3.5" />
                 </div>
                 <div className="min-w-0">
                   <div className="flex items-center gap-1.5">
-                    <span className="font-semibold text-white tracking-tight text-[11px] sm:text-xs">
-                      Disk: {telemetry ? telemetry.disk.usedFormatted : '--'}
+                    <span className="font-semibold text-white tracking-tight text-[11px] sm:text-xs truncate">
+                      Avail: {telemetry ? telemetry.disk.freeFormatted : '--'}
                     </span>
-                    <span className="text-[10px] text-slate-400 font-mono hidden sm:inline">
-                      / {telemetry?.disk.totalFormatted}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-1 text-[10px] text-slate-400">
-                    <span className={`font-mono font-bold ${diskColors.text}`}>
+                    <span className={`text-[10px] font-mono font-bold shrink-0 ${diskColors.text}`}>
                       {telemetry ? `${telemetry.disk.usedPercent}%` : '--%'}
                     </span>
-                    <span className="truncate hidden sm:inline">({telemetry?.disk.freeFormatted} free)</span>
+                  </div>
+                  <div className="flex items-center gap-1 text-[10px] text-slate-400 font-mono truncate">
+                    <span>
+                      Used {telemetry ? telemetry.disk.usedFormatted : '--'} / {telemetry ? telemetry.disk.totalFormatted : '--'}
+                    </span>
                   </div>
                 </div>
               </div>
-              <div className="w-10 sm:w-12 h-1.5 bg-slate-800 rounded-full overflow-hidden shrink-0">
+              <div className="w-8 sm:w-10 h-1.5 bg-slate-800 rounded-full overflow-hidden shrink-0">
                 <div
                   className={`h-full ${diskColors.bg} transition-all duration-500`}
                   style={{ width: `${Math.min(100, Math.max(3, telemetry?.disk.usedPercent ?? 0))}%` }}
@@ -342,7 +348,7 @@ export const VpsResourceBar: React.FC<VpsResourceBarProps> = ({
 
         {/* Expandable Technical Telemetry Drawer */}
         {isExpanded && telemetry && (
-          <div className="mt-3 pt-3 border-t border-slate-800/80 grid grid-cols-1 md:grid-cols-4 gap-3 animate-fadeIn text-[11px]">
+          <div className="mt-3 pt-3 border-t border-slate-800/80 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 animate-fadeIn text-[11px]">
             {/* CPU & Host Details */}
             <div className="bg-slate-950/60 p-2.5 rounded-xl border border-slate-800/60 space-y-1">
               <div className="text-[10px] uppercase font-bold text-cyan-400 tracking-wider flex items-center gap-1">
@@ -379,6 +385,35 @@ export const VpsResourceBar: React.FC<VpsResourceBarProps> = ({
               <div className="flex justify-between text-slate-400 text-[10px]">
                 <span>Available Free:</span>
                 <span className="font-mono text-emerald-400">{telemetry.ram.freeFormatted}</span>
+              </div>
+            </div>
+
+            {/* Disk Storage (Available / Used / Total) */}
+            <div className="bg-slate-950/60 p-2.5 rounded-xl border border-slate-800/60 space-y-1">
+              <div className="text-[10px] uppercase font-bold text-emerald-400 tracking-wider flex items-center justify-between gap-1">
+                <span className="flex items-center gap-1">
+                  <HardDrive className="w-3 h-3" />
+                  <span>Disk Storage</span>
+                </span>
+                <span className={`font-mono text-[10px] ${diskColors.text}`}>{telemetry.disk.usedPercent}% used</span>
+              </div>
+              <div className="flex justify-between text-slate-300 text-[10px]">
+                <span>Available Space:</span>
+                <span className="font-mono font-semibold text-emerald-400">{telemetry.disk.freeFormatted}</span>
+              </div>
+              <div className="flex justify-between text-slate-300 text-[10px]">
+                <span>Used Space:</span>
+                <span className={`font-mono font-semibold ${diskColors.text}`}>{telemetry.disk.usedFormatted}</span>
+              </div>
+              <div className="flex justify-between text-slate-300 text-[10px]">
+                <span>Total Capacity:</span>
+                <span className="font-mono text-white">{telemetry.disk.totalFormatted}</span>
+              </div>
+              <div className="flex justify-between text-slate-400 text-[9px] pt-1 border-t border-slate-800/60">
+                <span>Active Temp ({telemetry.disk.tempFileCount ?? 0}):</span>
+                <span className="font-mono text-amber-300 truncate max-w-[140px]" title={telemetry.disk.mountPoint}>
+                  {telemetry.disk.tempUploadsFormatted || '0 B'}
+                </span>
               </div>
             </div>
 
