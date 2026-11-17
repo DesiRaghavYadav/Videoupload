@@ -33,6 +33,8 @@ import { Cloud, ShieldCheck, HardDrive, Zap, Globe, ArrowRight } from 'lucide-re
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<AppTabType>('dashboard');
+  const hasUserSwitchedTabRef = React.useRef(false);
+  const hasAutoRestoredQueueViewRef = React.useRef(false);
   const [r2Status, setR2Status] = useState<R2StatusResponse | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
@@ -204,7 +206,20 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
+  const handleSelectTab = useCallback((tab: AppTabType) => {
+    hasUserSwitchedTabRef.current = true;
+    setActiveTab(tab);
+  }, []);
+
   const handleBatchProgressUpdate = useCallback((batchStatus: any) => {
+    if (
+      batchStatus?.isRunning &&
+      !hasUserSwitchedTabRef.current &&
+      !hasAutoRestoredQueueViewRef.current
+    ) {
+      hasAutoRestoredQueueViewRef.current = true;
+      setActiveTab('webprocessor');
+    }
     setWebProcessorBatchStatus((prev) => {
       if (!batchStatus && !prev) return null;
       if (
@@ -244,7 +259,7 @@ export default function App() {
         r2Status={r2Status}
         onOpenSettings={() => setIsSettingsOpen(true)}
         activeTab={activeTab}
-        setActiveTab={setActiveTab}
+        setActiveTab={handleSelectTab}
         webProcessorBatchStatus={webProcessorBatchStatus}
       />
 
@@ -502,30 +517,46 @@ export default function App() {
       </footer>
 
       {/* Floating Background Processor Monitor (Visible while user browses other tabs) */}
-      {webProcessorBatchStatus?.isRunning && activeTab !== 'webprocessor' && (
+      {(webProcessorBatchStatus?.isRunning || (webProcessorBatchStatus && webProcessorBatchStatus.totalCount > 0)) && activeTab !== 'webprocessor' && (
         <div className="fixed bottom-6 right-6 z-50 p-4 bg-slate-900/95 border border-cyan-500/50 rounded-2xl shadow-2xl backdrop-blur-md flex items-center gap-4 text-xs animate-fadeIn max-w-md ring-1 ring-cyan-500/30">
           <div className="flex items-center gap-3">
             <div className="relative shrink-0">
-              <span className="w-3 h-3 rounded-full bg-cyan-400 block animate-ping absolute" />
-              <span className="w-3 h-3 rounded-full bg-cyan-500 block" />
+              {webProcessorBatchStatus.isRunning && !webProcessorBatchStatus.isPaused && (
+                <span className="w-3 h-3 rounded-full bg-cyan-400 block animate-ping absolute" />
+              )}
+              <span
+                className={`w-3 h-3 rounded-full block ${
+                  webProcessorBatchStatus.isRunning && !webProcessorBatchStatus.isPaused
+                    ? 'bg-cyan-500'
+                    : webProcessorBatchStatus.isPaused
+                    ? 'bg-amber-400'
+                    : 'bg-emerald-400'
+                }`}
+              />
             </div>
             <div className="space-y-0.5">
               <div className="flex items-center gap-2">
                 <span className="font-bold text-white text-xs flex items-center gap-1">
                   <Globe className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>Web Processor Active</span>
+                  <span>
+                    {webProcessorBatchStatus.isRunning && !webProcessorBatchStatus.isPaused
+                      ? 'Web Processor Active'
+                      : webProcessorBatchStatus.isPaused
+                      ? 'Web Processor Paused'
+                      : 'Web Processor Queues Saved'}
+                  </span>
                 </span>
                 <span className="px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 font-mono text-[10px] font-bold border border-cyan-500/30">
                   {webProcessorBatchStatus.concurrency}x Workers
                 </span>
               </div>
               <p className="text-slate-400 text-[11px]">
-                {webProcessorBatchStatus.completedCount} / {webProcessorBatchStatus.totalCount} completed ({Math.round((webProcessorBatchStatus.completedCount / Math.max(1, webProcessorBatchStatus.totalCount)) * 100)}%) · Running in background
+                {webProcessorBatchStatus.completedCount} / {webProcessorBatchStatus.totalCount} completed ({Math.round((webProcessorBatchStatus.completedCount / Math.max(1, webProcessorBatchStatus.totalCount)) * 100)}%) · {webProcessorBatchStatus.isRunning ? 'Running in background' : 'Ready to inspect'}
               </p>
             </div>
           </div>
           <button
-            onClick={() => setActiveTab('webprocessor')}
+            onClick={() => handleSelectTab('webprocessor')}
             className="px-3 py-1.5 bg-gradient-to-r from-cyan-500 to-teal-500 hover:from-cyan-400 hover:to-teal-400 text-slate-950 font-bold rounded-xl transition-all shadow-md shrink-0 flex items-center gap-1"
           >
             <span>Open</span>

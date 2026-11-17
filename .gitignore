@@ -2,6 +2,13 @@ node_modules/
 build/
 dist/
 coverage/
+uploads/
+*.mp4
+*.mkv
+*.mov
+*.webm
+temp_vid_*
+temp_comp_*
 .DS_Store
 *.log
 .env*

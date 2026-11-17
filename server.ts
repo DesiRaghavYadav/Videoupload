@@ -6,6 +6,8 @@ import os from 'os';
 import http from 'http';
 import https from 'https';
 import tls from 'tls';
+import dns from 'dns';
+import net from 'net';
 import { pipeline } from 'stream/promises';
 import { execFile } from 'child_process';
 import crypto from 'crypto';
@@ -15,6 +17,7 @@ import dotenv from 'dotenv';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import ffmpegStatic from 'ffmpeg-static';
+import { chromium } from 'playwright-core';
 
 const execFileAsync = promisify(execFile);
 import {
@@ -25,12 +28,19 @@ import {
   HeadObjectCommand,
 } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
 
-// Initialize dotenv & expand libuv threadpool for parallel DNS/file streaming
+// Initialize dotenv, expand libuv threadpool, and prefer IPv4 to prevent 13s IPv6 handshake stalls on Cloud Run -> Cloudflare R2
 dotenv.config();
 if (!process.env.UV_THREADPOOL_SIZE) {
   process.env.UV_THREADPOOL_SIZE = '16';
 }
+try {
+  dns.setDefaultResultOrder('ipv4first');
+  if (typeof (net as any).setDefaultAutoSelectFamilyAttemptTimeout === 'function') {
+    (net as any).setDefaultAutoSelectFamilyAttemptTimeout(250);
+  }
+} catch {}
 
 // Format network/Axios errors concisely without dumping raw TLSSocket / ClientRequest internals
 function formatCompactError(err: any): string {
@@ -676,6 +686,40 @@ if (!fs.existsSync(localVideosDir)) fs.mkdirSync(localVideosDir, { recursive: tr
 if (!fs.existsSync(localThumbsDir)) fs.mkdirSync(localThumbsDir, { recursive: true });
 if (!fs.existsSync(localDatabaseDir)) fs.mkdirSync(localDatabaseDir, { recursive: true });
 
+// Store transient video downloads & FFmpeg scratch files in OS tmpdir so large binaries never bloat the project workspace
+let localTempDir = path.join(os.tmpdir(), 'ott-temp');
+try {
+  if (!fs.existsSync(localTempDir)) {
+    fs.mkdirSync(localTempDir, { recursive: true });
+  }
+  fs.accessSync(localTempDir, fs.constants.W_OK);
+} catch {
+  localTempDir = localUploadsDir;
+}
+
+// Sweep stale temp_vid_* / temp_comp_* files left behind by previous interrupted runs (>30m old)
+function cleanupOrphanedTempVideoFiles(maxAgeMs = 30 * 60 * 1000) {
+  const now = Date.now();
+  const dirs = Array.from(new Set([localTempDir, localUploadsDir]));
+  for (const dir of dirs) {
+    try {
+      if (!fs.existsSync(dir)) continue;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        if (!/^(temp_vid_|temp_comp_)/i.test(entry.name)) continue;
+        const fullPath = path.join(dir, entry.name);
+        try {
+          const st = fs.statSync(fullPath);
+          if (now - st.mtimeMs >= maxAgeMs) {
+            fs.unlinkSync(fullPath);
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+}
+cleanupOrphanedTempVideoFiles();
+
 // Parse JSON bodies
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
@@ -819,17 +863,66 @@ function getR2Config(req?: Request): R2Config | null {
   };
 }
 
+const r2SharedHttpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 30000,
+  maxSockets: 256,
+  maxFreeSockets: 64,
+  scheduling: 'lifo',
+  timeout: 180000,
+});
+
+const r2SharedHttpHandler = new NodeHttpHandler({
+  httpsAgent: r2SharedHttpsAgent,
+  connectionTimeout: 15000,
+  socketTimeout: 180000,
+  requestTimeout: 0,
+});
+
+const r2ClientCache = new Map<string, S3Client>();
+let activeR2VideoUploads = 0;
+
+function getR2MultipartTuning(fileSizeBytes: number): { queueSize: number; partSize: number } {
+  const concurrentNow = Math.max(1, activeR2VideoUploads);
+  const queueSize =
+    concurrentNow <= 1 ? 12 : concurrentNow === 2 ? 8 : concurrentNow <= 5 ? 6 : 4;
+  const partSize =
+    fileSizeBytes >= 512 * 1024 * 1024
+      ? 16 * 1024 * 1024
+      : fileSizeBytes >= 80 * 1024 * 1024
+      ? 8 * 1024 * 1024
+      : 5 * 1024 * 1024;
+  return { queueSize, partSize };
+}
+
 function createR2Client(config: R2Config): S3Client {
-  return new S3Client({
+  const cacheKey = crypto
+    .createHash('sha256')
+    .update(`${config.accountId}|${config.accessKeyId}|${config.secretAccessKey}`)
+    .digest('hex')
+    .slice(0, 24);
+  const cached = r2ClientCache.get(cacheKey);
+  if (cached) return cached;
+
+  const client = new S3Client({
     region: 'auto',
     endpoint: `https://${config.accountId}.r2.cloudflarestorage.com`,
     credentials: {
       accessKeyId: config.accessKeyId,
       secretAccessKey: config.secretAccessKey,
     },
+    requestHandler: r2SharedHttpHandler,
     requestChecksumCalculation: 'WHEN_REQUIRED',
     responseChecksumValidation: 'WHEN_REQUIRED',
+    maxAttempts: 4,
   });
+
+  if (r2ClientCache.size >= 16) {
+    const firstKey = r2ClientCache.keys().next().value;
+    if (firstKey) r2ClientCache.delete(firstKey);
+  }
+  r2ClientCache.set(cacheKey, client);
+  return client;
 }
 
 export interface VerificationStep {
@@ -1203,20 +1296,46 @@ app.post('/api/upload', (req: Request, res: Response) => {
 
       // STEP 4: Video Upload to Cloudflare R2 & Read-after-Write Verification
       try {
-        const videoUploadResult = await s3.send(
-          new PutObjectCommand({
-            Bucket: r2Config.bucketName,
-            Key: videoKey,
-            Body: videoFile.buffer,
-            ContentType: videoFile.mimetype || 'video/mp4',
-            Metadata: {
-              'original-name': encodeURIComponent(videoFile.originalname),
-              'duration-seconds': String(clientMetadata.duration || 0),
-              'extracted-timestamp': String(captureTimestamp),
+        if (videoFile.size > 5 * 1024 * 1024) {
+          const { queueSize, partSize } = getR2MultipartTuning(videoFile.size);
+          const parallelUpload = new Upload({
+            client: s3,
+            params: {
+              Bucket: r2Config.bucketName,
+              Key: videoKey,
+              Body: videoFile.buffer,
+              ContentType: videoFile.mimetype || 'video/mp4',
+              CacheControl: 'public, max-age=31536000',
+              Metadata: {
+                'original-name': encodeURIComponent(videoFile.originalname),
+                'duration-seconds': String(clientMetadata.duration || 0),
+                'extracted-timestamp': String(captureTimestamp),
+              },
             },
-          })
-        );
-        etagVideo = videoUploadResult.ETag || null;
+            queueSize,
+            partSize,
+            leavePartsOnError: false,
+          });
+          const upRes = await parallelUpload.done();
+          etagVideo = upRes.ETag || null;
+        } else {
+          const videoUploadResult = await s3.send(
+            new PutObjectCommand({
+              Bucket: r2Config.bucketName,
+              Key: videoKey,
+              Body: videoFile.buffer,
+              ContentLength: videoFile.size,
+              ContentType: videoFile.mimetype || 'video/mp4',
+              CacheControl: 'public, max-age=31536000',
+              Metadata: {
+                'original-name': encodeURIComponent(videoFile.originalname),
+                'duration-seconds': String(clientMetadata.duration || 0),
+                'extracted-timestamp': String(captureTimestamp),
+              },
+            })
+          );
+          etagVideo = videoUploadResult.ETag || null;
+        }
 
         // READ-AFTER-WRITE VERIFICATION: Verify object exists in Cloudflare R2
         const headVideo = await s3.send(
@@ -2458,6 +2577,8 @@ interface VpsBatchTask {
     | 'checking_registry'
     | 'skipped_in_cloudflare'
     | 'scraping'
+    | 'downloading_video'
+    | 'compressing_video'
     | 'uploading_cloudflare'
     | 'completed'
     | 'error';
@@ -2564,6 +2685,7 @@ interface VpsBatchJobState {
   startTime: string;
   endTime?: string;
   lastUpdatedAt: string;
+  appBaseUrl?: string;
   activeQueueId?: string;
   nextQueueNumber?: number;
   queues: VpsBatchQueue[];
@@ -2656,12 +2778,212 @@ const VPS_QUEUE_SCOPE = resolveVpsQueueScope();
 const vpsJobFilePath = VPS_QUEUE_SCOPE.jobFilePath;
 let activeVpsBatchJob: VpsBatchJobState | null = null;
 let activeVpsJobR2Config: R2Config | null = null;
-let activeVpsJobAppBaseUrl = 'http://localhost:3000';
+let activeVpsJobAppBaseUrl = resolveValidAppBaseUrl();
 let vpsBatchCancelFlag = false;
 let vpsBatchPauseFlag = false;
+let vpsServerShuttingDown = false;
 let vpsWorkerLoopActive = false;
 let triggerVpsWorkerScaleUp: (() => void) | null = null;
 let lastD1JobSyncAt = 0;
+let vpsBatchInitPromise: Promise<void> | null = null;
+let lastVpsBatchInitAttemptAt = 0;
+
+function isPublicHttpBaseUrl(rawUrl?: string): boolean {
+  if (!rawUrl) return false;
+  try {
+    const parsed = new URL(/^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`);
+    if (!/^https?:$/i.test(parsed.protocol)) return false;
+    return !isPlaceholderOrLocalHost(parsed.host);
+  } catch {
+    return false;
+  }
+}
+
+function resolveValidAppBaseUrl(req?: Request): string {
+  if (req) {
+    const rawHost = String(req.headers['x-forwarded-host'] || req.get('host') || '')
+      .split(',')[0]
+      .trim();
+    const rawProto = String(req.headers['x-forwarded-proto'] || req.protocol || 'http')
+      .split(',')[0]
+      .trim()
+      .replace(/[^a-z]/gi, '') || 'http';
+    if (rawHost && !isPlaceholderOrLocalHost(rawHost)) {
+      return `${rawProto}://${rawHost}`.replace(/\/+$/, '');
+    }
+  }
+
+  const envUrl = getEnvValue(['APP_URL', 'PUBLIC_URL', 'NEXT_PUBLIC_APP_URL']);
+  if (envUrl && isPublicHttpBaseUrl(envUrl)) {
+    const normalized = /^https?:\/\//i.test(envUrl) ? envUrl : `https://${envUrl}`;
+    return normalized.replace(/\/+$/, '');
+  }
+
+  if (req) {
+    const rawHost = String(req.get('host') || '').trim();
+    if (rawHost && !isPlaceholderOrLocalHost(`http://${rawHost}`) && !/^(my_app_url|undefined|null)$/i.test(rawHost)) {
+      return `${req.protocol || 'http'}://${rawHost}`.replace(/\/+$/, '');
+    }
+  }
+
+  return 'http://localhost:3000';
+}
+
+function captureRequestRuntimeContext(req?: Request): void {
+  if (!req) return;
+  const r2FromReq = getR2Config(req);
+  if (r2FromReq) {
+    activeVpsJobR2Config = r2FromReq;
+  }
+  const resolvedUrl = resolveValidAppBaseUrl(req);
+  if (isPublicHttpBaseUrl(resolvedUrl) || !isPublicHttpBaseUrl(activeVpsJobAppBaseUrl)) {
+    activeVpsJobAppBaseUrl = resolvedUrl;
+    if (activeVpsBatchJob && isPublicHttpBaseUrl(resolvedUrl)) {
+      activeVpsBatchJob.appBaseUrl = resolvedUrl;
+    }
+  }
+  if (
+    isPublicHttpBaseUrl(activeVpsJobAppBaseUrl) &&
+    activeVpsBatchJob?.isRunning &&
+    !vpsBatchPauseFlag &&
+    !vpsBatchCancelFlag &&
+    !vpsServerShuttingDown &&
+    hasAnyPendingOrRetryableWork(activeVpsBatchJob)
+  ) {
+    startVpsCloudKeepAliveLoop();
+  }
+}
+
+// Public Ingress Self-Keep-Alive for Cloud Run / serverless VPS containers:
+// Holds 1 active streaming HTTP request open through public URL while queues are actively running
+// so CPU stays unthrottled on free request-based Cloud Run tiers even after user closes Chrome/tab.
+let vpsCloudKeepAliveActive = false;
+let vpsCloudKeepAliveMode: 'active' | 'iap_blocked' | 'no_public_url' | 'idle' = 'idle';
+let vpsCloudKeepAliveBlockedUntil = 0;
+const activeKeepAliveControllers = new Set<AbortController>();
+
+function stopVpsCloudKeepAliveLoop(): void {
+  vpsCloudKeepAliveActive = false;
+  vpsCloudKeepAliveMode = 'idle';
+  for (const ctrl of Array.from(activeKeepAliveControllers)) {
+    try {
+      ctrl.abort();
+    } catch {}
+  }
+  activeKeepAliveControllers.clear();
+}
+
+function startVpsCloudKeepAliveLoop(): void {
+  if (vpsCloudKeepAliveActive) return;
+  if (!activeVpsBatchJob?.isRunning || vpsBatchPauseFlag || vpsBatchCancelFlag || vpsServerShuttingDown) {
+    vpsCloudKeepAliveMode = 'idle';
+    return;
+  }
+  if (!isPublicHttpBaseUrl(activeVpsJobAppBaseUrl)) {
+    vpsCloudKeepAliveMode = 'no_public_url';
+    return;
+  }
+  if (Date.now() < vpsCloudKeepAliveBlockedUntil) {
+    vpsCloudKeepAliveMode = 'iap_blocked';
+    return;
+  }
+
+  vpsCloudKeepAliveActive = true;
+  const holdMs = 45000;
+
+  const openStreamCycle = async () => {
+    while (
+      vpsCloudKeepAliveActive &&
+      activeVpsBatchJob?.isRunning &&
+      !vpsBatchPauseFlag &&
+      !vpsBatchCancelFlag &&
+      !vpsServerShuttingDown &&
+      hasAnyPendingOrRetryableWork(activeVpsBatchJob)
+    ) {
+      if (Date.now() < vpsCloudKeepAliveBlockedUntil) {
+        vpsCloudKeepAliveMode = 'iap_blocked';
+        await new Promise((r) => setTimeout(r, 15000));
+        continue;
+      }
+      const targetBase = isPublicHttpBaseUrl(activeVpsJobAppBaseUrl)
+        ? activeVpsJobAppBaseUrl
+        : resolveValidAppBaseUrl();
+      if (!isPublicHttpBaseUrl(targetBase)) {
+        vpsCloudKeepAliveMode = 'no_public_url';
+        break;
+      }
+
+      const controller = new AbortController();
+      activeKeepAliveControllers.add(controller);
+
+      try {
+        const res = await axios.get(`${targetBase}/api/vps-batch/keepalive?holdMs=${holdMs}`, {
+          responseType: 'stream',
+          timeout: holdMs + 15000,
+          signal: controller.signal,
+          maxRedirects: 0,
+          validateStatus: () => true,
+          headers: {
+            'X-Vps-Owner-Instance': SERVER_INSTANCE_ID,
+            'Cache-Control': 'no-cache',
+          },
+        });
+
+        const ctype = String(res.headers?.['content-type'] || '').toLowerCase();
+        if (res.status >= 300 || ctype.includes('text/html')) {
+          // Behind IAP / login proxy (e.g. Studio preview); back off quietly without noise
+          vpsCloudKeepAliveMode = 'iap_blocked';
+          vpsCloudKeepAliveBlockedUntil = Date.now() + 120000;
+          try {
+            res.data?.destroy?.();
+          } catch {}
+          await new Promise((r) => setTimeout(r, 15000));
+          continue;
+        }
+
+        vpsCloudKeepAliveMode = 'active';
+        await new Promise<void>((resolve) => {
+          let handoffTimer: NodeJS.Timeout | null = null;
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            if (handoffTimer) clearTimeout(handoffTimer);
+            resolve();
+          };
+          // Trigger overlapping next cycle 4s before current hold completes so active ingress count never hits 0
+          handoffTimer = setTimeout(() => {
+            finish();
+          }, holdMs - 4000);
+
+          res.data.on('data', () => {});
+          res.data.on('end', finish);
+          res.data.on('error', finish);
+          res.data.on('close', finish);
+        });
+      } catch {
+        await new Promise((r) => setTimeout(r, 2000));
+      } finally {
+        // Keep previous stream alive briefly if handoff already opened next cycle? No, let natural end/close happen or abort after short overlap
+        setTimeout(() => {
+          try {
+            controller.abort();
+          } catch {}
+          activeKeepAliveControllers.delete(controller);
+        }, 4500);
+      }
+    }
+    vpsCloudKeepAliveActive = false;
+    if (!activeVpsBatchJob?.isRunning || vpsBatchPauseFlag || vpsBatchCancelFlag || vpsServerShuttingDown) {
+      vpsCloudKeepAliveMode = 'idle';
+    }
+  };
+
+  openStreamCycle().catch(() => {
+    vpsCloudKeepAliveActive = false;
+    vpsCloudKeepAliveMode = 'idle';
+  });
+}
 
 // In-flight task IDs across ALL workers/queues so no task is ever claimed twice and workers never stall on trailing tasks
 const inFlightBatchTaskIds = new Set<string>();
@@ -2762,6 +3084,8 @@ function isTaskIncompleteForQueue(task: VpsBatchTask, opts: VpsQueueOptions): bo
     task.status === 'pending' ||
     task.status === 'checking_registry' ||
     task.status === 'scraping' ||
+    task.status === 'downloading_video' ||
+    task.status === 'compressing_video' ||
     task.status === 'uploading_cloudflare'
   ) {
     return true;
@@ -2868,6 +3192,9 @@ async function persistVpsBatchJob(forceD1 = false): Promise<void> {
   // Store queues as single source of truth on disk/D1 without duplicating active queue tasks in job.tasks
   const snapshotToPersist: VpsBatchJobState = {
     ...activeVpsBatchJob,
+    appBaseUrl: isPublicHttpBaseUrl(activeVpsJobAppBaseUrl)
+      ? activeVpsJobAppBaseUrl
+      : activeVpsBatchJob.appBaseUrl,
     tasks: [],
   };
 
@@ -3003,11 +3330,30 @@ async function runSingleVpsTask(
     }
   }
 
-  // Step 1: Scrape webpage + optional R2 thumbnail/video upload & FFmpeg compression per queue options
+  // Step 1: Scrape webpage + download video + optional compression + upload to Cloudflare R2
+  let lastStageName = 'scraping';
+  let lastStagePersistAt = 0;
+  const reportStage = (
+    stage: 'checking_registry' | 'scraping' | 'downloading_video' | 'compressing_video' | 'uploading_cloudflare',
+    detail: string,
+    meta?: { title?: string; thumbnailUrl?: string; videoUrl?: string }
+  ) => {
+    const stageChanged = stage !== lastStageName;
+    lastStageName = stage;
+    task.status = stage;
+    task.statusMessage = `[W${workerId} · ${queue.name} · Try ${attemptNum}] ${detail}`;
+    if (meta?.title && !task.title) task.title = meta.title;
+    if (meta?.thumbnailUrl && !task.originalThumbnailUrl) task.originalThumbnailUrl = meta.thumbnailUrl;
+    if (meta?.videoUrl && !task.originalVideoUrl) task.originalVideoUrl = meta.videoUrl;
+    const now = Date.now();
+    if (stageChanged || now - lastStagePersistAt >= 1800) {
+      lastStagePersistAt = now;
+      persistVpsBatchJob(false).catch(() => {});
+    }
+  };
+
   task.status = 'scraping';
-  task.statusMessage = `[W${workerId} · ${queue.name} · Try ${attemptNum}] Scraping${
-    opts.compressVideo ? ` & compressing (${opts.compressionQuality})` : opts.uploadVideoToR2 ? ' & uploading to R2' : ' stream link'
-  }...`;
+  task.statusMessage = `[W${workerId} · ${queue.name} · Try ${attemptNum}] Scraping webpage...`;
   await persistVpsBatchJob(false);
 
   const data = await processUrlCore({
@@ -3021,6 +3367,7 @@ async function runSingleVpsTask(
     r2ConfigOverride: activeVpsJobR2Config || undefined,
     appBaseUrlOverride: activeVpsJobAppBaseUrl,
     extraServers: opts.serverPool,
+    onStage: reportStage,
   });
 
   const primaryVideo = data.media?.videos?.[0];
@@ -3203,6 +3550,7 @@ function buildQueueSummaryStatusMessage(job: VpsBatchJobState): string {
 function launchVpsBatchWorkerLoop(): void {
   if (!activeVpsBatchJob) return;
   if (vpsWorkerLoopActive) {
+    startVpsCloudKeepAliveLoop();
     notifyVpsWorkers();
     if (triggerVpsWorkerScaleUp) triggerVpsWorkerScaleUp();
     return;
@@ -3211,10 +3559,11 @@ function launchVpsBatchWorkerLoop(): void {
 
   (async () => {
     try {
-      while (activeVpsBatchJob && !vpsBatchCancelFlag) {
+      while (activeVpsBatchJob && !vpsBatchCancelFlag && !vpsServerShuttingDown) {
         const job = activeVpsBatchJob;
         job.isRunning = true;
         job.endTime = undefined;
+        startVpsCloudKeepAliveLoop();
 
         let activeCount = 0;
         let workerIdSeq = 0;
@@ -3225,11 +3574,11 @@ function launchVpsBatchWorkerLoop(): void {
             activeCount++;
             if (activeVpsBatchJob) activeVpsBatchJob.activeWorkers = activeCount;
             try {
-              while (!vpsBatchCancelFlag && activeVpsBatchJob) {
-                while (vpsBatchPauseFlag && !vpsBatchCancelFlag) {
+              while (!vpsBatchCancelFlag && !vpsServerShuttingDown && activeVpsBatchJob) {
+                while (vpsBatchPauseFlag && !vpsBatchCancelFlag && !vpsServerShuttingDown) {
                   await waitForVpsWorkerSignal(400);
                 }
-                if (vpsBatchCancelFlag || !activeVpsBatchJob) break;
+                if (vpsBatchCancelFlag || vpsServerShuttingDown || !activeVpsBatchJob) break;
 
                 // Graceful scale-down if concurrency reduced live
                 if (activeCount > activeVpsBatchJob.concurrency) break;
@@ -3334,7 +3683,13 @@ function launchVpsBatchWorkerLoop(): void {
         triggerVpsWorkerScaleUp = null;
 
         // Re-check before exiting outer loop in case a new queue was added just as last worker exited
-        if (activeVpsBatchJob && !vpsBatchCancelFlag && !vpsBatchPauseFlag && hasAnyPendingOrRetryableWork(activeVpsBatchJob)) {
+        if (
+          activeVpsBatchJob &&
+          !vpsBatchCancelFlag &&
+          !vpsBatchPauseFlag &&
+          !vpsServerShuttingDown &&
+          hasAnyPendingOrRetryableWork(activeVpsBatchJob)
+        ) {
           continue;
         }
         break;
@@ -3342,18 +3697,26 @@ function launchVpsBatchWorkerLoop(): void {
     } finally {
       vpsWorkerLoopActive = false;
       triggerVpsWorkerScaleUp = null;
+      stopVpsCloudKeepAliveLoop();
       if (activeVpsBatchJob) {
-        activeVpsBatchJob.isRunning = false;
-        activeVpsBatchJob.isPaused = vpsBatchPauseFlag;
-        activeVpsBatchJob.activeWorkers = 0;
-        activeVpsBatchJob.endTime = new Date().toISOString();
-        recomputeVpsJobCounters(activeVpsBatchJob);
-        activeVpsBatchJob.statusMessage = vpsBatchCancelFlag
-          ? `Cancelled (${activeVpsBatchJob.completed}/${activeVpsBatchJob.total} completed across ${activeVpsBatchJob.queues.length} queue(s))`
-          : activeVpsBatchJob.incompleteCount > 0
-          ? `Finished ${activeVpsBatchJob.queues.length} queue(s): ${activeVpsBatchJob.completed} done, ${activeVpsBatchJob.incompleteCount} incomplete/failed`
-          : `All ${activeVpsBatchJob.total} link(s) across ${activeVpsBatchJob.queues.length} queue(s) completed!`;
-        await persistVpsBatchJob(true);
+        if (vpsServerShuttingDown) {
+          // Preserve isRunning so next container boot immediately auto-resumes remaining queued work!
+          activeVpsBatchJob.activeWorkers = 0;
+          recomputeVpsJobCounters(activeVpsBatchJob);
+          await persistVpsBatchJob(true);
+        } else {
+          activeVpsBatchJob.isRunning = false;
+          activeVpsBatchJob.isPaused = vpsBatchPauseFlag;
+          activeVpsBatchJob.activeWorkers = 0;
+          activeVpsBatchJob.endTime = new Date().toISOString();
+          recomputeVpsJobCounters(activeVpsBatchJob);
+          activeVpsBatchJob.statusMessage = vpsBatchCancelFlag
+            ? `Cancelled (${activeVpsBatchJob.completed}/${activeVpsBatchJob.total} completed across ${activeVpsBatchJob.queues.length} queue(s))`
+            : activeVpsBatchJob.incompleteCount > 0
+            ? `Finished ${activeVpsBatchJob.queues.length} queue(s): ${activeVpsBatchJob.completed} done, ${activeVpsBatchJob.incompleteCount} incomplete/failed`
+            : `All ${activeVpsBatchJob.total} link(s) across ${activeVpsBatchJob.queues.length} queue(s) completed!`;
+          await persistVpsBatchJob(true);
+        }
       }
     }
   })();
@@ -3377,11 +3740,19 @@ function normalizeLoadedVpsJob(raw: any): VpsBatchJobState | null {
         index: Number(t.index) || ti + 1,
         queueId: qId,
         status:
-          t.status === 'checking_registry' || t.status === 'scraping' || t.status === 'uploading_cloudflare'
+          t.status === 'checking_registry' ||
+          t.status === 'scraping' ||
+          t.status === 'downloading_video' ||
+          t.status === 'compressing_video' ||
+          t.status === 'uploading_cloudflare'
             ? 'pending'
             : t.status || 'pending',
         statusMessage:
-          t.status === 'checking_registry' || t.status === 'scraping' || t.status === 'uploading_cloudflare'
+          t.status === 'checking_registry' ||
+          t.status === 'scraping' ||
+          t.status === 'downloading_video' ||
+          t.status === 'compressing_video' ||
+          t.status === 'uploading_cloudflare'
             ? 'Resumed after server restart'
             : t.statusMessage,
       }));
@@ -3416,11 +3787,19 @@ function normalizeLoadedVpsJob(raw: any): VpsBatchJobState | null {
       index: Number(t.index) || ti + 1,
       queueId: qId,
       status:
-        t.status === 'checking_registry' || t.status === 'scraping' || t.status === 'uploading_cloudflare'
+        t.status === 'checking_registry' ||
+        t.status === 'scraping' ||
+        t.status === 'downloading_video' ||
+        t.status === 'compressing_video' ||
+        t.status === 'uploading_cloudflare'
           ? 'pending'
           : t.status || 'pending',
       statusMessage:
-        t.status === 'checking_registry' || t.status === 'scraping' || t.status === 'uploading_cloudflare'
+        t.status === 'checking_registry' ||
+        t.status === 'scraping' ||
+        t.status === 'downloading_video' ||
+        t.status === 'compressing_video' ||
+        t.status === 'uploading_cloudflare'
           ? 'Resumed after server restart'
           : t.statusMessage,
     }));
@@ -3479,6 +3858,7 @@ function normalizeLoadedVpsJob(raw: any): VpsBatchJobState | null {
     startTime: String(raw.startTime || new Date().toISOString()),
     endTime: raw.endTime,
     lastUpdatedAt: new Date().toISOString(),
+    appBaseUrl: typeof raw.appBaseUrl === 'string' && isPublicHttpBaseUrl(raw.appBaseUrl) ? raw.appBaseUrl : undefined,
     activeQueueId: raw.activeQueueId || queues[0]?.queueId,
     nextQueueNumber: Math.max(Number(raw.nextQueueNumber) || maxQNum + 1, maxQNum + 1),
     queues,
@@ -3489,45 +3869,95 @@ function normalizeLoadedVpsJob(raw: any): VpsBatchJobState | null {
   return normalized;
 }
 
+function getJobSnapshotTimestamp(raw: any): number {
+  if (!raw || typeof raw !== 'object') return 0;
+  if (typeof raw.updatedAt === 'number' && Number.isFinite(raw.updatedAt)) return raw.updatedAt;
+  const iso = raw.lastUpdatedAt || raw.startTime;
+  const ms = iso ? Date.parse(String(iso)) : 0;
+  return Number.isFinite(ms) ? ms : 0;
+}
+
 async function loadAndResumeVpsBatchJob(): Promise<void> {
   try {
-    let rawLoaded: any = null;
+    let diskRaw: any = null;
     if (fs.existsSync(vpsJobFilePath)) {
       try {
-        rawLoaded = JSON.parse(fs.readFileSync(vpsJobFilePath, 'utf-8'));
+        diskRaw = JSON.parse(fs.readFileSync(vpsJobFilePath, 'utf-8'));
       } catch {}
     }
-    if (!rawLoaded) {
+
+    let d1Raw: any = null;
+    try {
       const d1Res = await axios.get(`${CF_WORKER_BASE_URL}/api/ad_config`, {
-        timeout: 12000,
+        timeout: 10000,
         validateStatus: () => true,
       });
       if (d1Res.status >= 200 && d1Res.status < 300 && Array.isArray(d1Res.data)) {
         const doc = d1Res.data.find((x: any) => String(x?.id || x?._id) === VPS_QUEUE_SCOPE.d1DocId);
         if (doc && (Array.isArray(doc.queues) || Array.isArray(doc.tasks))) {
-          rawLoaded = doc;
+          d1Raw = doc;
         }
       }
+    } catch {}
+
+    // Pick whichever source (local disk vs Cloudflare D1) has newer progress
+    const diskTs = getJobSnapshotTimestamp(diskRaw);
+    const d1Ts = getJobSnapshotTimestamp(d1Raw);
+    const diskQueues = Array.isArray(diskRaw?.queues) ? diskRaw.queues.length : Array.isArray(diskRaw?.tasks) ? diskRaw.tasks.length : 0;
+    const d1Queues = Array.isArray(d1Raw?.queues) ? d1Raw.queues.length : Array.isArray(d1Raw?.tasks) ? d1Raw.tasks.length : 0;
+
+    let rawLoaded: any = null;
+    if (d1Raw && d1Queues > 0 && (diskQueues === 0 || d1Ts >= diskTs)) {
+      rawLoaded = d1Raw;
+    } else if (diskRaw && diskQueues > 0) {
+      rawLoaded = diskRaw;
+    } else {
+      rawLoaded = d1Raw || diskRaw;
     }
+
+    // Wait: if user restarted/created queues in this process already, never overwrite activeVpsBatchJob
+    if (activeVpsBatchJob) return;
 
     const loaded = normalizeLoadedVpsJob(rawLoaded);
     if (loaded && loaded.queues.length > 0) {
       if (!activeVpsJobR2Config) {
         activeVpsJobR2Config = getR2Config();
       }
-      if (process.env.APP_URL) {
-        activeVpsJobAppBaseUrl = process.env.APP_URL;
+      if (loaded.appBaseUrl && isPublicHttpBaseUrl(loaded.appBaseUrl)) {
+        activeVpsJobAppBaseUrl = loaded.appBaseUrl;
+      } else {
+        const envBase = resolveValidAppBaseUrl();
+        if (isPublicHttpBaseUrl(envBase)) activeVpsJobAppBaseUrl = envBase;
       }
+
       activeVpsBatchJob = loaded;
       vpsBatchPauseFlag = Boolean(loaded.isPaused);
       vpsBatchCancelFlag = false;
       if (loaded.isRunning && !loaded.isPaused && hasAnyPendingOrRetryableWork(loaded)) {
+        console.log(
+          `[VPS Batch] Auto-resuming ${loaded.queues.length} queue(s) (${loaded.completed}/${loaded.total} done) from persisted state...`
+        );
         launchVpsBatchWorkerLoop();
       }
     }
   } catch (err) {
     console.warn('Could not restore persisted VPS batch job:', formatCompactError(err));
   }
+}
+
+async function ensureVpsBatchJobInitialized(): Promise<void> {
+  if (activeVpsBatchJob) return;
+  if (vpsBatchInitPromise) {
+    await vpsBatchInitPromise;
+    if (activeVpsBatchJob) return;
+  }
+  const now = Date.now();
+  if (now - lastVpsBatchInitAttemptAt < 8000 && vpsBatchInitPromise) {
+    return;
+  }
+  lastVpsBatchInitAttemptAt = now;
+  vpsBatchInitPromise = loadAndResumeVpsBatchJob();
+  await vpsBatchInitPromise;
 }
 
 function createVpsQueueObject(params: {
@@ -3627,11 +4057,10 @@ async function addOrStartQueueHandler(req: Request, forceAppend: boolean) {
     return { status: 400, body: { success: false, error: 'urls array is required' } };
   }
 
-  await hydrateRegistryFromD1IfNeeded();
+  await Promise.all([hydrateRegistryFromD1IfNeeded(), ensureVpsBatchJobInitialized()]);
 
-  // Capture active R2 config in server RAM (never written to disk/D1)
-  activeVpsJobR2Config = getR2Config(req) || activeVpsJobR2Config;
-  activeVpsJobAppBaseUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+  // Capture active R2 config in server RAM (never written to disk/D1) and valid public URL
+  captureRequestRuntimeContext(req);
 
   const opts = normalizeQueueOptions(req.body);
   const safeConcurrency =
@@ -3776,6 +4205,7 @@ app.post('/api/vps-batch/queues', async (req: Request, res: Response) => {
 
 // API: Update per-queue options live (skip mode, R2 video/thumb toggles, compress/quality, filter words, retries, proxies)
 app.patch('/api/vps-batch/queues/:queueId/options', async (req: Request, res: Response) => {
+  await ensureVpsBatchJobInitialized();
   if (!activeVpsBatchJob) {
     return res.status(404).json({ success: false, error: 'No active batch pipeline' });
   }
@@ -3807,6 +4237,7 @@ app.patch('/api/vps-batch/queues/:queueId/options', async (req: Request, res: Re
 
 // API: Pause a specific queue (workers immediately switch to remaining runnable queues!)
 app.post('/api/vps-batch/queues/:queueId/pause', async (req: Request, res: Response) => {
+  await ensureVpsBatchJobInitialized();
   if (!activeVpsBatchJob) {
     return res.status(404).json({ success: false, error: 'No active batch pipeline' });
   }
@@ -3824,6 +4255,7 @@ app.post('/api/vps-batch/queues/:queueId/pause', async (req: Request, res: Respo
 
 // API: Stop a specific queue cleanly (workers immediately move to next runnable queue!)
 app.post('/api/vps-batch/queues/:queueId/stop', async (req: Request, res: Response) => {
+  await ensureVpsBatchJobInitialized();
   if (!activeVpsBatchJob) {
     return res.status(404).json({ success: false, error: 'No active batch pipeline' });
   }
@@ -3841,6 +4273,7 @@ app.post('/api/vps-batch/queues/:queueId/stop', async (req: Request, res: Respon
 
 // API: Resume a paused/stopped queue
 app.post('/api/vps-batch/queues/:queueId/resume', async (req: Request, res: Response) => {
+  await ensureVpsBatchJobInitialized();
   if (!activeVpsBatchJob) {
     return res.status(404).json({ success: false, error: 'No active batch pipeline' });
   }
@@ -3848,8 +4281,7 @@ app.post('/api/vps-batch/queues/:queueId/resume', async (req: Request, res: Resp
   if (!queue) {
     return res.status(404).json({ success: false, error: 'Queue not found' });
   }
-  activeVpsJobR2Config = getR2Config(req) || activeVpsJobR2Config;
-  activeVpsJobAppBaseUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+  captureRequestRuntimeContext(req);
 
   queue.status = 'queued';
   queue.endTime = undefined;
@@ -3867,6 +4299,7 @@ app.post('/api/vps-batch/queues/:queueId/resume', async (req: Request, res: Resp
 
 // API: Stop currently active queue(s) and switch workers immediately to :queueId
 app.post('/api/vps-batch/queues/:queueId/switch', async (req: Request, res: Response) => {
+  await ensureVpsBatchJobInitialized();
   if (!activeVpsBatchJob) {
     return res.status(404).json({ success: false, error: 'No active batch pipeline' });
   }
@@ -3875,8 +4308,7 @@ app.post('/api/vps-batch/queues/:queueId/switch', async (req: Request, res: Resp
     return res.status(404).json({ success: false, error: 'Queue not found' });
   }
 
-  activeVpsJobR2Config = getR2Config(req) || activeVpsJobR2Config;
-  activeVpsJobAppBaseUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+  captureRequestRuntimeContext(req);
 
   const targetQueue = activeVpsBatchJob.queues[idx];
   const stopOthers = req.body?.stopOthers !== false;
@@ -3917,6 +4349,7 @@ app.post('/api/vps-batch/queues/:queueId/switch', async (req: Request, res: Resp
 
 // API: Manually restart failed/incomplete tasks inside a single queue
 app.post('/api/vps-batch/queues/:queueId/retry-incomplete', async (req: Request, res: Response) => {
+  await ensureVpsBatchJobInitialized();
   if (!activeVpsBatchJob) {
     return res.status(404).json({ success: false, error: 'No saved batch pipeline found' });
   }
@@ -3925,8 +4358,7 @@ app.post('/api/vps-batch/queues/:queueId/retry-incomplete', async (req: Request,
     return res.status(404).json({ success: false, error: 'Queue not found' });
   }
 
-  activeVpsJobR2Config = getR2Config(req) || activeVpsJobR2Config;
-  activeVpsJobAppBaseUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
+  captureRequestRuntimeContext(req);
 
   const incomplete = queue.tasks.filter(
     (t) => !inFlightBatchTaskIds.has(t.id) && isTaskIncompleteForQueue(t, queue.options)
@@ -3969,6 +4401,7 @@ app.post('/api/vps-batch/queues/:queueId/retry-incomplete', async (req: Request,
 
 // API: Delete/Remove one queue cleanly without disturbing other queues
 app.delete('/api/vps-batch/queues/:queueId', async (req: Request, res: Response) => {
+  await ensureVpsBatchJobInitialized();
   if (!activeVpsBatchJob) {
     return res.status(404).json({ success: false, error: 'No active batch pipeline' });
   }
@@ -4003,11 +4436,135 @@ app.delete('/api/vps-batch/queues/:queueId', async (req: Request, res: Response)
   return res.json({ success: true, message: `Removed ${target.name}.`, job: projectJobForClient(activeVpsBatchJob) });
 });
 
+// API: Streaming Keep-Alive Hold Endpoint for Serverless / Cloud Run background execution
+app.get('/api/vps-batch/keepalive', async (req: Request, res: Response) => {
+  captureRequestRuntimeContext(req);
+  await ensureVpsBatchJobInitialized();
+
+  if (
+    activeVpsBatchJob &&
+    activeVpsBatchJob.isRunning &&
+    !vpsBatchPauseFlag &&
+    !vpsBatchCancelFlag &&
+    !vpsWorkerLoopActive &&
+    hasAnyPendingOrRetryableWork(activeVpsBatchJob)
+  ) {
+    launchVpsBatchWorkerLoop();
+  }
+
+  const holdMs = Math.max(5000, Math.min(55000, Number(req.query.holdMs) || 45000));
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  res.write(`: keepalive-start instance=${SERVER_INSTANCE_ID}\n\n`);
+
+  const startedAt = Date.now();
+  const interval = setInterval(() => {
+    const stillActive =
+      Boolean(activeVpsBatchJob?.isRunning) &&
+      !vpsBatchPauseFlag &&
+      !vpsBatchCancelFlag &&
+      !vpsServerShuttingDown;
+    if (!stillActive || Date.now() - startedAt >= holdMs || res.writableEnded) {
+      clearInterval(interval);
+      if (!res.writableEnded) {
+        try {
+          res.write(`: keepalive-end active=${stillActive}\n\n`);
+          res.end();
+        } catch {}
+      }
+      return;
+    }
+    try {
+      res.write(`: tick ${Date.now()}\n\n`);
+    } catch {
+      clearInterval(interval);
+    }
+  }, 4000);
+
+  req.on('close', () => {
+    clearInterval(interval);
+  });
+});
+
+// API: UptimeRobot / External Monitor Ping Endpoint
+// Keeps free hosted containers warm, ensures queue state is loaded from D1/disk, and resumes workers if active.
+const handleUptimePing = async (req: Request, res: Response) => {
+  captureRequestRuntimeContext(req);
+  await ensureVpsBatchJobInitialized();
+
+  if (
+    activeVpsBatchJob &&
+    activeVpsBatchJob.isRunning &&
+    !vpsBatchPauseFlag &&
+    !vpsBatchCancelFlag &&
+    !vpsWorkerLoopActive &&
+    hasAnyPendingOrRetryableWork(activeVpsBatchJob)
+  ) {
+    launchVpsBatchWorkerLoop();
+  } else if (
+    activeVpsBatchJob?.isRunning &&
+    !vpsBatchPauseFlag &&
+    !vpsBatchCancelFlag &&
+    !vpsCloudKeepAliveActive &&
+    hasAnyPendingOrRetryableWork(activeVpsBatchJob)
+  ) {
+    startVpsCloudKeepAliveLoop();
+  }
+
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  return res.status(200).json({
+    ok: true,
+    status: 'UP',
+    service: 'cloudflare-ott-admin',
+    instanceId: SERVER_INSTANCE_ID,
+    vpsScope: VPS_QUEUE_SCOPE.scopeLabel,
+    queueState: activeVpsBatchJob?.isRunning
+      ? vpsBatchPauseFlag
+        ? 'paused'
+        : 'running'
+      : 'idle',
+    activeQueues: activeVpsBatchJob?.queues?.length || 0,
+    completed: activeVpsBatchJob?.completed || 0,
+    total: activeVpsBatchJob?.total || 0,
+    activeWorkers: activeVpsBatchJob?.activeWorkers || 0,
+    cloudKeepAliveActive: vpsCloudKeepAliveActive,
+    cloudKeepAliveMode: vpsCloudKeepAliveMode,
+    uptimeSeconds: Math.round(process.uptime()),
+    timestamp: new Date().toISOString(),
+  });
+};
+
+app.get('/api/uptime', handleUptimePing);
+app.get('/api/vps-batch/ping', handleUptimePing);
+
 // API: Get Persistent Background Batch Status (restores only THIS VPS's isolated queues when reopening browser)
-app.get('/api/vps-batch/status', (_req: Request, res: Response) => {
+app.get('/api/vps-batch/status', async (req: Request, res: Response) => {
+  captureRequestRuntimeContext(req);
+  await ensureVpsBatchJobInitialized();
+
+  // If a resumed job was waiting on R2 config or got a fresh request while idle-paused, ensure loop is running if runnable
+  if (
+    activeVpsBatchJob &&
+    activeVpsBatchJob.isRunning &&
+    !vpsBatchPauseFlag &&
+    !vpsBatchCancelFlag &&
+    !vpsWorkerLoopActive &&
+    hasAnyPendingOrRetryableWork(activeVpsBatchJob)
+  ) {
+    launchVpsBatchWorkerLoop();
+  }
+
   res.json({
     success: true,
     job: projectJobForClient(activeVpsBatchJob),
+    cloudKeepAliveActive: vpsCloudKeepAliveActive,
+    cloudKeepAliveMode: vpsCloudKeepAliveMode,
+    cloudKeepAliveUrl: isPublicHttpBaseUrl(activeVpsJobAppBaseUrl) ? activeVpsJobAppBaseUrl : null,
     vpsScope: {
       scopeId: VPS_QUEUE_SCOPE.scopeId,
       scopeSlug: VPS_QUEUE_SCOPE.scopeSlug,
@@ -4021,6 +4578,8 @@ app.get('/api/vps-batch/status', (_req: Request, res: Response) => {
 
 // API: Update Concurrency Live on Running Background Job
 app.post('/api/vps-batch/concurrency', async (req: Request, res: Response) => {
+  captureRequestRuntimeContext(req);
+  await ensureVpsBatchJobInitialized();
   const safeConcurrency = Math.max(1, Math.min(50, Number(req.body?.concurrency) || 3));
   if (activeVpsBatchJob) {
     activeVpsBatchJob.concurrency = safeConcurrency;
@@ -4031,8 +4590,11 @@ app.post('/api/vps-batch/concurrency', async (req: Request, res: Response) => {
 });
 
 // API: Pause Background Batch Globally
-app.post('/api/vps-batch/pause', async (_req: Request, res: Response) => {
+app.post('/api/vps-batch/pause', async (req: Request, res: Response) => {
+  captureRequestRuntimeContext(req);
+  await ensureVpsBatchJobInitialized();
   vpsBatchPauseFlag = true;
+  stopVpsCloudKeepAliveLoop();
   if (activeVpsBatchJob) {
     activeVpsBatchJob.isPaused = true;
     activeVpsBatchJob.statusMessage = 'Paused globally (saved in database · safe to close browser)';
@@ -4043,9 +4605,8 @@ app.post('/api/vps-batch/pause', async (_req: Request, res: Response) => {
 
 // API: Resume Background Batch Globally
 app.post('/api/vps-batch/resume', async (req: Request, res: Response) => {
-  if (!activeVpsJobR2Config) {
-    activeVpsJobR2Config = getR2Config(req);
-  }
+  captureRequestRuntimeContext(req);
+  await ensureVpsBatchJobInitialized();
   vpsBatchPauseFlag = false;
   vpsBatchCancelFlag = false;
   if (activeVpsBatchJob) {
@@ -4061,8 +4622,10 @@ app.post('/api/vps-batch/resume', async (req: Request, res: Response) => {
 
 // API: Cancel Background Batch Globally
 app.post('/api/vps-batch/cancel', async (_req: Request, res: Response) => {
+  await ensureVpsBatchJobInitialized();
   vpsBatchCancelFlag = true;
   vpsBatchPauseFlag = false;
+  stopVpsCloudKeepAliveLoop();
   notifyVpsWorkers();
   if (activeVpsBatchJob) {
     activeVpsBatchJob.isRunning = false;
@@ -4082,12 +4645,11 @@ app.post('/api/vps-batch/cancel', async (_req: Request, res: Response) => {
 
 // API: Manually Restart All Failed & Incomplete Tasks across runnable queues (or specified queueId)
 app.post('/api/vps-batch/retry-incomplete', async (req: Request, res: Response) => {
+  captureRequestRuntimeContext(req);
+  await ensureVpsBatchJobInitialized();
   if (!activeVpsBatchJob) {
     return res.status(404).json({ success: false, error: 'No saved background batch job found' });
   }
-
-  activeVpsJobR2Config = getR2Config(req) || activeVpsJobR2Config;
-  activeVpsJobAppBaseUrl = process.env.APP_URL || `${req.protocol}://${req.get('host')}`;
 
   const targetQueueId = req.body?.queueId ? String(req.body.queueId) : null;
   const candidateQueues = targetQueueId
@@ -4143,6 +4705,7 @@ app.post('/api/vps-batch/retry-incomplete', async (req: Request, res: Response) 
 app.post('/api/vps-batch/clear', async (_req: Request, res: Response) => {
   vpsBatchCancelFlag = true;
   vpsBatchPauseFlag = false;
+  stopVpsCloudKeepAliveLoop();
   inFlightBatchTaskIds.clear();
   notifyVpsWorkers();
   activeVpsBatchJob = null;
@@ -4197,6 +4760,341 @@ export interface ExtractedPageLink {
   cloudflareRecord?: CloudflareExtractedLink | null;
 }
 
+let cachedChromiumExecutable: string | null | undefined;
+function resolveChromiumExecutable(): string | null {
+  if (cachedChromiumExecutable !== undefined) return cachedChromiumExecutable;
+
+  const directCandidates = [
+    process.env.CHROMIUM_PATH,
+    process.env.CHROME_PATH,
+    process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH,
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/snap/bin/chromium',
+  ].filter((c): c is string => Boolean(c && c.trim()));
+
+  for (const candidate of directCandidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        cachedChromiumExecutable = candidate;
+        return candidate;
+      }
+    } catch {}
+  }
+
+  const playwrightRoots = [
+    process.env.PLAYWRIGHT_BROWSERS_PATH,
+    '/ms-playwright',
+    '/root/.cache/ms-playwright',
+    path.join(os.homedir(), '.cache', 'ms-playwright'),
+  ].filter((d): d is string => Boolean(d && d.trim()));
+
+  const binaryNames = new Set(['chrome-headless-shell', 'headless_shell', 'chrome', 'chromium']);
+  const walkSearch = (dir: string, depth: number): string | null => {
+    if (depth > 4) return null;
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isFile() && binaryNames.has(entry.name)) {
+          return full;
+        }
+      }
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          const found = walkSearch(path.join(dir, entry.name), depth + 1);
+          if (found) return found;
+        }
+      }
+    } catch {}
+    return null;
+  };
+
+  for (const root of playwrightRoots) {
+    if (!fs.existsSync(root)) continue;
+    const found = walkSearch(root, 0);
+    if (found) {
+      cachedChromiumExecutable = found;
+      return found;
+    }
+  }
+
+  cachedChromiumExecutable = null;
+  return null;
+}
+
+interface ScrolledBrowserHarvest {
+  finalUrl: string;
+  pageTitle: string;
+  htmlSnapshot: string;
+  renderedLinks: Array<{ url: string; text: string; isDirectMedia?: boolean }>;
+  xhrPayloadTexts: string[];
+  scrollStepsCompleted: number;
+  loadMoreClicks: number;
+  xhrResponsesCaptured: number;
+  error?: string;
+}
+
+async function crawlLinksWithPlaywrightScroll(params: {
+  url: string;
+  scrollCount: number;
+  clickLoadMore: boolean;
+  userAgent?: string;
+}): Promise<ScrolledBrowserHarvest | null> {
+  const executablePath = resolveChromiumExecutable();
+  if (!executablePath) return null;
+
+  const { url, scrollCount, clickLoadMore } = params;
+  const maxSteps = Math.max(0, Math.min(40, scrollCount));
+
+  let browser: any = null;
+  try {
+    browser = await chromium.launch({
+      executablePath,
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+        '--disable-background-timer-throttling',
+        '--disable-renderer-backgrounding',
+      ],
+    });
+
+    const context = await browser.newContext({
+      userAgent:
+        params.userAgent ||
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      viewport: { width: 1440, height: 900 },
+      ignoreHTTPSErrors: true,
+    });
+
+    const page = await context.newPage();
+    page.setDefaultTimeout(20000);
+
+    // Block heavy images/media/fonts so scrolling through dozens of feeds is fast & lightweight
+    await page.route('**/*', (route: any) => {
+      const rType = route.request().resourceType();
+      if (rType === 'image' || rType === 'media' || rType === 'font') {
+        return route.abort();
+      }
+      return route.continue();
+    });
+
+    const xhrPayloadTexts: string[] = [];
+    let xhrResponsesCaptured = 0;
+
+    page.on('response', async (resp: any) => {
+      try {
+        const reqType = resp.request().resourceType();
+        if (reqType !== 'xhr' && reqType !== 'fetch') return;
+        const ctype = String(resp.headers()['content-type'] || '').toLowerCase();
+        if (ctype.includes('json') || ctype.includes('html') || ctype.includes('text/plain')) {
+          if (xhrPayloadTexts.length < 80) {
+            const bodyText = await resp.text();
+            if (bodyText && bodyText.length <= 2 * 1024 * 1024) {
+              xhrPayloadTexts.push(bodyText);
+              xhrResponsesCaptured++;
+            }
+          }
+        }
+      } catch {}
+    });
+
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(1200);
+
+    const renderedLinkMap = new Map<string, { text: string; isDirectMedia?: boolean }>();
+
+    const collectDomLinks = async (): Promise<{ totalFound: number; scrollHeight: number }> => {
+      const snap = await page.evaluate(`(() => {
+        var out = [];
+        var baseHref = location.href;
+        function resolveAbs(raw) {
+          try {
+            return new URL(raw, baseHref).href;
+          } catch (e) {
+            return '';
+          }
+        }
+
+        document.querySelectorAll('a[href]').forEach(function (a) {
+          var raw = (a.getAttribute('href') || '').trim();
+          if (!raw || raw.startsWith('#') || raw.startsWith('javascript:') || raw.startsWith('mailto:')) return;
+          var abs = resolveAbs(raw);
+          if (!abs || !/^https?:\\/\\//i.test(abs)) return;
+          var txt =
+            (a.textContent || '').replace(/\\s+/g, ' ').trim() ||
+            (a.getAttribute('title') || '').trim() ||
+            (a.getAttribute('aria-label') || '').trim();
+          out.push({ url: abs, text: txt });
+        });
+
+        var dataAttrs = ['data-href', 'data-url', 'data-link', 'data-video-url', 'data-target-url'];
+        for (var i = 0; i < dataAttrs.length; i++) {
+          var attr = dataAttrs[i];
+          document.querySelectorAll('[' + attr + ']').forEach(function (el) {
+            var raw = (el.getAttribute(attr) || '').trim();
+            if (!raw) return;
+            var abs = resolveAbs(raw);
+            if (!abs || !/^https?:\\/\\//i.test(abs)) return;
+            var txt =
+              (el.textContent || '').replace(/\\s+/g, ' ').trim() ||
+              (el.getAttribute('title') || '').trim();
+            out.push({ url: abs, text: txt });
+          });
+        }
+
+        document.querySelectorAll('video[src], source[src]').forEach(function (el) {
+          var raw = (el.getAttribute('src') || '').trim();
+          if (!raw) return;
+          var abs = resolveAbs(raw);
+          if (abs && /^https?:\\/\\//i.test(abs)) {
+            out.push({ url: abs, text: 'Direct Video Stream', isDirectMedia: true });
+          }
+        });
+
+        var maxScrollH = Math.max(
+          document.body ? document.body.scrollHeight : 0,
+          document.documentElement ? document.documentElement.scrollHeight : 0
+        );
+        return { links: out, scrollHeight: maxScrollH };
+      })()`) as { links: Array<{ url: string; text: string; isDirectMedia?: boolean }>; scrollHeight: number };
+
+      for (const item of snap.links) {
+        const existing = renderedLinkMap.get(item.url);
+        if (!existing) {
+          renderedLinkMap.set(item.url, { text: item.text, isDirectMedia: item.isDirectMedia });
+        } else if (item.text && !existing.text) {
+          renderedLinkMap.set(item.url, { text: item.text, isDirectMedia: existing.isDirectMedia || item.isDirectMedia });
+        }
+      }
+
+      return { totalFound: renderedLinkMap.size, scrollHeight: snap.scrollHeight };
+    };
+
+    let prevState = await collectDomLinks();
+    let stagnantCount = 0;
+    let scrollStepsCompleted = 0;
+    let loadMoreClicks = 0;
+
+    for (let step = 1; step <= maxSteps; step++) {
+      // Smooth viewport-by-viewport scroll + bottom jump + scrollable container scroll
+      await page.evaluate(`(() => {
+        var vh = window.innerHeight || 900;
+        window.scrollBy(0, vh * 0.95);
+        var targetH = Math.max(
+          document.body ? document.body.scrollHeight : 0,
+          document.documentElement ? document.documentElement.scrollHeight : 0
+        );
+        window.scrollTo(0, targetH);
+        window.dispatchEvent(new Event('scroll', { bubbles: true }));
+        document.dispatchEvent(new Event('scroll', { bubbles: true }));
+
+        document.querySelectorAll('main, section, div').forEach(function (el) {
+          if (el.scrollHeight > el.clientHeight + 250 && el.clientHeight > 300) {
+            var st = getComputedStyle(el);
+            if (st.overflowY === 'auto' || st.overflowY === 'scroll') {
+              el.scrollTop = el.scrollHeight;
+            }
+          }
+        });
+      })()`);
+
+      scrollStepsCompleted = step;
+      await page.waitForTimeout(1050);
+
+      let currState = await collectDomLinks();
+
+      // If pure scrolling yielded no growth, try clicking any visible "Load More / Show More" button
+      if (clickLoadMore && currState.totalFound === prevState.totalFound) {
+        const clicked = await page.evaluate(`(() => {
+          var btnPattern = /\\b(load\\s*more|show\\s*more|view\\s*more|see\\s*more|more\\s*videos|more\\s*results|older\\s*posts|fetch\\s*more)\\b/i;
+          var candidates = Array.from(
+            document.querySelectorAll(
+              'button, a[role="button"], [class*="load-more" i], [class*="loadmore" i], [class*="show-more" i], [id*="load-more" i], [data-action*="load" i]'
+            )
+          );
+          for (var i = 0; i < candidates.length; i++) {
+            var el = candidates[i];
+            var rect = el.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) continue;
+            var style = getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+            if (el.disabled) continue;
+            var txt = (el.textContent || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+            var cls = typeof el.className === 'string' ? el.className : '';
+            if (btnPattern.test(txt) || /load.?more|show.?more/i.test(cls)) {
+              el.scrollIntoView({ block: 'center' });
+              el.click();
+              return true;
+            }
+          }
+          return false;
+        })()`) as boolean;
+
+        if (clicked) {
+          loadMoreClicks++;
+          await page.waitForTimeout(1400);
+          currState = await collectDomLinks();
+        }
+      }
+
+      if (currState.totalFound > prevState.totalFound || currState.scrollHeight > prevState.scrollHeight + 40) {
+        stagnantCount = 0;
+      } else {
+        stagnantCount++;
+        if (stagnantCount >= 2) {
+          break;
+        }
+      }
+      prevState = currState;
+    }
+
+    const htmlSnapshot = await page.content();
+    const finalUrl = page.url() || url;
+    const pageTitle = await page.title().catch(() => '');
+
+    return {
+      finalUrl,
+      pageTitle: String(pageTitle || '').trim(),
+      htmlSnapshot,
+      renderedLinks: Array.from(renderedLinkMap.entries()).map(([u, m]) => ({
+        url: u,
+        text: m.text,
+        isDirectMedia: m.isDirectMedia,
+      })),
+      xhrPayloadTexts,
+      scrollStepsCompleted,
+      loadMoreClicks,
+      xhrResponsesCaptured,
+    };
+  } catch (err: any) {
+    const errMsg = formatCompactError(err);
+    console.warn('Playwright auto-scroll failed (falling back to HTTP crawler):', errMsg);
+    return {
+      finalUrl: url,
+      pageTitle: '',
+      htmlSnapshot: '',
+      renderedLinks: [],
+      xhrPayloadTexts: [],
+      scrollStepsCompleted: 0,
+      loadMoreClicks: 0,
+      xhrResponsesCaptured: 0,
+      error: errMsg,
+    };
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch {}
+    }
+  }
+}
+
 app.post('/api/extract-page-links', async (req: Request, res: Response) => {
   try {
     let {
@@ -4207,6 +5105,12 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
       webpagesOnly = true,
       urlFormat = '',
       autoRegisterNew = true,
+      autoScroll = true,
+      scrollCount = 8,
+      clickLoadMore = true,
+      scrollEngine: requestedScrollEngine = 'auto',
+      skipLongUrls = true,
+      maxUrlLength = 250,
     } = req.body;
 
     if (!url || typeof url !== 'string') {
@@ -4216,54 +5120,27 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
     url = url.trim();
     if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
 
+    const effectiveScrollCount = autoScroll ? Math.max(1, Math.min(40, Number(scrollCount) || 8)) : 0;
+    const effectiveMaxUrlLength = skipLongUrls
+      ? Math.max(40, Math.min(4000, Number(maxUrlLength) || 250))
+      : 0;
+
     await hydrateRegistryFromD1IfNeeded();
 
     const targetUrlObj = new URL(url);
     const targetDomain = targetUrlObj.hostname.toLowerCase();
-
-    const response = await axiosGetWithRetry(
-      url,
-      {
-        headers: {
-          'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Accept-Encoding': 'gzip, deflate, br',
-        },
-        timeout: 25000,
-        maxRedirects: 5,
-        responseType: 'text',
-        validateStatus: () => true,
-      },
-      3
-    );
-
-    const finalUrl = (response.request as any)?.res?.responseUrl || response.config?.url || url;
-    const finalUrlObj = new URL(finalUrl);
-
-    const resolveUrl = (relativeOrAbsolute: string) => {
-      if (!relativeOrAbsolute) return '';
-      try {
-        return new URL(relativeOrAbsolute, finalUrl).href;
-      } catch {
-        return '';
-      }
-    };
 
     // Helper: Check URL against whitelist and blacklist
     const isUrlAllowedByDomainRules = (testUrl: string): boolean => {
       if (!enableDomainFilters) return true;
       const lower = testUrl.toLowerCase();
 
-      // Check blacklist first
       for (const pattern of domainFilterRules.blacklist) {
         if (pattern && lower.includes(pattern.toLowerCase())) {
           return false;
         }
       }
 
-      // If whitelist is populated, URL must match at least one whitelist pattern
       if (domainFilterRules.whitelist.length > 0) {
         return domainFilterRules.whitelist.some((w) => w && lower.includes(w.toLowerCase()));
       }
@@ -4293,29 +5170,23 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
           let p = pattern.trim();
           if (!p) return true;
 
-          // Replace literal 'domain/xyz/' or '{domain}/xyz/' with actual target domain
           p = p.replace(/^\{?domain\}?\//i, `${targetDomain}/`);
-          // Strip http/https prefix
           p = p.replace(/^https?:\/\//i, '');
 
-          // Wildcard match support
           if (p.includes('*')) {
             const escaped = p.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
             const regex = new RegExp(escaped, 'i');
             return regex.test(testUrl) || regex.test(hostAndPath) || regex.test(fullPath);
           }
 
-          // Starting with slash (e.g. /xyz/)
           if (p.startsWith('/')) {
             return fullPath.toLowerCase().includes(p.toLowerCase());
           }
 
-          // Format includes domain (e.g. mysite.com/xyz/)
           if (p.toLowerCase().startsWith(targetDomain)) {
             return hostAndPath.toLowerCase().includes(p.toLowerCase());
           }
 
-          // Substring matching against testUrl, path, or hostAndPath
           return (
             testUrl.toLowerCase().includes(p.toLowerCase()) ||
             hostAndPath.toLowerCase().includes(p.toLowerCase()) ||
@@ -4335,34 +5206,32 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
     };
 
     const linksMap = new Map<string, { text: string; type: 'video_media' | 'page_article' | 'image' | 'external' }>();
+    const skippedLongUrlsSet = new Set<string>();
 
-    // Parse with Cheerio
-    const $ = cheerio.load(typeof response.data === 'string' ? response.data : '');
+    const addDiscoveredUrl = (
+      rawOrResolved: string,
+      baseUrl: string,
+      linkText = '',
+      fallbackType?: 'video_media' | 'page_article' | 'image' | 'external'
+    ): boolean => {
+      let resolved = '';
+      try {
+        resolved = new URL(rawOrResolved, baseUrl).href;
+      } catch {
+        return false;
+      }
+      if (!resolved || !/^https?:\/\//i.test(resolved)) return false;
 
-    // 1. Anchor links <a href="...">
-    $('a[href]').each((_, el) => {
-      const rawHref = $(el).attr('href')?.trim();
-      if (!rawHref || rawHref.startsWith('#') || rawHref.startsWith('javascript:') || rawHref.startsWith('mailto:')) {
-        return;
+      if (effectiveMaxUrlLength > 0 && resolved.length > effectiveMaxUrlLength) {
+        skippedLongUrlsSet.add(resolved);
+        return false;
       }
 
-      const resolved = resolveUrl(rawHref);
-      if (!resolved || !/^https?:\/\//i.test(resolved)) return;
-
-      // Skip direct video and image links if webpagesOnly is enabled
       const isMedia = isDirectMediaOrImage(resolved);
-      if (webpagesOnly && isMedia) {
-        return;
-      }
+      if (webpagesOnly && isMedia) return false;
+      if (!matchesUrlFormat(resolved, urlFormat)) return false;
 
-      // Check URL format match (e.g. domain/xyz/, /xyz/)
-      if (!matchesUrlFormat(resolved, urlFormat)) {
-        return;
-      }
-
-      const linkText = $(el).text().replace(/\s+/g, ' ').trim() || $(el).attr('title')?.trim() || '';
-
-      let type: 'video_media' | 'page_article' | 'image' | 'external' = 'page_article';
+      let type: 'video_media' | 'page_article' | 'image' | 'external' = fallbackType || 'page_article';
       if (/\.(mp4|m3u8|webm|mov|mkv)(\?.*)?$/i.test(resolved)) {
         type = 'video_media';
       } else if (/\.(jpg|jpeg|png|webp|avif|gif)(\?.*)?$/i.test(resolved)) {
@@ -4371,58 +5240,259 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
 
       try {
         const linkDomain = new URL(resolved).hostname.toLowerCase();
-        if (sameDomainOnly && linkDomain !== targetDomain && linkDomain !== finalUrlObj.hostname.toLowerCase()) {
-          return;
+        const baseHost = new URL(baseUrl).hostname.toLowerCase();
+        if (sameDomainOnly && linkDomain !== targetDomain && linkDomain !== baseHost) {
+          return false;
         }
-        if (linkDomain !== targetDomain) {
-          if (type === 'page_article') type = 'external';
+        if (linkDomain !== targetDomain && type === 'page_article') {
+          type = 'external';
         }
       } catch {}
 
-      if (!isUrlAllowedByDomainRules(resolved)) {
-        return;
+      if (!isUrlAllowedByDomainRules(resolved)) return false;
+
+      const prev = linksMap.get(resolved);
+      if (!prev) {
+        linksMap.set(resolved, { text: linkText, type });
+        return true;
+      } else if (linkText && (!prev.text || prev.text === 'Discovered in text/script source')) {
+        linksMap.set(resolved, { text: linkText, type: prev.type });
+      }
+      return false;
+    };
+
+    const harvestHtmlAndRawText = (htmlStr: string, pageBaseUrl: string): { nextPageCandidates: string[]; title: string; newlyAdded: number } => {
+      const $ = cheerio.load(htmlStr || '');
+      let newlyAdded = 0;
+
+      // 1. Anchor links <a href="...">
+      $('a[href]').each((_, el) => {
+        const rawHref = $(el).attr('href')?.trim();
+        if (!rawHref || rawHref.startsWith('#') || rawHref.startsWith('javascript:') || rawHref.startsWith('mailto:')) {
+          return;
+        }
+        const linkText = $(el).text().replace(/\s+/g, ' ').trim() || $(el).attr('title')?.trim() || '';
+        if (addDiscoveredUrl(rawHref, pageBaseUrl, linkText)) newlyAdded++;
+      });
+
+      // 2. Card/SPA data-* attributes carrying item links
+      for (const attr of ['data-href', 'data-url', 'data-link', 'data-video-url', 'data-target-url']) {
+        $(`[${attr}]`).each((_, el) => {
+          const val = $(el).attr(attr)?.trim();
+          if (!val) return;
+          const txt = $(el).text().replace(/\s+/g, ' ').trim() || $(el).attr('title')?.trim() || '';
+          if (addDiscoveredUrl(val, pageBaseUrl, txt)) newlyAdded++;
+        });
       }
 
-      if (!linksMap.has(resolved)) {
-        linksMap.set(resolved, { text: linkText, type });
-      } else if (linkText && !linksMap.get(resolved)?.text) {
-        linksMap.set(resolved, { text: linkText, type });
-      }
-    });
-
-    // 2. Direct video tags <video src> or <source src> (Only if webpagesOnly is false)
-    if (!webpagesOnly) {
-      $('video[src], source[src]').each((_, el) => {
-        const src = $(el).attr('src')?.trim();
-        if (src) {
-          const resolved = resolveUrl(src);
-          if (
-            resolved &&
-            /^https?:\/\//i.test(resolved) &&
-            isUrlAllowedByDomainRules(resolved) &&
-            matchesUrlFormat(resolved, urlFormat) &&
-            !linksMap.has(resolved)
-          ) {
-            linksMap.set(resolved, { text: 'Direct Video Stream', type: 'video_media' });
+      // 3. Direct video tags <video src> or <source src> (Only if webpagesOnly is false)
+      if (!webpagesOnly) {
+        $('video[src], source[src]').each((_, el) => {
+          const src = $(el).attr('src')?.trim();
+          if (src && addDiscoveredUrl(src, pageBaseUrl, 'Direct Video Stream', 'video_media')) {
+            newlyAdded++;
           }
+        });
+      }
+
+      // 4. Fallback regex scan for URLs in raw text / inline JSON / scripts
+      const textUrls = (htmlStr || '').match(/https?:\/\/[^\s"',<>\\]+/gi) || [];
+      for (const rawTextUrl of textUrls) {
+        const cleanUrl = rawTextUrl.replace(/[.,;:)\]]+$/, '').trim();
+        if (addDiscoveredUrl(cleanUrl, pageBaseUrl, 'Discovered in text/script source')) {
+          newlyAdded++;
+        }
+      }
+
+      // Discover pagination / infinite-scroll next-page URLs for HTTP multi-page fallback
+      const nextSet = new Set<string>();
+      const pushNext = (raw?: string) => {
+        if (!raw || raw.startsWith('#') || raw.startsWith('javascript:')) return;
+        try {
+          const abs = new URL(raw, pageBaseUrl).href;
+          if (/^https?:\/\//i.test(abs) && abs.length <= 2000 && new URL(abs).hostname.toLowerCase() === targetDomain) {
+            nextSet.add(abs);
+          }
+        } catch {}
+      };
+
+      $('link[rel="next"][href], a[rel="next"][href], a.next[href], a.next-page[href], a[aria-label*="next" i][href]').each((_, el) => {
+        pushNext($(el).attr('href'));
+      });
+      $('[data-next-url], [data-next-page], [data-load-more-url]').each((_, el) => {
+        pushNext($(el).attr('data-next-url') || $(el).attr('data-next-page') || $(el).attr('data-load-more-url'));
+      });
+      $('.pagination a[href], .pager a[href], nav[aria-label*="pagination" i] a[href], .wp-pagenavi a[href]').each((_, el) => {
+        const txt = $(el).text().trim();
+        if (/^(next|next\s*›|›|»|\d+)$/i.test(txt)) {
+          pushNext($(el).attr('href'));
         }
       });
+      // Catch general ?page=2 or /page/2/ pagination anchors
+      $('a[href]').each((_, el) => {
+        const href = $(el).attr('href') || '';
+        if (/[?&]page=\d+/i.test(href) || /\/page\/\d+\/?(?:\?|$)/i.test(href)) {
+          pushNext(href);
+        }
+      });
+
+      return {
+        nextPageCandidates: Array.from(nextSet),
+        title: $('title').text().trim() || '',
+        newlyAdded,
+      };
+    };
+
+    let finalUrl = url;
+    let resolvedPageTitle = '';
+    let activeScrollEngine: 'chromium_browser' | 'http_pagination' | 'single_fetch' = 'single_fetch';
+    let scrollStepsCompleted = 0;
+    let loadMoreClicks = 0;
+    let xhrResponsesCaptured = 0;
+    let pagesVisited = 1;
+    let scrollNote = '';
+
+    // Engine A: Headless Chromium Auto-Scroll (when enabled & browser binary is present & not forced to http)
+    const detectedChromium = resolveChromiumExecutable();
+    const shouldTryChromium =
+      effectiveScrollCount > 0 && requestedScrollEngine !== 'http' && detectedChromium !== null;
+
+    if (effectiveScrollCount > 0 && requestedScrollEngine !== 'http' && !detectedChromium) {
+      scrollNote = 'No Chromium binary found on server — used HTTP pagination crawler';
     }
 
-    // 3. Fallback regex scan for URLs in raw text
-    const textUrls = (typeof response.data === 'string' ? response.data : '').match(/https?:\/\/[^\s"',<>]+/gi) || [];
-    for (const rawTextUrl of textUrls) {
-      const cleanUrl = rawTextUrl.replace(/[.,;:)\]]+$/, '').trim();
-      if (/^https?:\/\//i.test(cleanUrl) && isUrlAllowedByDomainRules(cleanUrl)) {
-        const isMedia = isDirectMediaOrImage(cleanUrl);
-        if (webpagesOnly && isMedia) continue;
-        if (!matchesUrlFormat(cleanUrl, urlFormat)) continue;
+    if (shouldTryChromium) {
+      const browserRes = await crawlLinksWithPlaywrightScroll({
+        url,
+        scrollCount: effectiveScrollCount,
+        clickLoadMore: Boolean(clickLoadMore),
+      });
 
-        if (!linksMap.has(cleanUrl)) {
-          let type: 'video_media' | 'page_article' | 'image' | 'external' = 'page_article';
-          if (/\.(mp4|m3u8|webm|mov|mkv)(\?.*)?$/i.test(cleanUrl)) type = 'video_media';
-          else if (/\.(jpg|jpeg|png|webp|avif|gif)(\?.*)?$/i.test(cleanUrl)) type = 'image';
-          linksMap.set(cleanUrl, { text: 'Discovered in text/script source', type });
+      if (browserRes && !browserRes.error) {
+        activeScrollEngine = 'chromium_browser';
+        finalUrl = browserRes.finalUrl || url;
+        resolvedPageTitle = browserRes.pageTitle || '';
+        scrollStepsCompleted = browserRes.scrollStepsCompleted;
+        loadMoreClicks = browserRes.loadMoreClicks;
+        xhrResponsesCaptured = browserRes.xhrResponsesCaptured;
+
+        for (const rItem of browserRes.renderedLinks) {
+          addDiscoveredUrl(
+            rItem.url,
+            finalUrl,
+            rItem.text,
+            rItem.isDirectMedia ? 'video_media' : undefined
+          );
+        }
+
+        if (browserRes.htmlSnapshot) {
+          const snapRes = harvestHtmlAndRawText(browserRes.htmlSnapshot, finalUrl);
+          if (!resolvedPageTitle && snapRes.title) resolvedPageTitle = snapRes.title;
+        }
+
+        for (const xhrText of browserRes.xhrPayloadTexts) {
+          const unescaped = xhrText.replace(/\\\//g, '/').replace(/\\u002f/gi, '/');
+          const matches = unescaped.match(/https?:\/\/[^\s"',<>\\]+/gi) || [];
+          for (const rawM of matches) {
+            const cleanM = rawM.replace(/[.,;:)\]]+$/, '').trim();
+            addDiscoveredUrl(cleanM, finalUrl, 'Discovered in scroll feed XHR');
+          }
+        }
+      } else if (browserRes?.error) {
+        scrollNote = `Chromium scroll fallback (${browserRes.error})`;
+      }
+    }
+
+    // Engine B: Fast HTTP Fetch + Multi-Page Pagination / Infinite-Scroll Crawler
+    // Runs if Chromium wasn't used/available, or as fallback if Chromium yielded 0 usable links
+    if (activeScrollEngine !== 'chromium_browser' || linksMap.size === 0) {
+      const visitedPages = new Set<string>();
+      const pageQueue: string[] = [url];
+      const maxPagesToCrawl = effectiveScrollCount > 0 ? Math.min(25, effectiveScrollCount + 1) : 1;
+
+      if (effectiveScrollCount > 0 && requestedScrollEngine !== 'browser') {
+        activeScrollEngine = 'http_pagination';
+      } else {
+        activeScrollEngine = 'single_fetch';
+      }
+
+      pagesVisited = 0;
+      let consecutiveEmptyPages = 0;
+
+      while (pageQueue.length > 0 && pagesVisited < maxPagesToCrawl) {
+        const nextUrl = pageQueue.shift()!;
+        const normPage = normalizeUrlForDedup(nextUrl);
+        if (visitedPages.has(normPage)) continue;
+        visitedPages.add(normPage);
+
+        const response = await axiosGetWithRetry(
+          nextUrl,
+          {
+            headers: {
+              'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+              Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.9',
+              'Accept-Encoding': 'gzip, deflate, br',
+            },
+            timeout: 25000,
+            maxRedirects: 5,
+            responseType: 'text',
+            validateStatus: () => true,
+          },
+          3
+        );
+
+        const currentFinalUrl = (response.request as any)?.res?.responseUrl || response.config?.url || nextUrl;
+        if (pagesVisited === 0) {
+          finalUrl = currentFinalUrl;
+        }
+        pagesVisited++;
+
+        if (response.status >= 400 || typeof response.data !== 'string') {
+          if (pagesVisited === 1) break;
+          continue;
+        }
+
+        const harvested = harvestHtmlAndRawText(response.data, currentFinalUrl);
+        if (!resolvedPageTitle && harvested.title) resolvedPageTitle = harvested.title;
+
+        if (effectiveScrollCount > 0) {
+          scrollStepsCompleted = pagesVisited;
+          if (harvested.newlyAdded === 0 && pagesVisited > 1) {
+            consecutiveEmptyPages++;
+            if (consecutiveEmptyPages >= 2) break;
+          } else {
+            consecutiveEmptyPages = 0;
+          }
+
+          // Order next pagination pages sequentially (?page=2, ?page=3...)
+          const sortedNext = harvested.nextPageCandidates
+            .filter((cand) => !visitedPages.has(normalizeUrlForDedup(cand)))
+            .sort((a, b) => {
+              const numA = Number((a.match(/(?:page=|\/page\/)(\d+)/i) || [])[1] || 99999);
+              const numB = Number((b.match(/(?:page=|\/page\/)(\d+)/i) || [])[1] || 99999);
+              return numA - numB;
+            });
+
+          for (const cand of sortedNext) {
+            if (!pageQueue.includes(cand)) pageQueue.push(cand);
+          }
+
+          // If page had ?page=N or /page/N links, also synthesize page N+1 if missing from DOM
+          if (pageQueue.length === 0 && pagesVisited === 1) {
+            if (/[?&]page=(\d+)/i.test(currentFinalUrl)) {
+              const curP = Number((currentFinalUrl.match(/[?&]page=(\d+)/i) || [])[1] || 1);
+              for (let p = curP + 1; p <= curP + effectiveScrollCount; p++) {
+                pageQueue.push(currentFinalUrl.replace(/([?&]page=)\d+/i, `$1${p}`));
+              }
+            } else if (/\/page\/(\d+)(\/?)/i.test(currentFinalUrl)) {
+              const curP = Number((currentFinalUrl.match(/\/page\/(\d+)/i) || [])[1] || 1);
+              for (let p = curP + 1; p <= curP + effectiveScrollCount; p++) {
+                pageQueue.push(currentFinalUrl.replace(/(\/page\/)\d+/i, `$1${p}`));
+              }
+            }
+          }
         }
       }
     }
@@ -4439,7 +5509,6 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
       let finalReg = reg;
 
       if (!reg && autoRegisterNew) {
-        // Automatically add new link to Cloudflare so future requests find it immediately
         finalReg = {
           id: getLinkUniqueId(linkUrl),
           sourceUrl: linkUrl,
@@ -4494,9 +5563,19 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
       sourceUrl: url,
       finalUrl,
       targetDomain,
-      pageTitle: $('title').text().trim() || '',
+      pageTitle: resolvedPageTitle,
       webpagesOnly,
       urlFormat: urlFormat.trim(),
+      scrollUsed: effectiveScrollCount > 0,
+      scrollEngine: activeScrollEngine,
+      scrollStepsCompleted,
+      pagesVisited,
+      loadMoreClicks,
+      xhrResponsesCaptured,
+      scrollNote: scrollNote || undefined,
+      skipLongUrls: Boolean(skipLongUrls),
+      maxUrlLength: effectiveMaxUrlLength,
+      skippedLongUrlCount: skippedLongUrlsSet.size,
       totalExtracted: list.length,
       videoMediaCount: list.filter((l) => l.type === 'video_media').length,
       pageArticleCount: list.filter((l) => l.type === 'page_article').length,
@@ -5529,7 +6608,7 @@ async function compressVideoWithFfmpeg(
   const originalSizeBytes = fs.statSync(inputPath).size;
   const presetCfg = COMPRESSION_PRESETS[quality] || COMPRESSION_PRESETS.balanced;
   const outputPath = path.join(
-    localUploadsDir,
+    localTempDir,
     `temp_comp_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.mp4`
   );
 
@@ -5656,6 +6735,11 @@ async function uploadVideoToR2OrLocal(params: {
   allowShortDurationFallback?: boolean;
   compressVideo?: boolean;
   compressionQuality?: VideoCompressionQuality;
+  onStage?: (
+    stage: 'checking_registry' | 'scraping' | 'downloading_video' | 'compressing_video' | 'uploading_cloudflare',
+    detail: string,
+    meta?: { title?: string; thumbnailUrl?: string; videoUrl?: string }
+  ) => void;
 }): Promise<{
   cloudflareVideoBackLink: string;
   videoKey: string;
@@ -5685,6 +6769,7 @@ async function uploadVideoToR2OrLocal(params: {
     allowShortDurationFallback = true,
     compressVideo = false,
     compressionQuality = 'balanced',
+    onStage,
   } = params;
 
   const videoUrl = String(rawVideoUrl || '')
@@ -5721,9 +6806,9 @@ async function uploadVideoToR2OrLocal(params: {
     };
   }
 
-  // Temporary path for streaming download
+  // Temporary path for streaming download (in OS tmpdir outside workspace)
   const tempFilename = `temp_vid_${Date.now()}_${Math.random().toString(36).substring(2, 7)}.mp4`;
-  const tempFilePath = path.join(localUploadsDir, tempFilename);
+  const tempFilePath = path.join(localTempDir, tempFilename);
 
   const videoOrigin = resolveOriginSafe(videoUrl);
   const primaryReferer = refererUrl || (videoOrigin ? `${videoOrigin}/` : '');
@@ -5754,6 +6839,7 @@ async function uploadVideoToR2OrLocal(params: {
 
     try {
       if (looksLikeHls) {
+        onStage?.('downloading_video', 'Downloading HLS video stream...');
         const hlsOut = await downloadHlsStreamToMp4(videoUrl, tempFilePath, attempt === 3 ? undefined : useReferer || undefined, cookieHeader, useProxy);
         downloadedHlsFormat = hlsOut.format;
         contentType = hlsOut.format === 'ts' ? 'video/mp2t' : 'video/mp4';
@@ -5806,6 +6892,7 @@ async function uploadVideoToR2OrLocal(params: {
           if (videoStreamRes.data && typeof videoStreamRes.data.destroy === 'function') {
             videoStreamRes.data.destroy();
           }
+          onStage?.('downloading_video', 'Downloading HLS video stream...');
           const hlsOut = await downloadHlsStreamToMp4(videoUrl, tempFilePath, useReferer || primaryReferer, cookieHeader, useProxy);
           downloadedHlsFormat = hlsOut.format;
           contentType = hlsOut.format === 'ts' ? 'video/mp2t' : 'video/mp4';
@@ -5815,6 +6902,30 @@ async function uploadVideoToR2OrLocal(params: {
           }
 
           const expectedRemoteBytes = Number(videoStreamRes.headers['content-length'] || 0);
+          onStage?.(
+            'downloading_video',
+            expectedRemoteBytes > 0
+              ? `Downloading video (0 / ${formatBytes(expectedRemoteBytes)})...`
+              : 'Downloading video...'
+          );
+          let downloadedSoFar = 0;
+          let lastDlReportAt = Date.now();
+          videoStreamRes.data.on('data', (chunk: Buffer) => {
+            downloadedSoFar += chunk.length;
+            const now = Date.now();
+            if (now - lastDlReportAt >= 1200) {
+              lastDlReportAt = now;
+              if (expectedRemoteBytes > 0) {
+                const pct = Math.min(99, Math.round((downloadedSoFar / expectedRemoteBytes) * 100));
+                onStage?.(
+                  'downloading_video',
+                  `Downloading video (${pct}% · ${formatBytes(downloadedSoFar)} / ${formatBytes(expectedRemoteBytes)})...`
+                );
+              } else {
+                onStage?.('downloading_video', `Downloading video (${formatBytes(downloadedSoFar)})...`);
+              }
+            }
+          });
           const writer = fs.createWriteStream(tempFilePath);
           await pipeline(videoStreamRes.data, writer);
 
@@ -5837,6 +6948,7 @@ async function uploadVideoToR2OrLocal(params: {
               try {
                 if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
               } catch {}
+              onStage?.('downloading_video', 'Downloading HLS video stream...');
               const hlsOut = await downloadHlsStreamToMp4(videoUrl, tempFilePath, useReferer || primaryReferer, cookieHeader, useProxy);
               downloadedHlsFormat = hlsOut.format;
               contentType = hlsOut.format === 'ts' ? 'video/mp2t' : 'video/mp4';
@@ -5893,134 +7005,168 @@ async function uploadVideoToR2OrLocal(params: {
     throw new Error(`Failed to download remote video stream: ${formatCompactError(lastDownloadErr || '0 bytes')}`);
   }
 
-  // Extract actual video duration metadata directly from the downloaded video file before compression/upload
-  let extractedMeta = await extractVideoMetadataFromFile(tempFilePath);
-
-  // Reject ultra-short hover-preview/trailer clips when real page duration is much longer (unless it's our sole 20s+ fallback candidate)
-  const isTooShortPreview =
-    Boolean(minExpectedDurationSec && minExpectedDurationSec >= 45 && extractedMeta.durationSec) &&
-    extractedMeta.durationSec! < Math.max(15, Math.floor(minExpectedDurationSec! * 0.3)) &&
-    (!allowShortDurationFallback || extractedMeta.durationSec! < 20);
-
-  if (isTooShortPreview) {
-    try {
-      if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
-    } catch {}
-    throw new Error(
-      `Downloaded clip duration (${extractedMeta.durationSec}s) is much shorter than real video duration (${minExpectedDurationSec}s) — skipping preview clip`
-    );
-  }
-
-  // Derive file extension
-  let ext = downloadedHlsFormat === 'ts' ? 'ts' : 'mp4';
-  if (!looksLikeHls && downloadedHlsFormat !== 'ts') {
-    if (videoUrl.includes('.webm') || contentType.includes('webm')) ext = 'webm';
-    else if (videoUrl.includes('.mkv') || contentType.includes('x-matroska')) ext = 'mkv';
-    else if (videoUrl.includes('.mov') || contentType.includes('quicktime')) ext = 'mov';
-  }
-
-  // Optional FFmpeg compression BEFORE uploading to Cloudflare R2 (OFF by default)
-  let uploadFilePath = tempFilePath;
+  let extractedMeta: { durationSec: number | null; durationFormatted: string | null } = {
+    durationSec: null,
+    durationFormatted: null,
+  };
   let compressedTempPath: string | null = null;
   let didCompress = false;
   let originalSizeBeforeCompress = fileSize;
-  let compressionSavedPercent = 0;
   const resolvedQuality = normalizeCompressionQuality(compressionQuality);
-
-  if (compressVideo) {
-    try {
-      const compRes = await compressVideoWithFfmpeg(tempFilePath, resolvedQuality);
-      if (compRes.usedCompressed && compRes.outputPath !== tempFilePath) {
-        compressedTempPath = compRes.outputPath;
-        uploadFilePath = compRes.outputPath;
-        fileSize = compRes.compressedSizeBytes;
-        originalSizeBeforeCompress = compRes.originalSizeBytes;
-        compressionSavedPercent = compRes.savedPercent;
-        didCompress = true;
-        contentType = 'video/mp4';
-        ext = 'mp4';
-        if (!extractedMeta.durationSec) {
-          extractedMeta = await extractVideoMetadataFromFile(uploadFilePath);
-        }
-      }
-    } catch (compErr: any) {
-      console.warn('Video compression failed; falling back to original file:', formatCompactError(compErr));
-    }
-  }
-
-  const safeName = customFilename
-    ? customFilename.toLowerCase().replace(/[^a-z0-9_-]/g, '_').substring(0, 60)
-    : `video_${Date.now()}`;
-  const filename = `${safeName}.${ext}`;
-  const cleanFolder = folderPrefix.replace(/^\/+|\/+$/g, '');
-  const videoKey = cleanFolder ? `${cleanFolder}/${filename}` : filename;
-
+  let compressionSavedPercent = 0;
   let cloudflareVideoBackLink = '';
+  let videoKey = '';
   let storageSource: 'cloudflare_r2' | 'emulator' = 'emulator';
   let verifiedSizeBytes = fileSize;
 
   try {
+    // Extract actual video duration metadata directly from the downloaded video file before compression/upload
+    extractedMeta = await extractVideoMetadataFromFile(tempFilePath);
+
+    // Reject ultra-short hover-preview/trailer clips when real page duration is much longer (unless it's our sole 20s+ fallback candidate)
+    const isTooShortPreview =
+      Boolean(minExpectedDurationSec && minExpectedDurationSec >= 45 && extractedMeta.durationSec) &&
+      extractedMeta.durationSec! < Math.max(15, Math.floor(minExpectedDurationSec! * 0.3)) &&
+      (!allowShortDurationFallback || extractedMeta.durationSec! < 20);
+
+    if (isTooShortPreview) {
+      throw new Error(
+        `Downloaded clip duration (${extractedMeta.durationSec}s) is much shorter than real video duration (${minExpectedDurationSec}s) — skipping preview clip`
+      );
+    }
+
+    // Derive file extension
+    let ext = downloadedHlsFormat === 'ts' ? 'ts' : 'mp4';
+    if (!looksLikeHls && downloadedHlsFormat !== 'ts') {
+      if (videoUrl.includes('.webm') || contentType.includes('webm')) ext = 'webm';
+      else if (videoUrl.includes('.mkv') || contentType.includes('x-matroska')) ext = 'mkv';
+      else if (videoUrl.includes('.mov') || contentType.includes('quicktime')) ext = 'mov';
+    }
+
+    // Optional FFmpeg compression BEFORE uploading to Cloudflare R2 (OFF by default)
+    let uploadFilePath = tempFilePath;
+
+    if (compressVideo) {
+      onStage?.('compressing_video', `Compressing video (${resolvedQuality} · ${formatBytes(fileSize)})...`);
+      try {
+        const compRes = await compressVideoWithFfmpeg(tempFilePath, resolvedQuality);
+        if (compRes.usedCompressed && compRes.outputPath !== tempFilePath) {
+          compressedTempPath = compRes.outputPath;
+          uploadFilePath = compRes.outputPath;
+          fileSize = compRes.compressedSizeBytes;
+          originalSizeBeforeCompress = compRes.originalSizeBytes;
+          compressionSavedPercent = compRes.savedPercent;
+          didCompress = true;
+          contentType = 'video/mp4';
+          ext = 'mp4';
+          if (!extractedMeta.durationSec) {
+            extractedMeta = await extractVideoMetadataFromFile(uploadFilePath);
+          }
+        }
+      } catch (compErr: any) {
+        console.warn('Video compression failed; falling back to original file:', formatCompactError(compErr));
+      }
+    }
+
+    const safeName = customFilename
+      ? customFilename.toLowerCase().replace(/[^a-z0-9_-]/g, '_').substring(0, 60)
+      : `video_${Date.now()}`;
+    const filename = `${safeName}.${ext}`;
+    const cleanFolder = folderPrefix.replace(/^\/+|\/+$/g, '');
+    videoKey = cleanFolder ? `${cleanFolder}/${filename}` : filename;
+    verifiedSizeBytes = fileSize;
+
     if (r2Config) {
-      const s3 = createR2Client(r2Config);
-      let r2UploadErr: any = null;
-      for (let r2Attempt = 1; r2Attempt <= 2; r2Attempt++) {
-        const fileStream = fs.createReadStream(uploadFilePath);
-        try {
-          if (fileSize >= 8 * 1024 * 1024) {
-            // Multi-part parallel R2 upload (4 concurrent 8MB/16MB streams) for reliable uploads on large videos
-            const parallelUpload = new Upload({
-              client: s3,
-              params: {
+      activeR2VideoUploads++;
+      try {
+        const { queueSize, partSize } = getR2MultipartTuning(fileSize);
+        const isMultipart = fileSize > 5 * 1024 * 1024;
+        onStage?.(
+          'uploading_cloudflare',
+          isMultipart
+            ? `Uploading video to Cloudflare R2 (${formatBytes(fileSize)} · ${queueSize}x streams)...`
+            : `Uploading video to Cloudflare R2 (${formatBytes(fileSize)})...`
+        );
+        const s3 = createR2Client(r2Config);
+        let r2UploadErr: any = null;
+        for (let r2Attempt = 1; r2Attempt <= 2; r2Attempt++) {
+          let fileStream: fs.ReadStream | null = null;
+          try {
+            const uploadStartedAt = Date.now();
+            if (isMultipart) {
+              fileStream = fs.createReadStream(uploadFilePath, { highWaterMark: 2 * 1024 * 1024 });
+              const parallelUpload = new Upload({
+                client: s3,
+                params: {
+                  Bucket: r2Config.bucketName,
+                  Key: videoKey,
+                  Body: fileStream,
+                  ContentType: contentType,
+                  CacheControl: 'public, max-age=31536000',
+                },
+                queueSize,
+                partSize,
+                leavePartsOnError: false,
+              });
+              let lastUpReportAt = 0;
+              parallelUpload.on('httpUploadProgress', (prog) => {
+                const now = Date.now();
+                if (now - lastUpReportAt >= 1200 && typeof prog.loaded === 'number') {
+                  lastUpReportAt = now;
+                  const total = prog.total || fileSize;
+                  const pct = total > 0 ? Math.min(99, Math.round((prog.loaded / total) * 100)) : 0;
+                  const elapsedSecs = Math.max(0.2, (now - uploadStartedAt) / 1000);
+                  const speedMbSec = (prog.loaded / (1024 * 1024) / elapsedSecs).toFixed(1);
+                  onStage?.(
+                    'uploading_cloudflare',
+                    `Uploading video to Cloudflare R2 (${pct}% · ${formatBytes(prog.loaded)} / ${formatBytes(total)} · ${speedMbSec} MB/s · ${queueSize}x)...`
+                  );
+                }
+              });
+              await parallelUpload.done();
+            } else {
+              const directBuffer = await fs.promises.readFile(uploadFilePath);
+              await s3.send(
+                new PutObjectCommand({
+                  Bucket: r2Config.bucketName,
+                  Key: videoKey,
+                  Body: directBuffer,
+                  ContentLength: directBuffer.length,
+                  ContentType: contentType,
+                  CacheControl: 'public, max-age=31536000',
+                })
+              );
+            }
+
+            // Read-after-write verification on Cloudflare R2 & capture authoritative R2 object byte length
+            const headRes = await s3.send(
+              new HeadObjectCommand({
                 Bucket: r2Config.bucketName,
                 Key: videoKey,
-                Body: fileStream,
-                ContentType: contentType,
-                CacheControl: 'public, max-age=31536000',
-              },
-              queueSize: 4,
-              partSize: fileSize >= 1024 * 1024 * 1024 ? 16 * 1024 * 1024 : 8 * 1024 * 1024,
-              leavePartsOnError: false,
-            });
-            await parallelUpload.done();
-          } else {
-            await s3.send(
-              new PutObjectCommand({
-                Bucket: r2Config.bucketName,
-                Key: videoKey,
-                Body: fileStream,
-                ContentLength: fileSize,
-                ContentType: contentType,
-                CacheControl: 'public, max-age=31536000',
               })
             );
+            if (typeof headRes.ContentLength === 'number' && headRes.ContentLength > 0) {
+              verifiedSizeBytes = headRes.ContentLength;
+            }
+            r2UploadErr = null;
+            break;
+          } catch (err: any) {
+            r2UploadErr = err;
+            if (r2Attempt < 2 && isRetryableNetworkError(err)) {
+              await sleepMs(1000);
+              continue;
+            }
+            throw err;
+          } finally {
+            try {
+              if (fileStream) fileStream.destroy();
+            } catch {}
           }
-
-          // Read-after-write verification on Cloudflare R2 & capture authoritative R2 object byte length
-          const headRes = await s3.send(
-            new HeadObjectCommand({
-              Bucket: r2Config.bucketName,
-              Key: videoKey,
-            })
-          );
-          if (typeof headRes.ContentLength === 'number' && headRes.ContentLength > 0) {
-            verifiedSizeBytes = headRes.ContentLength;
-          }
-          r2UploadErr = null;
-          break;
-        } catch (err: any) {
-          r2UploadErr = err;
-          if (r2Attempt < 2 && isRetryableNetworkError(err)) {
-            await sleepMs(1000);
-            continue;
-          }
-          throw err;
-        } finally {
-          try {
-            fileStream.destroy();
-          } catch {}
         }
+        if (r2UploadErr) throw r2UploadErr;
+      } finally {
+        activeR2VideoUploads = Math.max(0, activeR2VideoUploads - 1);
       }
-      if (r2UploadErr) throw r2UploadErr;
 
       cloudflareVideoBackLink = r2Config.publicUrlPrefix
         ? `${r2Config.publicUrlPrefix}/${videoKey}`
@@ -6127,6 +7273,11 @@ async function processUrlCore(params: {
   r2ConfigOverride?: R2Config | null;
   appBaseUrlOverride?: string;
   extraServers?: string[];
+  onStage?: (
+    stage: 'checking_registry' | 'scraping' | 'downloading_video' | 'compressing_video' | 'uploading_cloudflare',
+    detail: string,
+    meta?: { title?: string; thumbnailUrl?: string; videoUrl?: string }
+  ) => void;
 }): Promise<any> {
   let {
     url,
@@ -6141,6 +7292,7 @@ async function processUrlCore(params: {
     r2ConfigOverride,
     appBaseUrlOverride,
     extraServers = [],
+    onStage,
   } = params;
 
   url = url.trim();
@@ -6858,9 +8010,18 @@ async function processUrlCore(params: {
       let lastThumbUploadError: string | null = null;
       let lastVideoUploadError: string | null = null;
 
+      onStage?.('scraping', 'Extracted metadata · preparing downloads...', {
+        title: cleanedPrimary.cleaned || undefined,
+        thumbnailUrl: originalPrimaryThumbnail || undefined,
+        videoUrl: firstVideoUrl || undefined,
+      });
+
       // Run thumbnail R2 upload and video R2 download/upload IN PARALLEL so thumbnail upload adds 0ms wait time
       const thumbUploadPromise = (async () => {
         if (!uploadThumbnailToR2 || !primaryThumbnail) return;
+        if (!uploadVideoToR2 || sortedVideoCandidates.length === 0) {
+          onStage?.('uploading_cloudflare', 'Uploading thumbnail to Cloudflare R2...');
+        }
         try {
           const r2Upload = await uploadImageToR2OrLocal({
             imageUrl: primaryThumbnail,
@@ -6912,6 +8073,7 @@ async function processUrlCore(params: {
               allowShortDurationFallback: idx === candidatesToTry.length - 1,
               compressVideo: Boolean(compressVideo),
               compressionQuality: normalizeCompressionQuality(compressionQuality),
+              onStage,
             });
             cloudflareVideoUrl = r2VideoUpload.cloudflareVideoBackLink;
             videoStorageSource = r2VideoUpload.storageSource;
@@ -7076,6 +8238,7 @@ async function processUrlCore(params: {
             appBaseUrlOverride,
             compressVideo: Boolean(compressVideo),
             compressionQuality: normalizeCompressionQuality(compressionQuality),
+            onStage,
           });
           cloudflareVideoUrl = r2DirectVideo.cloudflareVideoBackLink;
           videoStorageSource = r2DirectVideo.storageSource;
@@ -7229,6 +8392,7 @@ async function processUrlCore(params: {
     });
 
     // Sync complete record directly to ott-database (/api/links_registry)
+    onStage?.('uploading_cloudflare', 'Saving metadata to Cloudflare D1...');
     await syncRegistryToStorage(req, [savedRegistryRecord]);
 
     return {
@@ -7402,20 +8566,22 @@ app.get('/api/system-resources', (_req: Request, res: Response) => {
       diskUsagePercent = 20;
     }
 
-    // Measure temporary working files currently in uploads/ (active downloads/ffmpeg temp files)
+    // Measure temporary working files currently in temp/uploads (active downloads/ffmpeg temp files)
     let tempUploadsBytes = 0;
     let tempFileCount = 0;
-    try {
-      const entries = fs.readdirSync(localUploadsDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isFile()) {
-          try {
-            tempUploadsBytes += fs.statSync(path.join(localUploadsDir, entry.name)).size;
-            tempFileCount++;
-          } catch {}
+    for (const dir of Array.from(new Set([localTempDir, localUploadsDir]))) {
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (entry.isFile()) {
+            try {
+              tempUploadsBytes += fs.statSync(path.join(dir, entry.name)).size;
+              tempFileCount++;
+            } catch {}
+          }
         }
-      }
-    } catch {}
+      } catch {}
+    }
 
     // Dynamic Worker Recommendation calculation (range: 1 - 50)
     // Network/TLS scraping & streaming is I/O-bound (~95% socket wait), so each vCPU can drive ~10 concurrent workers toward 70-80% core usage
@@ -7717,13 +8883,38 @@ async function startServer() {
 
   const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server listening on port ${PORT} (Cloudflare Worker D1: ${CF_WORKER_BASE_URL})`);
-    hydrateRegistryFromD1IfNeeded()
-      .then(() => loadAndResumeVpsBatchJob())
-      .catch(() => {});
+    hydrateRegistryFromD1IfNeeded().catch(() => {});
+    ensureVpsBatchJobInitialized().catch(() => {});
   });
   httpServer.requestTimeout = 0;
   httpServer.headersTimeout = 120000;
   httpServer.keepAliveTimeout = 65000;
+
+  const gracefulShutdown = async (signal: string) => {
+    if (vpsServerShuttingDown) return;
+    vpsServerShuttingDown = true;
+    stopVpsCloudKeepAliveLoop();
+    console.log(`[Shutdown] ${signal} received — saving batch queue state cleanly...`);
+    try {
+      await Promise.race([
+        persistVpsBatchJob(true),
+        new Promise((r) => setTimeout(r, 3500)),
+      ]);
+    } catch {}
+    try {
+      httpServer.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 1000).unref();
+    } catch {
+      process.exit(0);
+    }
+  };
+
+  process.once('SIGTERM', () => {
+    gracefulShutdown('SIGTERM');
+  });
+  process.once('SIGINT', () => {
+    gracefulShutdown('SIGINT');
+  });
 }
 
 startServer().catch((err) => {

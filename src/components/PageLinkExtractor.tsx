@@ -63,12 +63,29 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
   const [webpagesOnly, setWebpagesOnly] = useState(true);
   const [urlFormat, setUrlFormat] = useState('');
   const [autoRegisterNew, setAutoRegisterNew] = useState(true);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [scrollCount, setScrollCount] = useState<number>(8);
+  const [clickLoadMore, setClickLoadMore] = useState(true);
+  const [scrollEngine, setScrollEngine] = useState<'auto' | 'browser' | 'http'>('auto');
+  const [skipLongUrls, setSkipLongUrls] = useState(true);
+  const [maxUrlLength, setMaxUrlLength] = useState<number>(250);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // Extracted response data
   const [pageTitle, setPageTitle] = useState('');
   const [linksList, setLinksList] = useState<ExtractedPageLink[]>([]);
+  const [scrollStats, setScrollStats] = useState<{
+    scrollUsed?: boolean;
+    scrollEngine?: string;
+    scrollStepsCompleted?: number;
+    pagesVisited?: number;
+    loadMoreClicks?: number;
+    xhrResponsesCaptured?: number;
+    scrollNote?: string;
+    skippedLongUrlCount?: number;
+    maxUrlLength?: number;
+  } | null>(null);
   const [activeTypeFilter, setActiveTypeFilter] = useState<'all' | 'video_media' | 'page_article' | 'registered' | 'unregistered'>('all');
   const [searchTerm, setSearchTerm] = useState('');
 
@@ -169,16 +186,19 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
     { label: 'Sample Video Bucket', url: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4' },
   ];
 
-  const handleExtractLinks = async (targetOverride?: string) => {
+  const handleExtractLinks = async (targetOverride?: string, scrollCountOverride?: number) => {
     const target = (targetOverride || sourceUrl).trim();
     if (!target) {
       setErrorMsg('Please enter a website URL to extract all links from.');
       return;
     }
 
+    const effectiveScrolls = scrollCountOverride ?? scrollCount;
     setIsLoading(true);
     setErrorMsg(null);
-    setSelectedUrls(new Set());
+    if (scrollCountOverride === undefined) {
+      setSelectedUrls(new Set());
+    }
 
     try {
       const res = await fetch('/api/extract-page-links', {
@@ -191,6 +211,12 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
           webpagesOnly,
           urlFormat: urlFormat.trim(),
           autoRegisterNew,
+          autoScroll,
+          scrollCount: effectiveScrolls,
+          clickLoadMore,
+          scrollEngine,
+          skipLongUrls,
+          maxUrlLength,
         }),
       });
 
@@ -201,6 +227,17 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
 
       setPageTitle(data.pageTitle || '');
       setLinksList(data.links || []);
+      setScrollStats({
+        scrollUsed: data.scrollUsed,
+        scrollEngine: data.scrollEngine,
+        scrollStepsCompleted: data.scrollStepsCompleted,
+        pagesVisited: data.pagesVisited,
+        loadMoreClicks: data.loadMoreClicks,
+        xhrResponsesCaptured: data.xhrResponsesCaptured,
+        scrollNote: data.scrollNote,
+        skippedLongUrlCount: data.skippedLongUrlCount,
+        maxUrlLength: data.maxUrlLength,
+      });
     } catch (err: any) {
       setErrorMsg(err.message || 'Error communicating with link extraction server');
     } finally {
@@ -282,6 +319,11 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
       );
     }
 
+    // Skip overly long tracking / token / CDN URLs
+    if (skipLongUrls && maxUrlLength > 0) {
+      result = result.filter((l) => l.url.length <= maxUrlLength);
+    }
+
     // URL path format filter (e.g. domain/xyz/ or /xyz/)
     if (urlFormat.trim()) {
       result = result.filter((l) => matchesFormatClient(l.url, urlFormat, sourceUrl));
@@ -303,7 +345,7 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
     }
 
     return result;
-  }, [linksList, webpagesOnly, urlFormat, sourceUrl, activeTypeFilter, searchTerm]);
+  }, [linksList, webpagesOnly, skipLongUrls, maxUrlLength, urlFormat, sourceUrl, activeTypeFilter, searchTerm]);
 
   const copyToClipboard = (text: string, key: string) => {
     navigator.clipboard.writeText(text);
@@ -428,7 +470,7 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
               {isLoading ? (
                 <>
                   <RefreshCw className="w-4 h-4 animate-spin" />
-                  <span>Harvesting Links...</span>
+                  <span>{autoScroll ? `Scrolling (${scrollCount}x) & Harvesting...` : 'Harvesting Links...'}</span>
                 </>
               ) : (
                 <>
@@ -514,6 +556,67 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
             </p>
           </div>
 
+          {/* Auto-Scroll & Infinite Feed Harvesting Panel */}
+          <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="flex items-center gap-2 cursor-pointer font-bold select-none bg-orange-500/10 border border-orange-500/30 text-orange-300 px-3 py-1.5 rounded-xl transition-colors hover:bg-orange-500/20">
+                <input
+                  type="checkbox"
+                  checked={autoScroll}
+                  onChange={(e) => setAutoScroll(e.target.checked)}
+                  className="rounded border-slate-700 text-orange-500 focus:ring-0 bg-slate-950"
+                />
+                <span className="flex items-center gap-1.5">
+                  <Layers className="w-3.5 h-3.5 text-orange-400" />
+                  <span>Auto-Scroll Page (Load Infinite Feed Like Chrome)</span>
+                </span>
+              </label>
+
+              {autoScroll && (
+                <>
+                  <div className="flex items-center gap-1.5 bg-slate-900 border border-slate-800 rounded-lg px-2 py-1">
+                    <span className="text-slate-400 text-[11px]">Scrolls:</span>
+                    {[3, 8, 15, 25, 40].map((val) => (
+                      <button
+                        key={val}
+                        type="button"
+                        onClick={() => setScrollCount(val)}
+                        className={`px-2 py-0.5 rounded font-mono text-[11px] font-bold transition-colors ${
+                          scrollCount === val
+                            ? 'bg-orange-500 text-slate-950'
+                            : 'bg-slate-950 text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        {val}x
+                      </button>
+                    ))}
+                  </div>
+
+                  <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 select-none">
+                    <input
+                      type="checkbox"
+                      checked={clickLoadMore}
+                      onChange={(e) => setClickLoadMore(e.target.checked)}
+                      className="rounded border-slate-700 text-orange-500 focus:ring-0 bg-slate-950"
+                    />
+                    <span>Click &quot;Load More&quot; buttons</span>
+                  </label>
+
+                  <select
+                    value={scrollEngine}
+                    onChange={(e) => setScrollEngine(e.target.value as 'auto' | 'browser' | 'http')}
+                    className="px-2.5 py-1 bg-slate-900 border border-slate-800 rounded-lg text-slate-300 text-[11px] outline-none focus:border-orange-500"
+                    title="Choose scrolling strategy"
+                  >
+                    <option value="auto">Engine: Auto (Chrome Scroll + Pagination)</option>
+                    <option value="browser">Engine: Headless Chrome Scroll</option>
+                    <option value="http">Engine: Fast HTTP Pagination</option>
+                  </select>
+                </>
+              )}
+            </div>
+          </div>
+
           {/* Options & Sample Sites */}
           <div className="flex flex-wrap items-center justify-between gap-3 text-xs pt-1">
             <div className="flex flex-wrap items-center gap-3">
@@ -530,6 +633,52 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
                   <span>Webpages Only (Skip Direct Video &amp; Image Links)</span>
                 </span>
               </label>
+
+              {/* Skip Too Long URLs Toggle & Max Length */}
+              <div className="flex flex-wrap items-center gap-2 bg-amber-500/10 border border-amber-500/30 text-amber-300 px-3 py-1.5 rounded-xl">
+                <label className="flex items-center gap-2 cursor-pointer font-bold select-none">
+                  <input
+                    type="checkbox"
+                    checked={skipLongUrls}
+                    onChange={(e) => setSkipLongUrls(e.target.checked)}
+                    className="rounded border-slate-700 text-amber-500 focus:ring-0 bg-slate-950"
+                  />
+                  <span>Skip Too Long URLs</span>
+                </label>
+
+                {skipLongUrls && (
+                  <div className="flex items-center gap-1 pl-1 border-l border-amber-500/30">
+                    <span className="text-[11px] text-amber-200/80">Max:</span>
+                    {[120, 200, 250, 400].map((len) => (
+                      <button
+                        key={len}
+                        type="button"
+                        onClick={() => setMaxUrlLength(len)}
+                        className={`px-1.5 py-0.5 rounded font-mono text-[10px] font-bold transition-colors ${
+                          maxUrlLength === len
+                            ? 'bg-amber-400 text-slate-950'
+                            : 'bg-slate-950/70 text-amber-200 hover:bg-slate-900'
+                        }`}
+                      >
+                        {len}
+                      </button>
+                    ))}
+                    <input
+                      type="number"
+                      min={40}
+                      max={4000}
+                      value={maxUrlLength}
+                      onChange={(e) => {
+                        const val = Number(e.target.value);
+                        if (!Number.isNaN(val)) setMaxUrlLength(Math.max(40, Math.min(4000, val)));
+                      }}
+                      className="w-14 px-1.5 py-0.5 bg-slate-950 border border-amber-500/30 rounded text-amber-200 font-mono text-[11px] outline-none focus:border-amber-400"
+                      title="Maximum URL character length"
+                    />
+                    <span className="text-[10px] text-amber-200/70">chars</span>
+                  </div>
+                )}
+              </div>
 
               <label className="flex items-center gap-2 cursor-pointer text-slate-300 select-none">
                 <input
@@ -776,6 +925,29 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
                     Format: {urlFormat} ({filteredLinks.length} matched)
                   </span>
                 )}
+                {scrollStats?.scrollUsed && (
+                  <span
+                    className="px-2 py-0.5 rounded bg-orange-500/15 border border-orange-500/30 text-orange-300 font-mono text-[11px] flex items-center gap-1"
+                    title={scrollStats.scrollNote || undefined}
+                  >
+                    <Layers className="w-3 h-3" />
+                    {scrollStats.scrollEngine === 'chromium_browser'
+                      ? `Chrome Scrolled ${scrollStats.scrollStepsCompleted || 0}x${
+                          scrollStats.loadMoreClicks ? ` · ${scrollStats.loadMoreClicks} Load More` : ''
+                        }${scrollStats.xhrResponsesCaptured ? ` · ${scrollStats.xhrResponsesCaptured} XHR` : ''}`
+                      : `Crawled ${scrollStats.pagesVisited || 1} Page(s)`}
+                  </span>
+                )}
+                {scrollStats?.scrollNote && scrollStats.scrollEngine !== 'chromium_browser' && (
+                  <span className="px-2 py-0.5 rounded bg-slate-800/80 border border-slate-700 text-slate-400 text-[10px]">
+                    {scrollStats.scrollNote}
+                  </span>
+                )}
+                {(scrollStats?.skippedLongUrlCount ?? 0) > 0 && (
+                  <span className="px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 font-mono text-[11px]">
+                    Skipped {scrollStats?.skippedLongUrlCount} Long URL{scrollStats?.skippedLongUrlCount === 1 ? '' : 's'} (&gt;{scrollStats?.maxUrlLength || maxUrlLength} chars)
+                  </span>
+                )}
                 {pageTitle && (
                   <span className="text-xs text-slate-400 truncate max-w-md font-mono">
                     ({pageTitle})
@@ -789,6 +961,23 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
 
             {/* Bulk Actions */}
             <div className="flex flex-wrap items-center gap-2">
+              {autoScroll && scrollCount < 40 && (
+                <button
+                  type="button"
+                  disabled={isLoading}
+                  onClick={() => {
+                    const nextScrolls = Math.min(40, scrollCount + 10);
+                    setScrollCount(nextScrolls);
+                    handleExtractLinks(undefined, nextScrolls);
+                  }}
+                  className="px-3 py-1.5 bg-orange-500/15 hover:bg-orange-500/25 border border-orange-500/30 text-orange-300 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                  title="Re-scroll deeper (+10 scroll steps) to harvest even more links"
+                >
+                  <Layers className="w-3.5 h-3.5" />
+                  <span>Scroll Deeper ({Math.min(40, scrollCount + 10)}x)</span>
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={() => handleCopyUrls(selectedUrls.size > 0)}

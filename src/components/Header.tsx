@@ -41,6 +41,7 @@ interface HeaderProps {
   setActiveTab: (tab: AppTabType) => void;
   webProcessorBatchStatus?: {
     isRunning: boolean;
+    isPaused?: boolean;
     completedCount: number;
     totalCount: number;
     activeWorkers: number;
@@ -146,8 +147,16 @@ export const Header: React.FC<HeaderProps> = ({
               >
                 <Icon className={`w-3.5 h-3.5 ${isActive ? 'text-white' : 'text-slate-400'}`} />
                 <span>{item.label}</span>
-                {item.id === 'webprocessor' && webProcessorBatchStatus?.isRunning && (
-                  <span className="ml-0.5 px-1.5 py-0.2 rounded-full bg-cyan-400 text-slate-950 font-extrabold text-[9px] animate-pulse">
+                {item.id === 'webprocessor' && webProcessorBatchStatus && webProcessorBatchStatus.totalCount > 0 && (
+                  <span
+                    className={`ml-0.5 px-1.5 py-0.2 rounded-full font-extrabold text-[9px] ${
+                      webProcessorBatchStatus.isRunning
+                        ? 'bg-cyan-400 text-slate-950 animate-pulse'
+                        : webProcessorBatchStatus.isPaused
+                        ? 'bg-amber-400 text-slate-950'
+                        : 'bg-emerald-400 text-slate-950'
+                    }`}
+                  >
                     {webProcessorBatchStatus.completedCount}/{webProcessorBatchStatus.totalCount}
                   </span>
                 )}

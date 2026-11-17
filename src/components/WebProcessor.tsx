@@ -45,6 +45,7 @@ import {
   Square,
   ArrowUpRight,
   Settings2,
+  Radio,
 } from 'lucide-react';
 import { AppTabType } from './Header';
 import { getR2Headers } from '../utils/r2Service';
@@ -182,7 +183,16 @@ export interface BatchQueueItem {
   url: string;
   index: number;
   workerId?: number;
-  status: 'pending' | 'checking_registry' | 'skipped_in_cloudflare' | 'scraping' | 'uploading_cloudflare' | 'completed' | 'error';
+  status:
+    | 'pending'
+    | 'checking_registry'
+    | 'skipped_in_cloudflare'
+    | 'scraping'
+    | 'downloading_video'
+    | 'compressing_video'
+    | 'uploading_cloudflare'
+    | 'completed'
+    | 'error';
   statusMessage?: string;
   error?: string;
   title?: string;
@@ -469,6 +479,34 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
     d1DocId: string;
     source: string;
   } | null>(null);
+  const [cloudKeepAliveActive, setCloudKeepAliveActive] = useState<boolean>(false);
+  const [cloudKeepAliveMode, setCloudKeepAliveMode] = useState<'active' | 'iap_blocked' | 'no_public_url' | 'idle'>('idle');
+  const [uptimeTestStatus, setUptimeTestStatus] = useState<string | null>(null);
+  const [isTestingUptime, setIsTestingUptime] = useState(false);
+  const uptimePingUrl = useMemo(() => {
+    if (typeof window !== 'undefined' && window.location?.origin) {
+      return `${window.location.origin}/api/uptime`;
+    }
+    return '/api/uptime';
+  }, []);
+  const isStudioPreviewHost =
+    typeof window !== 'undefined' && /^(ais-dev|ais-pre)-/i.test(window.location.hostname || '');
+  const handleTestUptimePing = async () => {
+    setIsTestingUptime(true);
+    try {
+      const res = await fetch('/api/uptime');
+      const data = await res.json();
+      if (res.ok && data?.ok) {
+        setUptimeTestStatus(`200 UP · ${data.queueState || 'idle'}`);
+      } else {
+        setUptimeTestStatus(`HTTP ${res.status}`);
+      }
+    } catch (err: any) {
+      setUptimeTestStatus(err?.message || 'Error');
+    } finally {
+      setIsTestingUptime(false);
+    }
+  };
   const [singleRegistryRecord, setSingleRegistryRecord] = useState<any | null>(null);
   const [editingRegistryRecord, setEditingRegistryRecord] = useState<any | null>(null);
   const pauseRef = useRef(false);
@@ -573,22 +611,32 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
     if (Array.isArray(job.serverPool) && job.serverPool.length > 0 && !serverPoolText.trim()) {
       setServerPoolText(job.serverPool.join('\n'));
     }
-    if (switchToBatchIfRunning && job.isRunning) {
+    if (
+      switchToBatchIfRunning &&
+      (job.isRunning || (Array.isArray(job.queues) && job.queues.length > 0) || (Array.isArray(job.tasks) && job.tasks.length > 0))
+    ) {
       setInputMode('batch');
     }
   };
 
-  // Restore saved/running server background job on mount & poll while running
+  // Restore saved/running server background job on mount, poll actively while running,
+  // refresh gently when idle, and sync immediately when browser tab regains focus/visibility.
   useEffect(() => {
     let cancelled = false;
     const loadStatus = async (initial = false) => {
       try {
-        const res = await fetch('/api/vps-batch/status');
+        const res = await fetch('/api/vps-batch/status', {
+          headers: { ...getR2Headers() },
+        });
         if (!res.ok) return;
         const data = await res.json();
         if (cancelled) return;
         if (data?.vpsScope) {
           setVpsScopeInfo(data.vpsScope);
+        }
+        setCloudKeepAliveActive(Boolean(data?.cloudKeepAliveActive));
+        if (data?.cloudKeepAliveMode) {
+          setCloudKeepAliveMode(data.cloudKeepAliveMode);
         }
         if (data?.job && ((Array.isArray(data.job.queues) && data.job.queues.length > 0) || (Array.isArray(data.job.tasks) && data.job.tasks.length > 0))) {
           applyServerBatchJob(data.job, initial);
@@ -597,15 +645,35 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
         }
       } catch {}
     };
+
     loadStatus(true);
+
+    const intervalMs = isBatchRunning ? 2000 : 10000;
     const interval = setInterval(() => {
-      if (isBatchRunning) {
+      loadStatus(false);
+    }, intervalMs);
+
+    const handleVisibilityOrFocus = () => {
+      if (typeof document === 'undefined' || document.visibilityState === 'visible') {
         loadStatus(false);
       }
-    }, 2000);
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', handleVisibilityOrFocus);
+    }
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', handleVisibilityOrFocus);
+    }
+
     return () => {
       cancelled = true;
       clearInterval(interval);
+      if (typeof document !== 'undefined') {
+        document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
+      }
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('focus', handleVisibilityOrFocus);
+      }
     };
   }, [isBatchRunning]);
 
@@ -2274,6 +2342,72 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
               </p>
             </div>
 
+            {/* External UptimeRobot Keep-Alive URL (Double Protection) */}
+            <div className="p-3 bg-slate-950/90 border border-emerald-500/30 rounded-xl space-y-2 text-xs">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Radio className="w-4 h-4 text-emerald-400" />
+                  <span className="font-bold text-slate-200">
+                    Double Keep-Alive URL (For UptimeRobot HTTP Monitor)
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 font-mono text-[10px]">
+                    GET · HTTP 200
+                  </span>
+                  {uptimeTestStatus && (
+                    <span className="px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono text-[10px]">
+                      {uptimeTestStatus}
+                    </span>
+                  )}
+                </div>
+                <span className="text-[11px] text-slate-400">
+                  Every ping wakes &amp; auto-resumes queues
+                </span>
+              </div>
+
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                <input
+                  type="text"
+                  readOnly
+                  value={uptimePingUrl}
+                  onClick={(e) => (e.target as HTMLInputElement).select()}
+                  className="flex-1 px-3 py-2 bg-slate-900 border border-slate-700/80 rounded-lg font-mono text-xs text-emerald-300 select-all outline-none focus:border-emerald-500"
+                />
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => copyToClipboard(uptimePingUrl, 'uptimerobot_url')}
+                    className="px-3.5 py-2 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 rounded-lg font-bold text-xs flex items-center gap-1.5 transition-colors"
+                  >
+                    {copiedKey === 'uptimerobot_url' ? (
+                      <Check className="w-3.5 h-3.5" />
+                    ) : (
+                      <Copy className="w-3.5 h-3.5" />
+                    )}
+                    <span>{copiedKey === 'uptimerobot_url' ? 'Copied URL' : 'Copy Uptime URL'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleTestUptimePing}
+                    disabled={isTestingUptime}
+                    className="px-3 py-2 bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 rounded-lg font-semibold text-xs flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isTestingUptime ? 'animate-spin' : ''}`} />
+                    <span>Test Ping</span>
+                  </button>
+                </div>
+              </div>
+
+              {isStudioPreviewHost ? (
+                <p className="text-[11px] text-amber-300/90 leading-snug">
+                  Note: AI Studio editor previews (<code className="font-mono">ais-dev-*</code>) require Google login. Open your deployed public <code className="font-mono">*.run.app</code> site and copy this URL from there to paste into UptimeRobot.
+                </p>
+              ) : (
+                <p className="text-[11px] text-slate-400 leading-snug">
+                  Paste this URL into <strong>UptimeRobot → Add New Monitor → HTTP(s)</strong> (5 min interval). Together with internal Cloud Keep-Alive, your container stays awake and auto-resumes paused/evicted queues.
+                </p>
+              )}
+            </div>
+
             {/* Cloudflare Deduplication & Multi-Option Skip Selector */}
             <div className="p-3 bg-slate-950/90 border border-slate-800 rounded-xl space-y-2.5 text-xs">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
@@ -2717,6 +2851,27 @@ export default {
                       title={`Queue State Key: ${vpsScopeInfo.d1DocId} (isolated to this VPS) · Shared D1 Link Registry active`}
                     >
                       VPS Queue: {vpsScopeInfo.scopeLabel} · Shared D1 Dedup ON
+                    </span>
+                  )}
+                  {isBatchRunning && cloudKeepAliveMode === 'active' && (
+                    <span
+                      className="px-2 py-0.5 rounded-md bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono text-[10px] font-bold"
+                      title="Active rolling 45s ingress stream holds free Cloud Run CPU allocated continuously even after closing Chrome"
+                    >
+                      Cloud Keep-Alive ON
+                    </span>
+                  )}
+                  {isBatchRunning && cloudKeepAliveMode === 'iap_blocked' && (
+                    <span
+                      className="px-2 py-0.5 rounded-md bg-amber-500/15 text-amber-300 border border-amber-500/30 font-mono text-[10px] font-bold"
+                      title="AI Studio Dev Preview sits behind Google login. For background running after closing Chrome, run the queue on your public deployed URL (*.run.app)"
+                    >
+                      Preview Auth (Keep Tab Open or Use Deployed URL)
+                    </span>
+                  )}
+                  {cloudKeepAliveActive && cloudKeepAliveMode !== 'active' && cloudKeepAliveMode !== 'iap_blocked' && isBatchRunning && (
+                    <span className="px-2 py-0.5 rounded-md bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono text-[10px] font-bold">
+                      Cloud Keep-Alive ON
                     </span>
                   )}
                   {Boolean(serverJobPass?.activeCompressions || serverJobPass?.pausedForLoadCount) && (
@@ -3224,8 +3379,42 @@ export default {
               const isErr = item.status === 'error';
               const isWorking =
                 item.status === 'scraping' ||
+                item.status === 'downloading_video' ||
+                item.status === 'compressing_video' ||
                 item.status === 'uploading_cloudflare' ||
                 item.status === 'checking_registry';
+
+              const stageBadge = (() => {
+                switch (item.status) {
+                  case 'checking_registry':
+                    return {
+                      label: 'Checking D1',
+                      cls: 'bg-slate-500/20 text-slate-200 border-slate-400/30',
+                    };
+                  case 'scraping':
+                    return {
+                      label: 'Scraping Web',
+                      cls: 'bg-indigo-500/20 text-indigo-300 border-indigo-400/40',
+                    };
+                  case 'downloading_video':
+                    return {
+                      label: 'Downloading Video',
+                      cls: 'bg-sky-500/20 text-sky-300 border-sky-400/40',
+                    };
+                  case 'compressing_video':
+                    return {
+                      label: 'Compressing',
+                      cls: 'bg-amber-500/20 text-amber-300 border-amber-400/40',
+                    };
+                  case 'uploading_cloudflare':
+                    return {
+                      label: 'Uploading R2',
+                      cls: 'bg-emerald-500/20 text-emerald-300 border-emerald-400/40',
+                    };
+                  default:
+                    return null;
+                }
+              })();
 
               return (
                 <div
@@ -3276,11 +3465,16 @@ export default {
                             </span>
                           )}
 
-                          {/* Status Badge */}
-                          {isWorking && (
-                            <span className="px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 font-bold text-[10px] animate-pulse flex items-center gap-1 border border-cyan-500/30">
+                          {/* Active Stage Pill + Live Step Message */}
+                          {isWorking && stageBadge && (
+                            <span className={`px-2 py-0.5 rounded-full font-bold text-[10px] flex items-center gap-1 border ${stageBadge.cls}`}>
                               <RefreshCw className="w-2.5 h-2.5 animate-spin" />
-                              <span>{item.statusMessage}</span>
+                              <span>{stageBadge.label}</span>
+                            </span>
+                          )}
+                          {isWorking && item.statusMessage && (
+                            <span className="px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 font-semibold text-[10px] border border-cyan-500/30">
+                              {item.statusMessage}
                             </span>
                           )}
 
