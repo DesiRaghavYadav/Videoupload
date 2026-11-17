@@ -186,6 +186,7 @@ export interface BatchQueueItem {
   status:
     | 'pending'
     | 'checking_registry'
+    | 'waiting_d1'
     | 'skipped_in_cloudflare'
     | 'scraping'
     | 'downloading_video'
@@ -3377,12 +3378,14 @@ export default {
               const isCurrent = activeBatchIndex === idx;
               const isDone = item.status === 'completed';
               const isErr = item.status === 'error';
+              const isWaitingD1 = item.status === 'waiting_d1';
               const isWorking =
                 item.status === 'scraping' ||
                 item.status === 'downloading_video' ||
                 item.status === 'compressing_video' ||
                 item.status === 'uploading_cloudflare' ||
-                item.status === 'checking_registry';
+                item.status === 'checking_registry' ||
+                isWaitingD1;
 
               const stageBadge = (() => {
                 switch (item.status) {
@@ -3390,6 +3393,11 @@ export default {
                     return {
                       label: 'Checking D1',
                       cls: 'bg-slate-500/20 text-slate-200 border-slate-400/30',
+                    };
+                  case 'waiting_d1':
+                    return {
+                      label: 'Waiting D1 Reuse',
+                      cls: 'bg-amber-500/20 text-amber-300 border-amber-400/40',
                     };
                   case 'scraping':
                     return {
@@ -3420,7 +3428,9 @@ export default {
                 <div
                   key={item.id}
                   className={`p-4 rounded-xl border text-xs transition-all ${
-                    isWorking || isCurrent
+                    isWaitingD1
+                      ? 'bg-amber-500/10 border-amber-500/35 ring-1 ring-amber-500/20'
+                      : isWorking || isCurrent
                       ? 'bg-cyan-500/10 border-cyan-500/40 ring-1 ring-cyan-500/30'
                       : isDone
                       ? 'bg-slate-950/80 border-slate-800 hover:border-slate-700'
