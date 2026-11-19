@@ -16,6 +16,7 @@ import {
   Zap,
   Globe,
   Link2,
+  Radar,
 } from 'lucide-react';
 import { R2StatusResponse } from '../types';
 
@@ -23,6 +24,7 @@ export type AppTabType =
   | 'dashboard'
   | 'webprocessor'
   | 'linkextractor'
+  | 'domainprobe'
   | 'batchvideo'
   | 'reels'
   | 'comics'
@@ -62,6 +64,7 @@ export const Header: React.FC<HeaderProps> = ({
     { id: 'dashboard', label: 'Dashboard & Stats', icon: LayoutDashboard },
     { id: 'webprocessor', label: 'Web Processor', icon: Globe },
     { id: 'linkextractor', label: 'URL Extractor', icon: Link2 },
+    { id: 'domainprobe', label: 'Domain Prober', icon: Radar },
     { id: 'batchvideo', label: 'Batch Videos', icon: Film },
     { id: 'database', label: 'App Database (JSON)', icon: Database },
     { id: 'reels', label: 'Short Reels', icon: PlaySquare },

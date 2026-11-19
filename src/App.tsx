@@ -16,6 +16,7 @@ import { ChannelsAdmin } from './components/admin/ChannelsAdmin';
 import { VideoCategoriesAdmin } from './components/admin/VideoCategoriesAdmin';
 import { WebProcessor } from './components/WebProcessor';
 import { PageLinkExtractor } from './components/PageLinkExtractor';
+import { DomainVideoProbe } from './components/DomainVideoProbe';
 import { VpsResourceBar } from './components/VpsResourceBar';
 import {
   R2StatusResponse,
@@ -35,6 +36,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<AppTabType>('dashboard');
   const hasUserSwitchedTabRef = React.useRef(false);
   const hasAutoRestoredQueueViewRef = React.useRef(false);
+  const appendNonceRef = React.useRef<number>(0);
   const [r2Status, setR2Status] = useState<R2StatusResponse | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
@@ -42,6 +44,15 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [forwardedMediaData, setForwardedMediaData] = useState<any>(null);
   const [forwardedBatchVideos, setForwardedBatchVideos] = useState<any[] | null>(null);
+  const [multiExtractorAppendPayload, setMultiExtractorAppendPayload] = useState<{
+    nonce: number;
+    urls: string[];
+  } | null>(null);
+  const [domainProbeAppendPayload, setDomainProbeAppendPayload] = useState<{
+    nonce: number;
+    urls: string[];
+  } | null>(null);
+  const [multiExtractorDraftCount, setMultiExtractorDraftCount] = useState<number>(0);
   const [webProcessorBatchStatus, setWebProcessorBatchStatus] = useState<{
     isRunning: boolean;
     isPaused: boolean;
@@ -211,6 +222,28 @@ export default function App() {
     setActiveTab(tab);
   }, []);
 
+  const handleSendLinksToMultiExtractor = useCallback((urls: string[], openTab = true) => {
+    const clean = urls.map((u) => String(u || '').trim()).filter(Boolean);
+    if (clean.length === 0) return;
+    appendNonceRef.current += 1;
+    setMultiExtractorAppendPayload({ nonce: appendNonceRef.current, urls: clean });
+    if (openTab) {
+      hasUserSwitchedTabRef.current = true;
+      setActiveTab('webprocessor');
+    }
+  }, []);
+
+  const handleSendLinksToDomainProber = useCallback((urls: string[], openTab = true) => {
+    const clean = urls.map((u) => String(u || '').trim()).filter(Boolean);
+    if (clean.length === 0) return;
+    appendNonceRef.current += 1;
+    setDomainProbeAppendPayload({ nonce: appendNonceRef.current, urls: clean });
+    if (openTab) {
+      hasUserSwitchedTabRef.current = true;
+      setActiveTab('domainprobe');
+    }
+  }, []);
+
   const handleBatchProgressUpdate = useCallback((batchStatus: any) => {
     if (
       batchStatus?.isRunning &&
@@ -275,6 +308,8 @@ export default function App() {
           <WebProcessor
             externalConcurrency={vpsConcurrency}
             onConcurrencyChange={setVpsConcurrency}
+            incomingBatchAppend={multiExtractorAppendPayload}
+            onBatchDraftCountChange={setMultiExtractorDraftCount}
             onNavigateTab={(t, initialData) => {
               if (Array.isArray(initialData)) {
                 setForwardedBatchVideos(initialData);
@@ -292,7 +327,17 @@ export default function App() {
         {/* TAB 0.8: DEDICATED WEBPAGE URL & LINK EXTRACTOR (KEPT MOUNTED IN BACKGROUND) */}
         <div className={activeTab === 'linkextractor' ? 'block' : 'hidden'}>
           <PageLinkExtractor
+            multiExtractorLinkCount={multiExtractorDraftCount}
+            onAddToMultiExtractor={handleSendLinksToMultiExtractor}
+            onAddToDomainProber={handleSendLinksToDomainProber}
             onNavigateTab={(t, initialData) => {
+              if (t === 'webprocessor' && Array.isArray(initialData)) {
+                const extracted = initialData
+                  .map((item: any) => String(item?.videoUrl || item?.reelsUrl || item?.url || '').trim())
+                  .filter(Boolean);
+                handleSendLinksToMultiExtractor(extracted, true);
+                return;
+              }
               if (Array.isArray(initialData)) {
                 setForwardedBatchVideos(initialData);
                 setForwardedMediaData(null);
@@ -302,6 +347,14 @@ export default function App() {
               }
               setActiveTab(t);
             }}
+          />
+        </div>
+
+        {/* TAB 0.9: DOMAIN VIDEO AVAILABILITY PROBER (KEPT MOUNTED IN BACKGROUND) */}
+        <div className={activeTab === 'domainprobe' ? 'block' : 'hidden'}>
+          <DomainVideoProbe
+            incomingAppendUrls={domainProbeAppendPayload}
+            onSendToMultiExtractor={handleSendLinksToMultiExtractor}
           />
         </div>
 

@@ -18,6 +18,7 @@ import axios from 'axios';
 import * as cheerio from 'cheerio';
 import ffmpegStatic from 'ffmpeg-static';
 import { chromium } from 'playwright-core';
+import { registerDomainProbeRoutes } from './domainProbeService.ts';
 
 const execFileAsync = promisify(execFile);
 import {
@@ -5507,6 +5508,7 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
       scrollEngine: requestedScrollEngine = 'auto',
       skipLongUrls = true,
       maxUrlLength = 250,
+      singlePageOnly = false,
     } = req.body;
 
     if (!url || typeof url !== 'string') {
@@ -5804,9 +5806,13 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
     if (activeScrollEngine !== 'chromium_browser' || linksMap.size === 0) {
       const visitedPages = new Set<string>();
       const pageQueue: string[] = [url];
-      const maxPagesToCrawl = effectiveScrollCount > 0 ? Math.min(25, effectiveScrollCount + 1) : 1;
+      const maxPagesToCrawl = singlePageOnly
+        ? 1
+        : effectiveScrollCount > 0
+        ? Math.min(25, effectiveScrollCount + 1)
+        : 1;
 
-      if (effectiveScrollCount > 0 && requestedScrollEngine !== 'browser') {
+      if (!singlePageOnly && effectiveScrollCount > 0 && requestedScrollEngine !== 'browser') {
         activeScrollEngine = 'http_pagination';
       } else {
         activeScrollEngine = 'single_fetch';
@@ -5853,7 +5859,7 @@ app.post('/api/extract-page-links', async (req: Request, res: Response) => {
         const harvested = harvestHtmlAndRawText(response.data, currentFinalUrl);
         if (!resolvedPageTitle && harvested.title) resolvedPageTitle = harvested.title;
 
-        if (effectiveScrollCount > 0) {
+        if (!singlePageOnly && effectiveScrollCount > 0) {
           scrollStepsCompleted = pagesVisited;
           if (harvested.newlyAdded === 0 && pagesVisited > 1) {
             consecutiveEmptyPages++;
@@ -9518,6 +9524,15 @@ app.post('/api/proxies/fetch-free', async (req: Request, res: Response) => {
       error: formatCompactError(err),
     });
   }
+});
+
+// Register Domain Video Availability Prober routes (up to 50 workers, zero video download, persistent JSON)
+registerDomainProbeRoutes(app, {
+  localRegistryDir,
+  cfWorkerBaseUrl: CF_WORKER_BASE_URL,
+  isPreviewVideoUrl,
+  axiosGetWithRetry,
+  resolveChromiumExecutable,
 });
 
 // Ensure /api routes NEVER fall through to Vite SPA html middleware

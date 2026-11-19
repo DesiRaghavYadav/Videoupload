@@ -65,6 +65,8 @@ export interface WebProcessorProps {
   onBatchProgressUpdate?: (progress: WebProcessorBatchProgress) => void;
   externalConcurrency?: number;
   onConcurrencyChange?: (concurrency: number) => void;
+  incomingBatchAppend?: { nonce: number; urls: string[] } | null;
+  onBatchDraftCountChange?: (count: number) => void;
 }
 
 export interface CandidateTitle {
@@ -343,6 +345,8 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
   onBatchProgressUpdate,
   externalConcurrency,
   onConcurrencyChange,
+  incomingBatchAppend,
+  onBatchDraftCountChange,
 }) => {
   // Mode: 'single' | 'batch'
   const [inputMode, setInputMode] = useState<'single' | 'batch'>('single');
@@ -391,6 +395,12 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
 
   // Multi-Link Multi-Queue State & VPS Multi-Worker Concurrency (1 - 50)
   const [batchRawText, setBatchRawText] = useState('');
+  const lastHandledAppendNonceRef = useRef<number>(0);
+  const [appendedNotice, setAppendedNotice] = useState<{
+    addedCount: number;
+    skippedDuplicates: number;
+    totalCount: number;
+  } | null>(null);
   const [draftQueueName, setDraftQueueName] = useState('');
   const [batchQueue, setBatchQueue] = useState<BatchQueueItem[]>([]);
   const [queues, setQueues] = useState<BatchQueueGroup[]>([]);
@@ -751,6 +761,44 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
   const detectedLinksInBatch = useMemo(() => {
     return extractUrlsFromText(batchRawText);
   }, [batchRawText]);
+
+  useEffect(() => {
+    onBatchDraftCountChange?.(detectedLinksInBatch.length);
+  }, [detectedLinksInBatch.length, onBatchDraftCountChange]);
+
+  // Append links forwarded from Dedicated Link Extractor (preserving any existing links)
+  useEffect(() => {
+    if (!incomingBatchAppend || incomingBatchAppend.nonce === lastHandledAppendNonceRef.current) return;
+    lastHandledAppendNonceRef.current = incomingBatchAppend.nonce;
+
+    const cleanIncoming = Array.from(
+      new Set(
+        (incomingBatchAppend.urls || [])
+          .map((u) => String(u || '').trim())
+          .filter((u) => /^https?:\/\//i.test(u))
+      )
+    );
+    if (cleanIncoming.length === 0) return;
+
+    setInputMode('batch');
+    setBatchRawText((prev) => {
+      const existingUrls = extractUrlsFromText(prev);
+      const existingSet = new Set(existingUrls.map((u) => u.trim()));
+      const newUnique = cleanIncoming.filter((u) => !existingSet.has(u));
+      const trimmedPrev = prev.trim();
+
+      setAppendedNotice({
+        addedCount: newUnique.length,
+        skippedDuplicates: incomingBatchAppend.urls.length - newUnique.length,
+        totalCount: existingUrls.length + newUnique.length,
+      });
+
+      if (newUnique.length === 0) {
+        return prev;
+      }
+      return trimmedPrev ? `${trimmedPrev}\n${newUnique.join('\n')}` : newUnique.join('\n');
+    });
+  }, [incomingBatchAppend]);
 
   // Also check if single URL input contains multiple links
   const detectedMultipleInSingle = useMemo(() => {
@@ -2154,6 +2202,40 @@ export const WebProcessor: React.FC<WebProcessorProps> = ({
                   )}
                 </div>
               </div>
+
+              {appendedNotice && (
+                <div className="p-2.5 bg-emerald-500/10 border border-emerald-500/30 rounded-xl flex items-center justify-between gap-2 text-xs text-emerald-300 animate-fadeIn">
+                  <div className="flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                    <span>
+                      {appendedNotice.addedCount > 0 ? (
+                        <>
+                          Appended <strong>+{appendedNotice.addedCount}</strong> new link
+                          {appendedNotice.addedCount === 1 ? '' : 's'} into Multi-Extractor
+                          {appendedNotice.skippedDuplicates > 0
+                            ? ` (${appendedNotice.skippedDuplicates} duplicate${appendedNotice.skippedDuplicates === 1 ? '' : 's'} skipped)`
+                            : ''}{' '}
+                          · <strong>{appendedNotice.totalCount}</strong> total ready below.
+                        </>
+                      ) : (
+                        <>
+                          All {appendedNotice.skippedDuplicates} selected link
+                          {appendedNotice.skippedDuplicates === 1 ? ' is' : 's are'} already in Multi-Extractor (
+                          <strong>{appendedNotice.totalCount}</strong> total ready below).
+                        </>
+                      )}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setAppendedNotice(null)}
+                    className="text-emerald-400/80 hover:text-emerald-200 px-1"
+                    title="Dismiss notice"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
 
               <textarea
                 value={batchRawText}

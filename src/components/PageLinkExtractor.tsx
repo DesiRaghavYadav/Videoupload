@@ -30,11 +30,18 @@ import {
   Plus,
   FileText,
   Code,
+  Square as StopSquare,
+  ListOrdered,
+  Ban,
+  Radar,
 } from 'lucide-react';
 import { AppTabType } from './Header';
 
 interface PageLinkExtractorProps {
   onNavigateTab: (tab: AppTabType, initialData?: any) => void;
+  onAddToMultiExtractor?: (urls: string[], openTab?: boolean) => void;
+  onAddToDomainProber?: (urls: string[], openTab?: boolean) => void;
+  multiExtractorLinkCount?: number;
 }
 
 export interface ExtractedPageLink {
@@ -56,9 +63,15 @@ export interface ExtractedPageLink {
   } | null;
 }
 
-export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigateTab }) => {
+export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({
+  onNavigateTab,
+  onAddToMultiExtractor,
+  onAddToDomainProber,
+  multiExtractorLinkCount = 0,
+}) => {
   const [sourceUrl, setSourceUrl] = useState('');
   const [filterKeywords, setFilterKeywords] = useState('');
+  const [excludeKeywords, setExcludeKeywords] = useState('');
   const [sameDomainOnly, setSameDomainOnly] = useState(false);
   const [webpagesOnly, setWebpagesOnly] = useState(true);
   const [urlFormat, setUrlFormat] = useState('');
@@ -69,8 +82,33 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
   const [scrollEngine, setScrollEngine] = useState<'auto' | 'browser' | 'http'>('auto');
   const [skipLongUrls, setSkipLongUrls] = useState(true);
   const [maxUrlLength, setMaxUrlLength] = useState<number>(250);
+
+  // Paginated Start -> End Sequence (/1, /2 ... /N) & Append Mode
+  const [enablePageRange, setEnablePageRange] = useState(false);
+  const [startPage, setStartPage] = useState<number>(1);
+  const [endPage, setEndPage] = useState<number>(5);
+  const [pageUrlPattern, setPageUrlPattern] = useState<
+    'slash' | 'slash_trailing' | 'page_slash' | 'query_page' | 'replace_last_num'
+  >('slash');
+  const [appendToExistingResults, setAppendToExistingResults] = useState(false);
+
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [multiAppendToast, setMultiAppendToast] = useState<string | null>(null);
+
+  const stopPaginationRef = React.useRef(false);
+  const activeAbortControllerRef = React.useRef<AbortController | null>(null);
+  const [paginationProgress, setPaginationProgress] = useState<{
+    active: boolean;
+    currentIndex: number;
+    totalPages: number;
+    currentPageNumber: number;
+    currentPageUrl: string;
+    completedPages: number;
+    failedPages: Array<{ page: number; url: string; error: string }>;
+    totalLinksCollected: number;
+    stoppedEarly: boolean;
+  } | null>(null);
 
   // Extracted response data
   const [pageTitle, setPageTitle] = useState('');
@@ -186,6 +224,86 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
     { label: 'Sample Video Bucket', url: 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4' },
   ];
 
+  // Build paginated URL for a given page number
+  const buildPaginatedPageUrl = (
+    rawBase: string,
+    pageNum: number,
+    pattern: 'slash' | 'slash_trailing' | 'page_slash' | 'query_page' | 'replace_last_num'
+  ): string => {
+    let base = rawBase.trim();
+    if (!base) return '';
+    if (!/^https?:\/\//i.test(base)) base = `https://${base}`;
+    if (/\{page\}/i.test(base)) {
+      return base.replace(/\{page\}/gi, String(pageNum));
+    }
+    if (pattern === 'query_page') {
+      if (/([?&]page=)\d*/i.test(base)) {
+        return base.replace(/([?&]page=)\d*/i, `$1${pageNum}`);
+      }
+      return `${base}${base.includes('?') ? '&' : '?'}page=${pageNum}`;
+    }
+    if (pattern === 'replace_last_num') {
+      if (/(\d+)(\/?(?:\?.*)?)$/.test(base)) {
+        return base.replace(/(\d+)(\/?(?:\?.*)?)$/, `${pageNum}$2`);
+      }
+      return `${base.replace(/\/+$/, '')}/${pageNum}`;
+    }
+    if (pattern === 'page_slash') {
+      return `${base.replace(/\/+$/, '')}/page/${pageNum}`;
+    }
+    if (pattern === 'slash_trailing') {
+      return `${base.replace(/\/+$/, '')}/${pageNum}/`;
+    }
+    // Default 'slash': /1, /2 ... (or append directly if URL already ends with '=' like ?page=)
+    if (base.endsWith('=')) {
+      return `${base}${pageNum}`;
+    }
+    return `${base.replace(/\/+$/, '')}/${pageNum}`;
+  };
+
+  const paginatedPreview = useMemo(() => {
+    if (!enablePageRange || !sourceUrl.trim()) return null;
+    const safeStart = Math.max(0, Math.min(99999, Math.floor(Number(startPage) || 0)));
+    const safeEnd = Math.max(safeStart, Math.min(safeStart + 199, Math.floor(Number(endPage) || safeStart)));
+    return {
+      safeStart,
+      safeEnd,
+      count: safeEnd - safeStart + 1,
+      firstUrl: buildPaginatedPageUrl(sourceUrl, safeStart, pageUrlPattern),
+      lastUrl: buildPaginatedPageUrl(sourceUrl, safeEnd, pageUrlPattern),
+    };
+  }, [enablePageRange, sourceUrl, startPage, endPage, pageUrlPattern]);
+
+  const mergeExtractedLinks = (
+    targetMap: Map<string, ExtractedPageLink>,
+    incoming: ExtractedPageLink[]
+  ) => {
+    for (const item of incoming) {
+      const key = item.normalizedUrl || item.url;
+      const existing = targetMap.get(key);
+      if (!existing) {
+        targetMap.set(key, item);
+      } else if (
+        (!existing.text || existing.text === 'Discovered in text/script source') &&
+        item.text
+      ) {
+        targetMap.set(key, {
+          ...existing,
+          text: item.text,
+          cloudflareRecord: existing.cloudflareRecord || item.cloudflareRecord,
+          isRegisteredInCloudflare: existing.isRegisteredInCloudflare || item.isRegisteredInCloudflare,
+        });
+      }
+    }
+  };
+
+  const handleStopPagination = () => {
+    stopPaginationRef.current = true;
+    try {
+      activeAbortControllerRef.current?.abort();
+    } catch {}
+  };
+
   const handleExtractLinks = async (targetOverride?: string, scrollCountOverride?: number) => {
     const target = (targetOverride || sourceUrl).trim();
     if (!target) {
@@ -196,14 +314,160 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
     const effectiveScrolls = scrollCountOverride ?? scrollCount;
     setIsLoading(true);
     setErrorMsg(null);
-    if (scrollCountOverride === undefined) {
+    stopPaginationRef.current = false;
+    if (scrollCountOverride === undefined && !appendToExistingResults) {
       setSelectedUrls(new Set());
     }
+
+    const isSequentialRangeRun = Boolean(enablePageRange && !targetOverride);
+
+    if (isSequentialRangeRun) {
+      const safeStart = Math.max(0, Math.min(99999, Math.floor(Number(startPage) || 0)));
+      const safeEnd = Math.max(safeStart, Math.min(safeStart + 199, Math.floor(Number(endPage) || safeStart)));
+      const totalPages = safeEnd - safeStart + 1;
+
+      const mergedMap = new Map<string, ExtractedPageLink>();
+      if (appendToExistingResults && linksList.length > 0) {
+        mergeExtractedLinks(mergedMap, linksList);
+      } else {
+        setLinksList([]);
+      }
+
+      const failedPages: Array<{ page: number; url: string; error: string }> = [];
+      let completedPages = 0;
+      let totalSkippedLong = 0;
+      let firstTitle = appendToExistingResults ? pageTitle : '';
+
+      for (let idx = 0; idx < totalPages; idx++) {
+        if (stopPaginationRef.current) {
+          setPaginationProgress((prev) =>
+            prev ? { ...prev, active: false, stoppedEarly: true } : null
+          );
+          break;
+        }
+
+        const pageNum = safeStart + idx;
+        const pageUrl = buildPaginatedPageUrl(target, pageNum, pageUrlPattern);
+
+        setPaginationProgress({
+          active: true,
+          currentIndex: idx + 1,
+          totalPages,
+          currentPageNumber: pageNum,
+          currentPageUrl: pageUrl,
+          completedPages,
+          failedPages: [...failedPages],
+          totalLinksCollected: mergedMap.size,
+          stoppedEarly: false,
+        });
+
+        const controller = new AbortController();
+        activeAbortControllerRef.current = controller;
+
+        try {
+          const res = await fetch('/api/extract-page-links', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            signal: controller.signal,
+            body: JSON.stringify({
+              url: pageUrl,
+              filterKeywords: filterKeywords.trim(),
+              sameDomainOnly,
+              webpagesOnly,
+              urlFormat: urlFormat.trim(),
+              autoRegisterNew,
+              autoScroll,
+              scrollCount: effectiveScrolls,
+              clickLoadMore,
+              scrollEngine,
+              skipLongUrls,
+              maxUrlLength,
+              singlePageOnly: true,
+            }),
+          });
+
+          const data = await res.json();
+          if (!res.ok || !data.success) {
+            throw new Error(data.error || `HTTP ${res.status}`);
+          }
+
+          if (!firstTitle && data.pageTitle) {
+            firstTitle = data.pageTitle;
+            setPageTitle(data.pageTitle);
+          }
+          totalSkippedLong += Number(data.skippedLongUrlCount || 0);
+          mergeExtractedLinks(mergedMap, data.links || []);
+          completedPages++;
+
+          const combined = Array.from(mergedMap.values());
+          setLinksList(combined);
+          setScrollStats({
+            scrollUsed: true,
+            scrollEngine: 'page_sequence',
+            pagesVisited: completedPages,
+            scrollStepsCompleted: completedPages,
+            skippedLongUrlCount: totalSkippedLong,
+            maxUrlLength,
+            scrollNote: `Sequentially extracted ${completedPages}/${totalPages} pages (${safeStart} → ${safeEnd})`,
+          });
+
+          setPaginationProgress({
+            active: idx + 1 < totalPages && !stopPaginationRef.current,
+            currentIndex: idx + 1,
+            totalPages,
+            currentPageNumber: pageNum,
+            currentPageUrl: pageUrl,
+            completedPages,
+            failedPages: [...failedPages],
+            totalLinksCollected: combined.length,
+            stoppedEarly: stopPaginationRef.current,
+          });
+        } catch (err: any) {
+          if (err?.name === 'AbortError' || stopPaginationRef.current) {
+            setPaginationProgress((prev) =>
+              prev ? { ...prev, active: false, stoppedEarly: true } : null
+            );
+            break;
+          }
+          failedPages.push({
+            page: pageNum,
+            url: pageUrl,
+            error: err?.message || 'Failed to load page',
+          });
+          setPaginationProgress({
+            active: idx + 1 < totalPages,
+            currentIndex: idx + 1,
+            totalPages,
+            currentPageNumber: pageNum,
+            currentPageUrl: pageUrl,
+            completedPages,
+            failedPages: [...failedPages],
+            totalLinksCollected: mergedMap.size,
+            stoppedEarly: false,
+          });
+        } finally {
+          activeAbortControllerRef.current = null;
+        }
+      }
+
+      if (failedPages.length > 0 && completedPages === 0) {
+        setErrorMsg(
+          `Could not extract pages ${safeStart}–${safeEnd}: ${failedPages[0].error}`
+        );
+      }
+      setIsLoading(false);
+      return;
+    }
+
+    setPaginationProgress(null);
+    const controller = new AbortController();
+    activeAbortControllerRef.current = controller;
 
     try {
       const res = await fetch('/api/extract-page-links', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           url: target,
           filterKeywords: filterKeywords.trim(),
@@ -225,8 +489,17 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
         throw new Error(data.error || 'Failed to extract links from website');
       }
 
-      setPageTitle(data.pageTitle || '');
-      setLinksList(data.links || []);
+      if (appendToExistingResults && linksList.length > 0) {
+        const mergedMap = new Map<string, ExtractedPageLink>();
+        mergeExtractedLinks(mergedMap, linksList);
+        mergeExtractedLinks(mergedMap, data.links || []);
+        setLinksList(Array.from(mergedMap.values()));
+        if (!pageTitle && data.pageTitle) setPageTitle(data.pageTitle);
+      } else {
+        setPageTitle(data.pageTitle || '');
+        setLinksList(data.links || []);
+      }
+
       setScrollStats({
         scrollUsed: data.scrollUsed,
         scrollEngine: data.scrollEngine,
@@ -239,8 +512,11 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
         maxUrlLength: data.maxUrlLength,
       });
     } catch (err: any) {
-      setErrorMsg(err.message || 'Error communicating with link extraction server');
+      if (err?.name !== 'AbortError') {
+        setErrorMsg(err.message || 'Error communicating with link extraction server');
+      }
     } finally {
+      activeAbortControllerRef.current = null;
       setIsLoading(false);
     }
   };
@@ -339,13 +615,57 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
       result = result.filter((l) => !l.isRegisteredInCloudflare);
     }
 
+    // Include keywords filter (live refinement after extraction as well)
+    if (filterKeywords.trim()) {
+      const includeTerms = filterKeywords
+        .toLowerCase()
+        .split(/[,|\n]+/)
+        .map((t) => t.trim())
+        .filter(Boolean);
+      if (includeTerms.length > 0) {
+        result = result.filter((l) =>
+          includeTerms.some(
+            (term) => l.url.toLowerCase().includes(term) || l.text.toLowerCase().includes(term)
+          )
+        );
+      }
+    }
+
+    // Exclude keywords filter (post-extraction live removal of unwanted links)
+    if (excludeKeywords.trim()) {
+      const excludeTerms = excludeKeywords
+        .toLowerCase()
+        .split(/[,|\n]+/)
+        .map((t) => t.trim())
+        .filter(Boolean);
+      if (excludeTerms.length > 0) {
+        result = result.filter(
+          (l) =>
+            !excludeTerms.some(
+              (term) => l.url.toLowerCase().includes(term) || l.text.toLowerCase().includes(term)
+            )
+        );
+      }
+    }
+
     if (searchTerm.trim()) {
       const q = searchTerm.toLowerCase();
       result = result.filter((l) => l.url.toLowerCase().includes(q) || l.text.toLowerCase().includes(q));
     }
 
     return result;
-  }, [linksList, webpagesOnly, skipLongUrls, maxUrlLength, urlFormat, sourceUrl, activeTypeFilter, searchTerm]);
+  }, [
+    linksList,
+    webpagesOnly,
+    skipLongUrls,
+    maxUrlLength,
+    urlFormat,
+    sourceUrl,
+    activeTypeFilter,
+    filterKeywords,
+    excludeKeywords,
+    searchTerm,
+  ]);
 
   const copyToClipboard = (text: string, key: string) => {
     navigator.clipboard.writeText(text);
@@ -362,36 +682,71 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
     });
   };
 
+  const selectedFilteredUrls = useMemo(
+    () => filteredLinks.filter((l) => selectedUrls.has(l.url)).map((l) => l.url),
+    [filteredLinks, selectedUrls]
+  );
+
   const handleSelectAllFiltered = () => {
-    if (selectedUrls.size === filteredLinks.length && filteredLinks.length > 0) {
-      setSelectedUrls(new Set());
+    if (selectedFilteredUrls.length === filteredLinks.length && filteredLinks.length > 0) {
+      setSelectedUrls((prev) => {
+        const next = new Set(prev);
+        for (const l of filteredLinks) next.delete(l.url);
+        return next;
+      });
     } else {
-      setSelectedUrls(new Set(filteredLinks.map((l) => l.url)));
+      setSelectedUrls((prev) => {
+        const next = new Set(prev);
+        for (const l of filteredLinks) next.add(l.url);
+        return next;
+      });
     }
   };
 
   // Copy selected URLs or all filtered URLs
   const handleCopyUrls = (onlySelected: boolean) => {
     const urlsToCopy = onlySelected
-      ? Array.from(selectedUrls)
+      ? selectedFilteredUrls
       : filteredLinks.map((l) => l.url);
 
     if (urlsToCopy.length === 0) return;
     copyToClipboard(urlsToCopy.join('\n'), 'copy_bulk_urls');
   };
 
-  // Forward selected URLs to Web Processor Multi-Link Queue
-  const handleForwardToWebProcessor = (onlySelected: boolean) => {
+  // Add / Append filtered or selected URLs directly into Multi-Extractor (WebProcessor Multi-Link Queue)
+  const handleForwardToWebProcessor = (onlySelected: boolean, openTab = true) => {
     const urlsToSend = onlySelected
-      ? Array.from(selectedUrls)
+      ? selectedFilteredUrls
       : filteredLinks.map((l) => l.url);
 
     if (urlsToSend.length === 0) return;
-    onNavigateTab('webprocessor', urlsToSend.map((url) => ({
-      title: 'Extracted Link',
-      reelsUrl: url,
-      videoUrl: url,
-    })));
+
+    if (onAddToMultiExtractor) {
+      onAddToMultiExtractor(urlsToSend, openTab);
+      if (!openTab) {
+        setMultiAppendToast(
+          `Appended ${urlsToSend.length} link${urlsToSend.length === 1 ? '' : 's'} to Multi-Extractor!`
+        );
+        setTimeout(() => setMultiAppendToast(null), 3500);
+      }
+      return;
+    }
+
+    onNavigateTab(
+      'webprocessor',
+      urlsToSend.map((url) => ({
+        title: 'Extracted Link',
+        reelsUrl: url,
+        videoUrl: url,
+      }))
+    );
+  };
+
+  const handleSendToDomainProber = (onlySelected: boolean) => {
+    if (!onAddToDomainProber) return;
+    const urlsToSend = onlySelected ? selectedFilteredUrls : filteredLinks.map((l) => l.url);
+    if (urlsToSend.length === 0) return;
+    onAddToDomainProber(urlsToSend, true);
   };
 
   return (
@@ -461,24 +816,153 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
               />
             </div>
 
-            {/* Action Button */}
-            <button
-              type="submit"
-              disabled={isLoading || !sourceUrl.trim()}
-              className="px-6 py-3 bg-gradient-to-r from-orange-500 to-amber-600 hover:from-orange-400 hover:to-amber-500 text-white font-bold rounded-xl transition-all shadow-lg shadow-orange-500/20 disabled:opacity-50 flex items-center justify-center gap-2 text-xs sm:text-sm shrink-0"
-            >
-              {isLoading ? (
-                <>
-                  <RefreshCw className="w-4 h-4 animate-spin" />
-                  <span>{autoScroll ? `Scrolling (${scrollCount}x) & Harvesting...` : 'Harvesting Links...'}</span>
-                </>
-              ) : (
-                <>
-                  <span>Extract All Links</span>
-                  <ArrowRight className="w-4 h-4" />
-                </>
+            {/* Action Button(s) */}
+            {isLoading && enablePageRange ? (
+              <button
+                type="button"
+                onClick={handleStopPagination}
+                className="px-6 py-3 bg-rose-500/20 hover:bg-rose-500/30 border border-rose-500/40 text-rose-200 font-bold rounded-xl transition-all flex items-center justify-center gap-2 text-xs sm:text-sm shrink-0"
+              >
+                <StopSquare className="w-4 h-4 fill-current" />
+                <span>
+                  Stop ({paginationProgress?.completedPages || 0}/{paginationProgress?.totalPages || 0} Done)
+                </span>
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={isLoading || !sourceUrl.trim()}
+                className="px-6 py-3 bg-gradient-to-r from-orange-500 to-amber-600 hover:from-orange-400 hover:to-amber-500 text-white font-bold rounded-xl transition-all shadow-lg shadow-orange-500/20 disabled:opacity-50 flex items-center justify-center gap-2 text-xs sm:text-sm shrink-0"
+              >
+                {isLoading ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span>{autoScroll ? `Scrolling (${scrollCount}x) & Harvesting...` : 'Harvesting Links...'}</span>
+                  </>
+                ) : enablePageRange && paginatedPreview ? (
+                  <>
+                    <ListOrdered className="w-4 h-4" />
+                    <span>
+                      Extract Pages {paginatedPreview.safeStart}–{paginatedPreview.safeEnd} ({paginatedPreview.count})
+                    </span>
+                    <ArrowRight className="w-4 h-4" />
+                  </>
+                ) : (
+                  <>
+                    <span>Extract All Links</span>
+                    <ArrowRight className="w-4 h-4" />
+                  </>
+                )}
+              </button>
+            )}
+          </div>
+
+          {/* Multi-Page Sequence (/1, /2 ... Start to End) & Append Accumulation Bar */}
+          <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-xl space-y-2.5 text-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2.5">
+              <div className="flex flex-wrap items-center gap-2.5">
+                <label className="flex items-center gap-2 cursor-pointer font-bold select-none bg-violet-500/10 border border-violet-500/30 text-violet-300 px-3 py-1.5 rounded-xl transition-colors hover:bg-violet-500/20">
+                  <input
+                    type="checkbox"
+                    checked={enablePageRange}
+                    onChange={(e) => setEnablePageRange(e.target.checked)}
+                    className="rounded border-slate-700 text-violet-500 focus:ring-0 bg-slate-950"
+                  />
+                  <span className="flex items-center gap-1.5">
+                    <ListOrdered className="w-3.5 h-3.5 text-violet-400" />
+                    <span>Paginated Range (/1, /2 ... Start → End)</span>
+                  </span>
+                </label>
+
+                <label
+                  className="flex items-center gap-2 cursor-pointer font-semibold select-none bg-slate-900 border border-slate-800 text-slate-300 px-3 py-1.5 rounded-xl hover:border-slate-700 transition-colors"
+                  title="Keep previously extracted links and add new ones into the same list"
+                >
+                  <input
+                    type="checkbox"
+                    checked={appendToExistingResults}
+                    onChange={(e) => setAppendToExistingResults(e.target.checked)}
+                    className="rounded border-slate-700 text-emerald-500 focus:ring-0 bg-slate-950"
+                  />
+                  <span>Keep &amp; Append to Current Results</span>
+                </label>
+              </div>
+
+              {multiExtractorLinkCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => onNavigateTab('webprocessor')}
+                  className="px-3 py-1.5 rounded-xl bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/30 text-cyan-300 font-semibold text-xs flex items-center gap-1.5 transition-colors"
+                  title="Open Multi-Link Extractor queue box"
+                >
+                  <Globe className="w-3.5 h-3.5" />
+                  <span>Multi-Extractor Box: {multiExtractorLinkCount} link{multiExtractorLinkCount === 1 ? '' : 's'}</span>
+                  <ArrowRight className="w-3 h-3" />
+                </button>
               )}
-            </button>
+            </div>
+
+            {enablePageRange && (
+              <div className="p-2.5 bg-slate-900/70 border border-violet-500/20 rounded-lg space-y-2">
+                <div className="flex flex-wrap items-center gap-3">
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-slate-400 font-semibold">Start Page:</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={99999}
+                      value={startPage}
+                      onChange={(e) => setStartPage(Math.max(0, Number(e.target.value) || 0))}
+                      className="w-20 px-2.5 py-1 bg-slate-950 border border-slate-700 focus:border-violet-400 rounded-lg text-white font-mono text-xs outline-none"
+                    />
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-slate-400 font-semibold">End Page:</span>
+                    <input
+                      type="number"
+                      min={startPage}
+                      max={startPage + 199}
+                      value={endPage}
+                      onChange={(e) => setEndPage(Math.max(startPage, Number(e.target.value) || startPage))}
+                      className="w-20 px-2.5 py-1 bg-slate-950 border border-slate-700 focus:border-violet-400 rounded-lg text-white font-mono text-xs outline-none"
+                    />
+                  </div>
+
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-slate-400 font-semibold">Page URL Format:</span>
+                    <select
+                      value={pageUrlPattern}
+                      onChange={(e) => setPageUrlPattern(e.target.value as any)}
+                      className="px-2.5 py-1 bg-slate-950 border border-slate-700 focus:border-violet-400 rounded-lg text-slate-200 text-xs outline-none"
+                    >
+                      <option value="slash">Append /1, /2 ... (or {`{page}`})</option>
+                      <option value="slash_trailing">Append /1/, /2/ ...</option>
+                      <option value="page_slash">Append /page/1, /page/2 ...</option>
+                      <option value="query_page">Query ?page=1, ?page=2 ...</option>
+                      <option value="replace_last_num">Replace number in URL</option>
+                    </select>
+                  </div>
+                </div>
+
+                {paginatedPreview ? (
+                  <div className="text-[11px] font-mono text-violet-200/90 flex flex-wrap items-center gap-1.5 break-all">
+                    <span className="text-slate-400 font-sans">Will extract one-by-one ({paginatedPreview.count} pages) into 1 list:</span>
+                    <span className="px-1.5 py-0.5 bg-slate-950 rounded border border-slate-800 text-cyan-300">
+                      {paginatedPreview.firstUrl}
+                    </span>
+                    <span className="text-slate-500">→</span>
+                    <span className="px-1.5 py-0.5 bg-slate-950 rounded border border-slate-800 text-cyan-300">
+                      {paginatedPreview.lastUrl}
+                    </span>
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-slate-400">
+                    Enter your base URL above (e.g. <code className="text-violet-300">https://site.com/videos</code> or use <code className="text-violet-300">{`{page}`}</code>). Pages from Start to End are extracted 1-by-1 and combined in one place for filtering.
+                  </p>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Dedicated URL Path Format / Pattern Specification Row */}
@@ -903,6 +1387,83 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
         </div>
       )}
 
+      {/* Sequential Page Extraction Progress */}
+      {paginationProgress && (
+        <div className="p-4 bg-slate-900/90 border border-violet-500/30 rounded-xl space-y-2 text-xs animate-fadeIn">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              {paginationProgress.active ? (
+                <RefreshCw className="w-4 h-4 text-violet-400 animate-spin shrink-0" />
+              ) : (
+                <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+              )}
+              <span className="font-bold text-white">
+                {paginationProgress.active
+                  ? `Extracting Page ${paginationProgress.currentIndex} of ${paginationProgress.totalPages} (Page #${paginationProgress.currentPageNumber})`
+                  : paginationProgress.stoppedEarly
+                  ? `Stopped Early — Saved ${paginationProgress.totalLinksCollected} links from ${paginationProgress.completedPages}/${paginationProgress.totalPages} pages`
+                  : `Completed ${paginationProgress.completedPages}/${paginationProgress.totalPages} pages — ${paginationProgress.totalLinksCollected} unique links combined`}
+              </span>
+            </div>
+            <span className="px-2 py-0.5 rounded bg-violet-500/15 text-violet-300 border border-violet-500/30 font-mono font-bold">
+              {paginationProgress.totalLinksCollected} links collected
+            </span>
+          </div>
+
+          <div className="w-full h-2 bg-slate-950 rounded-full overflow-hidden border border-slate-800">
+            <div
+              className="h-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-all duration-300"
+              style={{
+                width: `${Math.min(
+                  100,
+                  Math.round(
+                    ((paginationProgress.active
+                      ? paginationProgress.completedPages + 0.3
+                      : paginationProgress.completedPages) /
+                      Math.max(1, paginationProgress.totalPages)) *
+                      100
+                  )
+                )}%`,
+              }}
+            />
+          </div>
+
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
+            <span className="font-mono truncate max-w-xl">
+              {paginationProgress.active ? `Fetching: ${paginationProgress.currentPageUrl}` : 'All collected links are combined below for 1-click filtering.'}
+            </span>
+            {paginationProgress.failedPages.length > 0 && (
+              <span className="text-amber-300 font-semibold">
+                {paginationProgress.failedPages.length} page{paginationProgress.failedPages.length === 1 ? '' : 's'} skipped ({paginationProgress.failedPages.map((f) => `#${f.page}`).join(', ')})
+              </span>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Appended Confirmation Toast */}
+      {multiAppendToast && (
+        <div className="p-3 bg-emerald-500/10 border border-emerald-500/30 rounded-xl flex items-center justify-between gap-3 text-xs text-emerald-300 animate-fadeIn">
+          <div className="flex items-center gap-2">
+            <Check className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span className="font-semibold">{multiAppendToast}</span>
+            {multiExtractorLinkCount > 0 && (
+              <span className="text-emerald-200/80">
+                (Multi-Extractor now holds {multiExtractorLinkCount} link{multiExtractorLinkCount === 1 ? '' : 's'})
+              </span>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => onNavigateTab('webprocessor')}
+            className="px-3 py-1 bg-emerald-500 text-slate-950 font-bold rounded-lg text-xs flex items-center gap-1"
+          >
+            <span>Open Multi-Extractor</span>
+            <ArrowRight className="w-3 h-3" />
+          </button>
+        </div>
+      )}
+
       {/* Results Workspace */}
       {linksList.length > 0 && (
         <div className="p-5 bg-slate-900/90 border border-slate-800 rounded-2xl shadow-xl space-y-5 animate-fadeIn">
@@ -961,7 +1522,7 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
 
             {/* Bulk Actions */}
             <div className="flex flex-wrap items-center gap-2">
-              {autoScroll && scrollCount < 40 && (
+              {autoScroll && scrollCount < 40 && !enablePageRange && (
                 <button
                   type="button"
                   disabled={isLoading}
@@ -980,30 +1541,78 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
 
               <button
                 type="button"
-                onClick={() => handleCopyUrls(selectedUrls.size > 0)}
+                onClick={() => {
+                  setLinksList([]);
+                  setSelectedUrls(new Set());
+                  setPaginationProgress(null);
+                }}
+                disabled={isLoading}
+                className="px-2.5 py-1.5 bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-400 hover:text-rose-300 rounded-xl text-xs font-semibold flex items-center gap-1 transition-colors disabled:opacity-50"
+                title="Clear extracted links table"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Clear</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleCopyUrls(selectedFilteredUrls.length > 0)}
                 className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors"
               >
                 {copiedKey === 'copy_bulk_urls' ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
                 <span>
                   {copiedKey === 'copy_bulk_urls'
                     ? 'Copied to Clipboard'
-                    : selectedUrls.size > 0
-                    ? `Copy Selected (${selectedUrls.size})`
+                    : selectedFilteredUrls.length > 0
+                    ? `Copy Selected (${selectedFilteredUrls.length})`
                     : `Copy All (${filteredLinks.length})`}
                 </span>
               </button>
 
               <button
                 type="button"
-                onClick={() => handleForwardToWebProcessor(selectedUrls.size > 0)}
-                className="px-3.5 py-1.5 bg-gradient-to-r from-orange-500 to-amber-600 hover:from-orange-400 hover:to-amber-500 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-md shadow-orange-500/20 transition-all"
-                title="Send directly into the Web Processor queue"
+                disabled={filteredLinks.length === 0}
+                onClick={() => handleForwardToWebProcessor(selectedFilteredUrls.length > 0, false)}
+                className="px-3 py-1.5 bg-cyan-500/15 hover:bg-cyan-500/25 border border-cyan-500/35 text-cyan-300 font-bold rounded-xl text-xs flex items-center gap-1.5 transition-colors disabled:opacity-40"
+                title="Append links into Multi-Extractor without leaving this page"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>
+                  {selectedFilteredUrls.length > 0
+                    ? `Append (${selectedFilteredUrls.length}) & Stay`
+                    : `Append (${filteredLinks.length}) & Stay`}
+                </span>
+              </button>
+
+              {onAddToDomainProber && (
+                <button
+                  type="button"
+                  disabled={filteredLinks.length === 0}
+                  onClick={() => handleSendToDomainProber(selectedFilteredUrls.length > 0)}
+                  className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-cyan-300 font-bold rounded-xl text-xs flex items-center gap-1.5 transition-colors disabled:opacity-40"
+                  title="Send extracted URLs to Domain Prober to check which domains/subdomains have video (max 5 links/domain)"
+                >
+                  <Radar className="w-3.5 h-3.5" />
+                  <span>
+                    {selectedFilteredUrls.length > 0
+                      ? `Probe Domains (${selectedFilteredUrls.length})`
+                      : `Probe Domains (${filteredLinks.length})`}
+                  </span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                disabled={filteredLinks.length === 0}
+                onClick={() => handleForwardToWebProcessor(selectedFilteredUrls.length > 0, true)}
+                className="px-3.5 py-1.5 bg-gradient-to-r from-orange-500 to-amber-600 hover:from-orange-400 hover:to-amber-500 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-md shadow-orange-500/20 transition-all disabled:opacity-40"
+                title="Append links to Multi-Extractor (keeps any existing links) and open Multi-Extractor"
               >
                 <Globe className="w-3.5 h-3.5" />
                 <span>
-                  {selectedUrls.size > 0
-                    ? `Send Selected (${selectedUrls.size}) to Processor`
-                    : `Send All (${filteredLinks.length}) to Processor`}
+                  {selectedFilteredUrls.length > 0
+                    ? `Add Selected (${selectedFilteredUrls.length}) to Multi-Extractor`
+                    : `Add Filtered (${filteredLinks.length}) to Multi-Extractor`}
                 </span>
               </button>
             </div>
@@ -1070,16 +1679,28 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
               </button>
             </div>
 
-            {/* Quick Search in list */}
-            <div className="relative w-full sm:w-64">
-              <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-2.5" />
-              <input
-                type="text"
-                value={searchTerm}
-                onChange={(e) => setSearchTerm(e.target.value)}
-                placeholder="Search extracted links..."
-                className="w-full pl-9 pr-3 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-white font-mono text-xs outline-none focus:border-orange-500"
-              />
+            {/* Quick Search & Post-Extract Exclude Filter */}
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 w-full sm:w-auto">
+              <div className="relative w-full sm:w-56">
+                <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                  placeholder="Include / search links..."
+                  className="w-full pl-9 pr-3 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-white font-mono text-xs outline-none focus:border-orange-500"
+                />
+              </div>
+              <div className="relative w-full sm:w-56">
+                <Ban className="w-3.5 h-3.5 text-rose-400/80 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  value={excludeKeywords}
+                  onChange={(e) => setExcludeKeywords(e.target.value)}
+                  placeholder="Exclude (e.g. /tag/, /page/)..."
+                  className="w-full pl-9 pr-3 py-1.5 bg-slate-950 border border-slate-800 rounded-lg text-white font-mono text-xs outline-none focus:border-rose-500"
+                />
+              </div>
             </div>
           </div>
 
@@ -1090,7 +1711,7 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
               onClick={handleSelectAllFiltered}
               className="flex items-center gap-1.5 hover:text-white transition-colors font-medium"
             >
-              {selectedUrls.size === filteredLinks.length && filteredLinks.length > 0 ? (
+              {selectedFilteredUrls.length === filteredLinks.length && filteredLinks.length > 0 ? (
                 <CheckSquare className="w-4 h-4 text-orange-400" />
               ) : (
                 <Square className="w-4 h-4 text-slate-500" />
@@ -1098,7 +1719,7 @@ export const PageLinkExtractor: React.FC<PageLinkExtractorProps> = ({ onNavigate
               <span>Select all {filteredLinks.length} filtered items</span>
             </button>
             <span>
-              {selectedUrls.size} of {filteredLinks.length} selected
+              {selectedFilteredUrls.length} of {filteredLinks.length} selected
             </span>
           </div>
 
